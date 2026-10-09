@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFTW, CFITSIO and MPICH
+        run: sudo apt-get update && sudo apt-get install -y libfftw3-dev libcfitsio-dev mpich libmpich-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pysanepic
+        run: pip install -e ".[test]"
+
+      - name: Build the C++ SANEPIC reference
+        run: make -C cpp ARCH=linux
+
+      - name: Tests (including comparison with C++ SANEPIC)
+        run: pytest -v
+
+      - name: MPI test on 4 ranks
+        run: mpirun -n 4 python tests/test_mpi.py
+        env:
+          PYTHONPATH: tests

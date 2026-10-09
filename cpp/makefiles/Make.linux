@@ -1,0 +1,5 @@
+CCC = mpic++ -O2
+
+FITS = -lcfitsio
+
+FFTW = -lfftw3

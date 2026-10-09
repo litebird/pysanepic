@@ -12,6 +12,10 @@ dependencies = ["numpy", "scipy", "healpy", "numba", "ducc0"]
 
 [project.optional-dependencies]
 mpi = ["mpi4py"]
+test = ["pytest", "mpi4py"]
 
 [tool.hatch.version]
 path = "src/pysanepic/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
