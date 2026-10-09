@@ -3,8 +3,8 @@
 test_noiseless_recovers_sky: always runs; noiseless data must give back the
 input sky (up to the I monopole, which SANEPIC's DC weighting leaves free).
 
-test_matches_cpp_sanepic: runs only if SANEPIC_BIN points to a built C++
-sanepic executable; maps must agree with the C++ ones.
+test_matches_cpp_sanepic: runs if the C++ code is built (make -C cpp ARCH=mac)
+or SANEPIC_BIN points to a sanepic executable; maps must agree with the C++ ones.
 
 Run with: pytest tests/   (or: python tests/test_vs_sanepic.py)
 """
@@ -53,9 +53,9 @@ def test_noiseless_recovers_sky():
 
 
 def test_matches_cpp_sanepic():
-    exe = os.environ.get("SANEPIC_BIN")
-    if not exe:
-        print("SANEPIC_BIN not set, skipping C++ comparison")
+    exe = os.environ.get("SANEPIC_BIN", ROOT / "cpp/sanepic")
+    if not Path(exe).exists():
+        print(f"{exe} not found, skipping C++ comparison")
         return
     with tempfile.TemporaryDirectory() as d:
         _simulate(d)

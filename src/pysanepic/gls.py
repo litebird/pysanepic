@@ -62,11 +62,16 @@ class GLS:
         Inverse noise power spectrum of each chunk on the rfft grid.
     min_pol_hits : int
         Q/U are not solved in pixels with fewer hits (degenerate).
+    comm : mpi4py communicator or None
+        With MPI, each rank passes only its own chunks; maps are replicated on
+        all ranks and P^T is summed with Allreduce.
     """
 
-    def __init__(self, pix, psi, weights, min_pol_hits=4):
-        self.pixels, ip = np.unique(pix, return_inverse=True)
-        self.ip = ip.reshape(pix.shape)
+    def __init__(self, pix, psi, weights, min_pol_hits=4, comm=None):
+        self.comm = comm
+        local = np.unique(pix)
+        self.pixels = local if comm is None else np.unique(np.concatenate(comm.allgather(local)))
+        self.ip = np.searchsorted(self.pixels, pix)
         self.nobs = self.pixels.size
         self.weights = weights
         self.pol = psi is not None
@@ -75,7 +80,7 @@ class GLS:
             self.cos2 = np.cos(2 * psi)
             self.sin2 = np.sin(2 * psi)
 
-        self.hits = np.bincount(self.ip.ravel(), minlength=self.nobs)
+        self.hits = self._sum(np.bincount(self.ip.ravel(), minlength=self.nobs))
         self.mask = np.ones((self.ncomp, self.nobs), dtype=bool)
         if self.pol:
             self.mask[1:] = self.hits >= min_pol_hits
@@ -83,7 +88,7 @@ class GLS:
         # Jacobi preconditioner. Like SANEPIC, Q/U use diag_I / 2, which
         # assumes uniform angle coverage.
         c = scipy.fft.irfft(weights, n=pix.shape[-1], axis=-1)
-        diag = _diag_circulant(self.ip, c, self.nobs)
+        diag = self._sum(_diag_circulant(self.ip, c, self.nobs))
         if np.any(diag <= 0):
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
         self.precond = np.empty((self.ncomp, self.nobs))
@@ -91,6 +96,14 @@ class GLS:
         if self.pol:
             self.precond[1:] = 2.0 / diag
         self.precond *= self.mask
+
+    def _sum(self, x):
+        """Sum a map-sized array over ranks (identity without MPI)."""
+        if self.comm is None:
+            return x
+        out = np.empty_like(x)
+        self.comm.Allreduce(np.ascontiguousarray(x), out)
+        return out
 
     def project(self, m):
         """P m: map (ncomp, nobs) -> timelines (nchunk, ns)."""
@@ -106,7 +119,7 @@ class GLS:
         if self.pol:
             out.append(np.bincount(ip, (t * self.cos2).ravel(), minlength=self.nobs))
             out.append(np.bincount(ip, (t * self.sin2).ravel(), minlength=self.nobs))
-        return np.array(out) * self.mask
+        return self._sum(np.array(out)) * self.mask
 
     def apply_A(self, m):
         return self.backproject(_filter(self.project(m), self.weights))
@@ -143,7 +156,7 @@ class GLS:
             delta = delta_new
             history.append(np.vdot(r, r) / bb)
             it += 1
-            if verbose:
+            if verbose and (self.comm is None or self.comm.rank == 0):
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
 
         return x, {"iterations": it, "residuals": np.array(history)}
