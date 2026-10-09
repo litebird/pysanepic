@@ -60,6 +60,66 @@ def test_noiseless_recovers_sky():
         assert np.abs(res.maps[i][seen] - sky[i][seen]).max() < 1e-9 * np.abs(sky).max(), i
 
 
+def _four_detectors(n, fs, rng, sky, nside, noise=False):
+    """Four detectors at different polarization angles, 1/f noise model, no HWP."""
+    data = []
+    for pol_angle in [0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]:
+        theta, phi, psi = _scan(n, rng)
+        p = hp.ang2pix(nside, theta, phi)
+        a = psi + pol_angle
+        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a)
+        data.append(
+            DetectorData(
+                tod=tod, theta=theta, phi=phi, psi=psi, coordinates="E", sampling_rate_hz=fs,
+                net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4, pol_angle_rad=pol_angle,
+            )
+        )
+    return data
+
+
+def test_padding_noiseless():
+    nside, n, fs = 16, 120_000, 10.0
+    rng = np.random.default_rng(0)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _four_detectors(n, fs, rng, sky, nside)
+    # compare only pixels where Q/U are well conditioned (the default criterion)
+    good = make_maps(data, nside, coordinates="E", chunk_s=1200.0, maxiter=1).maps[1] != hp.UNSEEN
+    common = dict(coordinates="E", chunk_s=1200.0, pad_s=300.0, tol=1e-24, min_pol_rcond=0.0)
+
+    # zeros are exactly described by the margin offsets: exact recovery
+    res = make_maps(data, nside, pad_fill="zeros", **common)
+    assert res.hit_map.sum() == 4 * n  # padded samples are not hits
+    err = res.maps[:, good] - sky[:, good]
+    err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
+    assert np.abs(err).max() < 1e-4 * np.abs(sky).max()
+
+    # SANEPIC's extrapolation leaves a small bias (unmodelled padding shape)
+    res = make_maps(data, nside, pad_fill="extrapolate", **common)
+    err = res.maps[:, good] - sky[:, good]
+    err[0] -= err[0].mean()
+    assert np.median(np.abs(err)) < 1e-2 * 1e-4
+
+
+def test_contiguous_run_kernel():
+    """O(n) formula for contiguous unpolarized runs == sum over all sample pairs."""
+    from pysanepic.gls import _block_circulant
+
+    rng = np.random.default_rng(1)
+    ns = 64
+    ip = np.zeros((1, ns), dtype=np.int64)
+    ip[0, 10:30] = 1  # contiguous run in pixel 1
+    ip[0, 40:44] = 2
+    ip[0, 50] = 2  # pixel 2 is not contiguous
+    c = rng.normal(size=(1, ns))
+    c = c + c[:, (-np.arange(ns)) % ns]  # symmetric, like a circulant correlation
+    fast = _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), 3, False)[:, 0]
+    t = np.arange(ns)
+    brute = [c[0, (t[ip[0] == q][:, None] - t[ip[0] == q][None, :]) % ns].sum() for q in range(3)]
+    assert np.allclose(fast, brute)
+
+
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
+    test_padding_noiseless()
+    test_contiguous_run_kernel()
     print("ok")
