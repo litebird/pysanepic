@@ -110,6 +110,8 @@ def make_maps(
     coordinates="G",
     chunk_s=3600.0,
     pol=True,
+    preconditioner="block",
+    min_pol_rcond=1e-2,
     tol=1e-12,
     maxiter=2000,
     comm=None,
@@ -130,6 +132,11 @@ def make_maps(
         longer chunks capture lower frequencies but cost more.
     pol : bool
         Solve for I/Q/U (True) or I only.
+    preconditioner : str
+        "block" (default, 3x3 I/Q/U block per pixel) or "jacobi" (SANEPIC's).
+    min_pol_rcond : float
+        Q/U are solved only in pixels whose polarization-angle coverage gives a
+        reciprocal condition number >= this value (0: no check, as SANEPIC).
     tol, maxiter : float, int
         PCG stops when |r|^2/|b|^2 < tol or after maxiter iterations.
     comm : mpi4py communicator or None
@@ -155,6 +162,8 @@ def make_maps(
         blocks["psi"] if pol else None,
         blocks["w"],
         pol_efficiency=blocks["gamma"] if pol else None,
+        preconditioner=preconditioner,
+        min_pol_rcond=min_pol_rcond,
         comm=comm,
     )
     m, info = gls.solve(blocks["tod"], tol=tol, maxiter=maxiter, verbose=verbose)
