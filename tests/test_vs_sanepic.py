@@ -59,16 +59,19 @@ def test_matches_cpp_sanepic():
         return
     with tempfile.TemporaryDirectory() as d:
         _simulate(d)
-        subprocess.run(
+        run = subprocess.run(
             ["mpirun", "-n", "5", exe, "-F", d, "-Z", f"{d}/pointings_", "-X", f"{d}/bolometer_info.txt",
              "-d", "2", "-C", "det0", "-C", "det1", "-k", f"{d}/iSpf_", "-u", str(NS), "-l", str(NS),
              "-n", str(NSEG), "-N", str(NSIDE), "-p", "1", "-E", "0", "-h", "0", "-i", "0",
              "-e", "ref", "-O", f"{d}/map"],
-            check=True, capture_output=True,
+            check=True, capture_output=True, text=True,
         )
         maps, _ = _solve(d)
         ref = np.array([read_map(f"{d}/map_{c}_ref_1", NSIDE) for c in "IQU"])
-    assert np.array_equal(maps != 0, ref != 0)
+    assert np.array_equal(maps != 0, ref != 0), (
+        f"solved pixels I/Q/U: python {(maps != 0).sum(axis=1)}, C++ {(ref != 0).sum(axis=1)}\n"
+        f"C++ log tail:\n{run.stdout[-2000:]}\n{run.stderr[-1000:]}"
+    )
     for i in range(3):
         scale = np.abs(ref[i]).max()
         assert np.abs(maps[i] - ref[i]).max() < 1e-5 * scale, i
