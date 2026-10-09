@@ -7,8 +7,11 @@ pysanepic is a Python port of [SANEPIC](https://github.com/patanch/SANEPIC)
 problem (PᵀN⁻¹P) m = PᵀN⁻¹d with preconditioned conjugate gradients, applying
 N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
 
+- Designed for experiments **without HWP**, where 1/f noise affects both
+  intensity and polarization. An ideal HWP is supported too: pysanepic only
+  needs the TOD and the pointings (and the HWP angle, if any).
 - Pure Python with numba, scipy.fft and ducc0; runs with MPI (mpi4py).
-- Supports an ideal HWP, polarization efficiency and any coordinate system.
+- Supports polarization efficiency and any coordinate system.
 - Independent of any simulation pipeline: data are passed as plain arrays.
 - Validated against the original C++ code, which is kept in `cpp/`.
 
@@ -32,9 +35,15 @@ result.hit_map    # samples per pixel
 ```
 
 Until [litebird_sim#568](https://github.com/litebird/litebird_sim/pull/568) is
-merged, install litebird_sim from the `sanepic_gls` branch. A complete example,
-compared with the litebird_sim binner and destriper, is in
-[`notebooks/lbs_example.ipynb`](notebooks/lbs_example.ipynb).
+merged, install litebird_sim from the `sanepic_gls` branch.
+
+Example notebooks:
+
+- [`lbs_example.ipynb`](notebooks/lbs_example.ipynb): one day of LiteBIRD
+  without HWP and with 1/f noise, compared with the litebird_sim binner and
+  destriper;
+- [`preconditioner.ipynb`](notebooks/preconditioner.ipynb): block vs SANEPIC's
+  Jacobi preconditioner, and the Q/U conditioning criterion.
 
 ## Usage without litebird_sim
 
@@ -96,6 +105,8 @@ The conventions are the same as litebird_sim:
 | `coordinates` | `"G"` | Coordinate system of the output maps |
 | `chunk_s` | 3600 | N⁻¹ is applied on chunks of this duration [s]; longer chunks capture lower frequencies |
 | `pol` | `True` | Solve for I, Q, U, or I only |
+| `min_pol_rcond` | 1e-2 | Q/U are solved only in pixels whose polarization-angle coverage has a reciprocal condition number ≥ this (and ≥ 4 hits); elsewhere only I. 0 disables the check, as in SANEPIC |
+| `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of PᵀN⁻¹P per pixel; `"jacobi"`: original SANEPIC (I diagonal, Q/U = 2/diag_I) |
 | `tol`, `maxiter` | 1e-12, 2000 | PCG stops when \|r\|²/\|b\|² < `tol` |
 | `comm` | `None` | mpi4py communicator; each rank passes only its own data |
 
@@ -113,8 +124,9 @@ pytest                        # includes the comparison with C++ SANEPIC
 mpirun -n 4 python tests/test_mpi.py
 ```
 
-- `test_vs_sanepic.py`: maps agree with the C++ SANEPIC to ~1e-6; noiseless
-  data give back the input sky.
+- `test_vs_sanepic.py`: with SANEPIC's preconditioner, maps agree with the C++
+  SANEPIC to ~1e-6; the block preconditioner converges to the same map in a
+  fraction of the iterations; noiseless data give back the input sky.
 - `test_mapmaker.py`: `make_maps` recovers the input sky to machine precision
   with HWP, polarization efficiency and coordinate rotation.
 - `test_mpi.py`: MPI and serial runs agree.

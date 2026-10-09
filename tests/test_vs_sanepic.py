@@ -42,17 +42,20 @@ def _clean_mpi_env():
     }
 
 
-def _solve(d):
+def _solve(d, **kwargs):
     inp = read_inputs(d, f"{d}/pointings_", f"{d}/bolometer_info.txt", DETS, f"{d}/iSpf_", NS, NS, NSEG, NSIDE)
-    g = GLS(inp["pix"], inp["psi"], inp["weights"])
-    m, info = g.solve(inp["tod"])
+    tol = kwargs.pop("tol", 1e-15)
+    g = GLS(inp["pix"], inp["psi"], inp["weights"], **kwargs)
+    m, info = g.solve(inp["tod"], tol=tol)
     return g.to_healpix(m, NSIDE, fill=0.0), info
 
 
 def test_noiseless_recovers_sky():
     with tempfile.TemporaryDirectory() as d:
         _simulate(d, "--noiseless")
-        maps, _ = _solve(d)
+        # Solve Q/U everywhere: with noiseless data even poorly covered pixels are
+        # exact, while pixels solved for I only would leave unmodelled signal
+        maps, _ = _solve(d, min_pol_rcond=0.0)
         sky = np.load(f"{d}/truth.npz")["sky"]
     for i in range(3):
         seen = maps[i] != 0
@@ -77,7 +80,8 @@ def test_matches_cpp_sanepic():
             capture_output=True, text=True, env=_clean_mpi_env(),
         )
         assert run.returncode == 0, f"SANEPIC failed:\n{run.stdout[-2000:]}\n{run.stderr[-2000:]}"
-        maps, _ = _solve(d)
+        # Same preconditioner and stopping rule as SANEPIC, so the PCG path is the same
+        maps, _ = _solve(d, preconditioner="jacobi", min_pol_rcond=0.0)
         ref = np.array([read_map(f"{d}/map_{c}_ref_1", NSIDE) for c in "IQU"])
     assert np.array_equal(maps != 0, ref != 0), (
         f"solved pixels I/Q/U: python {(maps != 0).sum(axis=1)}, C++ {(ref != 0).sum(axis=1)}\n"
@@ -88,7 +92,21 @@ def test_matches_cpp_sanepic():
         assert np.abs(maps[i] - ref[i]).max() < 1e-5 * scale, i
 
 
+def test_block_preconditioner():
+    """Block and Jacobi preconditioners converge to the same map; block is much faster."""
+    with tempfile.TemporaryDirectory() as d:
+        _simulate(d)
+        block, info_b = _solve(d, preconditioner="block", tol=1e-20)
+        jacobi, info_j = _solve(d, preconditioner="jacobi", tol=1e-20)
+    assert info_b["iterations"] < info_j["iterations"] / 3, (info_b["iterations"], info_j["iterations"])
+    diff = block - jacobi
+    seen = block[0] != 0
+    diff[0][seen] -= diff[0][seen].mean()  # the I monopole is (almost) unconstrained
+    assert np.abs(diff).max() < 1e-6 * np.abs(jacobi).max()
+
+
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_matches_cpp_sanepic()
+    test_block_preconditioner()
     print("ok")
