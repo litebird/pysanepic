@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      # the C++ comparison uses 5 ranks on a 4-core runner
+      OMPI_MCA_rmaps_base_oversubscribe: "1"
+      PRTE_MCA_rmaps_default_mapping_policy: ":oversubscribe"
+    steps:
+      - uses: actions/checkout@v4
+
+      # OpenMPI: Ubuntu 24.04's MPICH 4.2 starts every process as a singleton on GitHub runners
+      - name: Install FFTW, CFITSIO and OpenMPI
+        run: sudo apt-get update && sudo apt-get install -y libfftw3-dev libcfitsio-dev openmpi-bin libopenmpi-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pysanepic
+        run: pip install -e ".[test]"
+
+      - name: Check that MPI ranks see each other
+        run: mpirun -n 2 python -c "from mpi4py import MPI; assert MPI.COMM_WORLD.size == 2"
+
+      - name: Build the C++ SANEPIC reference
+        run: make -C cpp ARCH=linux
+
+      - name: Tests (including comparison with C++ SANEPIC)
+        run: pytest -v
+
+      - name: MPI test on 4 ranks
+        run: mpirun -n 4 python tests/test_mpi.py
+        env:
+          PYTHONPATH: tests

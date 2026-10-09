@@ -32,6 +32,16 @@ def _simulate(outdir, *extra):
     )
 
 
+def _clean_mpi_env():
+    """Environment for launching mpirun from a process that may already have
+    initialized MPI (e.g. test_mpi.py in the same pytest run): OpenMPI refuses to
+    start a nested mpirun if the runtime variables of the parent are inherited."""
+    return {
+        k: v for k, v in os.environ.items()
+        if not k.startswith(("OMPI_", "PMIX_", "PRTE_")) or "_MCA_rmaps" in k
+    }
+
+
 def _solve(d):
     inp = read_inputs(d, f"{d}/pointings_", f"{d}/bolometer_info.txt", DETS, f"{d}/iSpf_", NS, NS, NSEG, NSIDE)
     g = GLS(inp["pix"], inp["psi"], inp["weights"])
@@ -59,16 +69,20 @@ def test_matches_cpp_sanepic():
         return
     with tempfile.TemporaryDirectory() as d:
         _simulate(d)
-        subprocess.run(
+        run = subprocess.run(
             ["mpirun", "-n", "5", exe, "-F", d, "-Z", f"{d}/pointings_", "-X", f"{d}/bolometer_info.txt",
              "-d", "2", "-C", "det0", "-C", "det1", "-k", f"{d}/iSpf_", "-u", str(NS), "-l", str(NS),
              "-n", str(NSEG), "-N", str(NSIDE), "-p", "1", "-E", "0", "-h", "0", "-i", "0",
              "-e", "ref", "-O", f"{d}/map"],
-            check=True, capture_output=True,
+            capture_output=True, text=True, env=_clean_mpi_env(),
         )
+        assert run.returncode == 0, f"SANEPIC failed:\n{run.stdout[-2000:]}\n{run.stderr[-2000:]}"
         maps, _ = _solve(d)
         ref = np.array([read_map(f"{d}/map_{c}_ref_1", NSIDE) for c in "IQU"])
-    assert np.array_equal(maps != 0, ref != 0)
+    assert np.array_equal(maps != 0, ref != 0), (
+        f"solved pixels I/Q/U: python {(maps != 0).sum(axis=1)}, C++ {(ref != 0).sum(axis=1)}\n"
+        f"C++ log tail:\n{run.stdout[-2000:]}\n{run.stderr[-1000:]}"
+    )
     for i in range(3):
         scale = np.abs(ref[i]).max()
         assert np.abs(maps[i] - ref[i]).max() < 1e-5 * scale, i
