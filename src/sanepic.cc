@@ -685,8 +685,8 @@ MPI_Barrier(MPI_COMM_WORLD);
 
             ras = new double[nsmarg];
             decs = new double[nsmarg];
-            if (polar)
-	            psips = new double[nsmarg];
+            // psi is always needed: pointingshift() uses it for detector offsets even without -p
+            psips = new double[nsmarg];
 
             //Read boresight pointing
             sprintf(namefilering,"%sra%s.bi",dirfilep.c_str(),pextension.c_str());
@@ -696,11 +696,8 @@ MPI_Barrier(MPI_COMM_WORLD);
             sprintf(namefilering,"%sdec%s.bi",dirfilep.c_str(),pextension.c_str());
             MyErr=ReadDoubleVECT(decs+marge, namefilering, isampmin[iseg], isampmax[iseg]);
 
-            if (polar){
-	            sprintf(namefilering,"%spsi%s.bi",dirfilep.c_str(),pextension.c_str());
-	            MyErr=ReadDoubleVECT(psips+marge, namefilering, isampmin[iseg], isampmax[iseg]);
-	            //printf("psips[0] = %10.15g , psips[1895654] = %10.15g, psi[0] = %10.15g, psi[1] = %10.15g, psi[2] = %10.15g, psi[3] = %10.15g\n",psips[0],psips[1895654],idet,psi[0],psi[1],psi[2],psi[3]);
-            }
+            sprintf(namefilering,"%spsi%s.bi",dirfilep.c_str(),pextension.c_str());
+            MyErr=ReadDoubleVECT(psips+marge, namefilering, isampmin[iseg], isampmax[iseg]);
 
 
             for (idet=0;idet<ndet;idet++){
@@ -721,10 +718,10 @@ MPI_Barrier(MPI_COMM_WORLD);
 	                    }
 	                }
 
-	                for (ii=0;ii<ns;ii++)
+	                for (ii=marge;ii<ns+marge;ii++)
                         if (!(psips[ii] > 0) && !(psips[ii] <= 0.0)){
                             printf("NAN DETECTED IN PSI, psi = %10.15g\n",psips[ii]);
-                            if (ii > 0)
+                            if (ii > marge)
                                 psips[ii] = psips[ii-1];
                         }
 
@@ -820,7 +817,7 @@ if (marge){
                 data[ii] = bb*(double(ii-ns-marge-nfit)-double(nfit)/2.0) + aa;
 
 	  //// apodise
-	  double mmean;
+	  double mmean = 0.0;
 	  for (ii=marge;ii<ns+marge;ii++)
 		  mmean += data[ii]/ns;
 
@@ -864,8 +861,7 @@ if (marge){
             }
             delete(ras);
             delete(decs);
-            if (polar)
-	            delete(psips);
+            delete[] psips;
             printf("DATA READ det %s, fraction %d/%ld\n",namefilering,newrank,(size-nsubm)/nsubm);
         }
   }
@@ -1127,8 +1123,8 @@ if (marge){
 	        for (idet=0;idet<ndet;idet++)
 	            if (segon[idet*lnr + iseg+iseg_min])
 	                for (ii=0;ii<nsmarg/2+1;ii++){
-	                    fdatas0[ii+idet*(nsmarg/2+1)+iseg*ndet*(nsmarg/2+1)][0] /= relCalib[idet + iseg+iseg_min*ndet];
-	                    fdatas0[ii+idet*(nsmarg/2+1)+iseg*ndet*(nsmarg/2+1)][1] /= relCalib[idet + iseg+iseg_min*ndet];
+	                    fdatas0[ii+idet*(nsmarg/2+1)+iseg*ndet*(nsmarg/2+1)][0] /= relCalib[idet + (iseg+iseg_min)*ndet];
+	                    fdatas0[ii+idet*(nsmarg/2+1)+iseg*ndet*(nsmarg/2+1)][1] /= relCalib[idet + (iseg+iseg_min)*ndet];
 	                }
     }
     if ((recalib || odip) && (newrank != 0)){
@@ -1426,7 +1422,7 @@ if (marge){
 	        //Mptot[ii] = 1.0/double(hitstot[ii]);
 	        if ((Mptot[ii] == 0) && (ii < nsmpix)){
 	            printf("ERROR: Mp[%ld] has elements = 0, ipixmin = %ld\n",ii,ipixmin);
-	            exit(0);
+	            exit_Sanepic(1);
 	        }
         }
 
