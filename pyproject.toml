@@ -7,7 +7,7 @@ name = "pysanepic"
 version = "0.0.1"
 description = "GLS map-making with correlated noise (SANEPIC algorithm) in Python"
 requires-python = ">=3.10"
-dependencies = ["numpy", "scipy", "healpy", "numba"]
+dependencies = ["numpy", "scipy", "healpy", "numba", "ducc0"]
 
 [project.optional-dependencies]
 mpi = ["mpi4py"]

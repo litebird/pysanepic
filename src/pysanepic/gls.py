@@ -2,11 +2,12 @@
 
 Solves (P^T N^-1 P) m = P^T N^-1 d with preconditioned conjugate gradients.
 N^-1 is applied in Fourier space, independently on each data chunk
-(one detector x one segment), as a circulant filter.
+(one detector x one stretch of time), as a circulant filter.
 
-Data layout: every per-sample array has shape (nchunk, ns); noise weights
-have shape (nchunk, ns//2+1) and are defined so that the filter is
-irfft(rfft(t) * w).
+Data layout: data come in *blocks*; a block is a 2D array (nchunk, ns) of
+chunks with the same length ns. Pass one array for a single block or a list
+of arrays for chunks of different lengths. Noise weights of a block have shape
+(nchunk, ns//2+1) and are defined so that the filter is irfft(rfft(t) * w).
 """
 
 import numba
@@ -26,6 +27,10 @@ def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0):
     num, den = fa + fmin_hz**alpha, fa + fknee_hz**alpha
     ratio = np.divide(num, den, out=np.ones_like(fa), where=den > 0)  # fknee = 0: white
     return ratio / sigma**2
+
+
+def _blocks(x):
+    return list(x) if isinstance(x, (list, tuple)) else [x]
 
 
 def _filter(t, w):
@@ -68,41 +73,48 @@ class GLS:
 
     Parameters
     ----------
-    pix : int array (nchunk, ns)
+    pix : int array (nchunk, ns), or list of such blocks
         HEALPix pixel index of each sample (any scheme; only used as labels).
-    psi : float array (nchunk, ns) or None
+    psi : float array(s) like `pix`, or None
         Polarization angle of each sample. None for intensity only.
-    weights : float array (nchunk, ns//2+1)
+    weights : float array (nchunk, ns//2+1), or list (one per block)
         Inverse noise power spectrum of each chunk on the rfft grid.
+    pol_efficiency : float array (nchunk,), or list (one per block), or None
+        Polarization efficiency of each chunk; None means 1.
     min_pol_hits : int
         Q/U are not solved in pixels with fewer hits (degenerate).
     comm : mpi4py communicator or None
-        With MPI, each rank passes only its own chunks; maps are replicated on
-        all ranks and P^T is summed with Allreduce.
+        With MPI, each rank passes only its own chunks (possibly none); maps
+        are replicated on all ranks and P^T is summed with Allreduce.
     """
 
-    def __init__(self, pix, psi, weights, min_pol_hits=4, comm=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, comm=None):
+        pix, self.weights = _blocks(pix), _blocks(weights)
         self.comm = comm
-        local = np.unique(pix)
+        local = np.unique(np.concatenate([p.ravel() for p in pix] or [np.empty(0, np.int64)]))
         self.pixels = local if comm is None else np.unique(np.concatenate(comm.allgather(local)))
-        self.ip = np.searchsorted(self.pixels, pix)
+        self.ip = [np.searchsorted(self.pixels, p) for p in pix]
         self.nobs = self.pixels.size
-        self.weights = weights
         self.pol = psi is not None
         self.ncomp = 3 if self.pol else 1
         if self.pol:
-            self.cos2 = np.cos(2 * psi)
-            self.sin2 = np.sin(2 * psi)
+            psi = _blocks(psi)
+            eff = [1.0] * len(psi) if pol_efficiency is None else _blocks(pol_efficiency)
+            g = [np.asarray(e, dtype=float).reshape(-1, 1) for e in eff]
+            self.cos2 = [gb * np.cos(2 * s) for gb, s in zip(g, psi)]
+            self.sin2 = [gb * np.sin(2 * s) for gb, s in zip(g, psi)]
 
-        self.hits = self._sum(np.bincount(self.ip.ravel(), minlength=self.nobs))
+        self.hits = self._sum(sum((np.bincount(ip.ravel(), minlength=self.nobs) for ip in self.ip), np.zeros(self.nobs, np.int64)))
         self.mask = np.ones((self.ncomp, self.nobs), dtype=bool)
         if self.pol:
             self.mask[1:] = self.hits >= min_pol_hits
 
         # Jacobi preconditioner. Like SANEPIC, Q/U use diag_I / 2, which
-        # assumes uniform angle coverage.
-        c = scipy.fft.irfft(weights, n=pix.shape[-1], axis=-1)
-        diag = self._sum(_diag_circulant(self.ip, c, self.nobs))
+        # assumes uniform angle coverage and unit polarization efficiency.
+        diag = np.zeros(self.nobs)
+        for ip, w in zip(self.ip, self.weights):
+            diag += _diag_circulant(ip, scipy.fft.irfft(w, n=ip.shape[-1], axis=-1), self.nobs)
+        diag = self._sum(diag)
         if np.any(diag <= 0):
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
         self.precond = np.empty((self.ncomp, self.nobs))
@@ -120,30 +132,39 @@ class GLS:
         return out
 
     def project(self, m):
-        """P m: map (ncomp, nobs) -> timelines (nchunk, ns)."""
-        t = m[0][self.ip]
-        if self.pol:
-            t = t + m[1][self.ip] * self.cos2 + m[2][self.ip] * self.sin2
-        return t
+        """P m: map (ncomp, nobs) -> list of timeline blocks."""
+        out = []
+        for k, ip in enumerate(self.ip):
+            t = m[0][ip]
+            if self.pol:
+                t = t + m[1][ip] * self.cos2[k] + m[2][ip] * self.sin2[k]
+            out.append(t)
+        return out
 
-    def backproject(self, t):
-        """P^T t: timelines -> map (ncomp, nobs)."""
-        ip = self.ip.ravel()
-        out = [np.bincount(ip, t.ravel(), minlength=self.nobs)]
-        if self.pol:
-            out.append(np.bincount(ip, (t * self.cos2).ravel(), minlength=self.nobs))
-            out.append(np.bincount(ip, (t * self.sin2).ravel(), minlength=self.nobs))
-        return self._sum(np.array(out)) * self.mask
+    def backproject(self, tod):
+        """P^T t: timeline block(s) -> map (ncomp, nobs)."""
+        out = np.zeros((self.ncomp, self.nobs))
+        for k, (ip, t) in enumerate(zip(self.ip, _blocks(tod))):
+            ip = ip.ravel()
+            out[0] += np.bincount(ip, t.ravel(), minlength=self.nobs)
+            if self.pol:
+                out[1] += np.bincount(ip, (t * self.cos2[k]).ravel(), minlength=self.nobs)
+                out[2] += np.bincount(ip, (t * self.sin2[k]).ravel(), minlength=self.nobs)
+        return self._sum(out) * self.mask
+
+    def _filter_all(self, tod):
+        return [_filter(t, w) for t, w in zip(_blocks(tod), self.weights)]
 
     def apply_A(self, m):
-        return self.backproject(_filter(self.project(m), self.weights))
+        return self.backproject(self._filter_all(self.project(m)))
 
     def rhs(self, tod):
-        return self.backproject(_filter(tod, self.weights))
+        return self.backproject(self._filter_all(tod))
 
     def solve(self, tod, x0=None, tol=1e-15, maxiter=2000, recompute_every=10, verbose=False):
-        """Run PCG. Stops when |r|^2 / |b|^2 < tol (same criterion as SANEPIC).
+        """Run PCG on `tod` (same block layout as `pix`).
 
+        Stops when |r|^2 / |b|^2 < tol (same criterion as SANEPIC).
         Returns (map (ncomp, nobs), info dict).
         """
         b = self.rhs(tod)
@@ -173,7 +194,7 @@ class GLS:
             if verbose and (self.comm is None or self.comm.rank == 0):
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
 
-        return x, {"iterations": it, "residuals": np.array(history)}
+        return x, {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history)}
 
     def to_healpix(self, m, nside, fill=np.nan):
         """Expand (ncomp, nobs) to full RING maps (ncomp, 12 nside^2)."""
