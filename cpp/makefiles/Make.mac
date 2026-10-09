@@ -1,0 +1,5 @@
+CCC = mpic++ -O2
+
+FITS = -I/opt/homebrew/include -L/opt/homebrew/lib -lcfitsio
+
+FFTW = -I/opt/homebrew/include -L/opt/homebrew/lib -lfftw3
