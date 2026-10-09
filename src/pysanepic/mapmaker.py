@@ -12,7 +12,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from .gls import GLS, one_over_f_weights
+from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads
 
 
 @dataclass
@@ -82,18 +82,19 @@ def _rotate(theta, phi, psi, R, out):
         out[2, i] = psi[i] + np.arctan2(cx * vx + cy * vy + cz * vz, bx * ax + by * ay + bz * az)
 
 
-def _pixels_and_angles(d, nside, coordinates):
+def _pixels_and_angles(d, nside, coordinates, nthreads):
     theta, phi, psi = d.theta, d.phi, d.psi
     if d.coordinates != coordinates:
         R = hp.Rotator(coord=[d.coordinates, coordinates]).mat
         out = np.empty((3, theta.size))
-        _rotate(np.ascontiguousarray(theta), np.ascontiguousarray(phi), np.ascontiguousarray(psi), R, out)
+        with numba_threads(nthreads):
+            _rotate(np.ascontiguousarray(theta), np.ascontiguousarray(phi), np.ascontiguousarray(psi), R, out)
         theta, phi, psi = out
     if d.hwp_angle is None:
         angle = psi + d.pol_angle_rad
     else:
         angle = psi + 2 * d.hwp_angle - d.pol_angle_rad
-    pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=0)
+    pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=nthreads)
     return pix, angle
 
 
@@ -115,6 +116,7 @@ def make_maps(
     tol=1e-12,
     maxiter=2000,
     comm=None,
+    nthreads=None,
     verbose=False,
 ):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
@@ -141,11 +143,16 @@ def make_maps(
         PCG stops when |r|^2/|b|^2 < tol or after maxiter iterations.
     comm : mpi4py communicator or None
         Every rank of `comm` must call this function.
+    nthreads : int or None
+        Threads per process (FFTs, ducc0, numba). None: OMP_NUM_THREADS if set,
+        else 1, as in litebird_sim; with MPI, use (cores per node) / (processes
+        per node).
     """
     # Group chunks by length: each group is one GLS block
+    nthreads = resolve_nthreads(nthreads)
     groups = {}
     for d in data:
-        pix, angle = _pixels_and_angles(d, nside, coordinates)
+        pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
         fs = d.sampling_rate_hz
         sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
         for a, b in _chunk_bounds(len(d.tod), max(1, int(round(chunk_s * fs)))):
@@ -165,6 +172,7 @@ def make_maps(
         preconditioner=preconditioner,
         min_pol_rcond=min_pol_rcond,
         comm=comm,
+        nthreads=nthreads,
     )
     m, info = gls.solve(blocks["tod"], tol=tol, maxiter=maxiter, verbose=verbose)
 

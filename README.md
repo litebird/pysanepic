@@ -109,6 +109,17 @@ The conventions are the same as litebird_sim:
 | `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of PᵀN⁻¹P per pixel; `"jacobi"`: original SANEPIC (I diagonal, Q/U = 2/diag_I) |
 | `tol`, `maxiter` | 1e-12, 2000 | PCG stops when \|r\|²/\|b\|² < `tol` |
 | `comm` | `None` | mpi4py communicator; each rank passes only its own data |
+| `nthreads` | `None` | Threads per process (FFTs, ducc0, numba); `None`: `OMP_NUM_THREADS` if set, else 1 |
+
+### MPI and threads
+
+With MPI each process passes only its own data (`DetectorData` objects, or
+litebird_sim observations); the maps are replicated on all processes and
+summed with one `Allreduce` per iteration. Within each process, FFTs, ducc0 and
+numba kernels use `nthreads` threads. As in litebird_sim, the default is
+`OMP_NUM_THREADS` or, if it is not set, **1 thread**, to avoid oversubscription
+when several MPI processes share a node: set
+`OMP_NUM_THREADS = cores per node / processes per node`.
 
 ### Low-level interface
 

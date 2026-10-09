@@ -10,9 +10,32 @@ of arrays for chunks of different lengths. Noise weights of a block have shape
 (nchunk, ns//2+1) and are defined so that the filter is irfft(rfft(t) * w).
 """
 
+import os
+from contextlib import contextmanager
+
 import numba
 import numpy as np
 import scipy.fft
+
+
+def resolve_nthreads(nthreads=None):
+    """Number of threads per process: `nthreads` if given, else OMP_NUM_THREADS,
+    else 1 (as in litebird_sim, to avoid oversubscription with several MPI
+    processes per node)."""
+    if nthreads is not None:
+        return int(nthreads)
+    return int(os.environ.get("OMP_NUM_THREADS", 1))
+
+
+@contextmanager
+def numba_threads(nthreads):
+    """Run numba parallel kernels with `nthreads` threads (capped by numba's pool)."""
+    old = numba.get_num_threads()
+    numba.set_num_threads(max(1, min(nthreads, numba.config.NUMBA_NUM_THREADS)))
+    try:
+        yield
+    finally:
+        numba.set_num_threads(old)
 
 
 def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0):
@@ -33,9 +56,9 @@ def _blocks(x):
     return list(x) if isinstance(x, (list, tuple)) else [x]
 
 
-def _filter(t, w):
+def _filter(t, w, workers):
     ns = t.shape[-1]
-    return scipy.fft.irfft(scipy.fft.rfft(t, axis=-1, workers=-1) * w, n=ns, axis=-1, workers=-1)
+    return scipy.fft.irfft(scipy.fft.rfft(t, axis=-1, workers=workers) * w, n=ns, axis=-1, workers=workers)
 
 
 @numba.njit(cache=True)
@@ -102,11 +125,14 @@ class GLS:
     comm : mpi4py communicator or None
         With MPI, each rank passes only its own chunks (possibly none); maps
         are replicated on all ranks and P^T is summed with Allreduce.
+    nthreads : int or None
+        Threads per process for the FFTs; None: OMP_NUM_THREADS, else 1.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None):
         pix, self.weights = _blocks(pix), _blocks(weights)
         self.comm = comm
+        self.nthreads = resolve_nthreads(nthreads)
         local = np.unique(np.concatenate([p.ravel() for p in pix] or [np.empty(0, np.int64)]))
         self.pixels = local if comm is None else np.unique(np.concatenate(comm.allgather(local)))
         self.ip = [np.searchsorted(self.pixels, p) for p in pix]
@@ -211,7 +237,7 @@ class GLS:
         return self._sum(out) * self.mask
 
     def _filter_all(self, tod):
-        return [_filter(t, w) for t, w in zip(_blocks(tod), self.weights)]
+        return [_filter(t, w, self.nthreads) for t, w in zip(_blocks(tod), self.weights)]
 
     def apply_A(self, m):
         return self.backproject(self._filter_all(self.project(m)))
