@@ -14,6 +14,20 @@ import numpy as np
 import scipy.fft
 
 
+def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0):
+    """Inverse noise PSD on the rfft grid of a chunk of `ns` samples.
+
+    Model: P(f) = sigma^2 (f^alpha + fknee^alpha) / (f^alpha + fmin^alpha), the
+    litebird_sim "toast" model; sigma is the white-noise rms per sample, so that
+    for white noise the filter is exactly 1/sigma^2. With fmin = 0 the DC weight
+    is 0 and the mean of each chunk is not used.
+    """
+    fa = np.fft.rfftfreq(ns, 1.0 / fsamp_hz) ** alpha
+    num, den = fa + fmin_hz**alpha, fa + fknee_hz**alpha
+    ratio = np.divide(num, den, out=np.ones_like(fa), where=den > 0)  # fknee = 0: white
+    return ratio / sigma**2
+
+
 def _filter(t, w):
     ns = t.shape[-1]
     return scipy.fft.irfft(scipy.fft.rfft(t, axis=-1, workers=-1) * w, n=ns, axis=-1, workers=-1)
