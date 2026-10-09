@@ -21,6 +21,14 @@ jobs:
       - name: Install pysanepic
         run: pip install -e ".[test]"
 
+      - name: MPI diagnostics
+        run: |
+          which -a mpirun mpicxx mpic++ || true
+          ls -l /etc/alternatives/ | grep -i mpi || true
+          mpicxx -show || true
+          mpirun --version || true
+          mpirun -n 2 python -c "from mpi4py import MPI; print('size', MPI.COMM_WORLD.size, MPI.Get_library_version()[:40])"
+
       - name: Build the C++ SANEPIC reference
         run: make -C cpp ARCH=linux
 
