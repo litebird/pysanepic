@@ -34,7 +34,30 @@ def test_mpi_matches_serial():
         assert rel < 1e-8
 
 
+def test_make_maps_mpi_padding():
+    """make_maps with padding: data split across ranks gives the serial result."""
+    import healpy as hp
+
+    from pysanepic import make_maps
+    from test_mapmaker import _four_detectors
+
+    comm = MPI.COMM_WORLD
+    nside, n, fs = 16, 60_000, 10.0
+    rng = np.random.default_rng(0)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _four_detectors(n, fs, rng, sky, nside)
+    kw = dict(coordinates="E", chunk_s=1200.0, pad_s=300.0, tol=1e-20)
+    res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
+    if comm.rank == 0:
+        ref = make_maps(data, nside, **kw)
+        assert np.array_equal(res.hit_map, ref.hit_map)
+        seen = ref.maps != hp.UNSEEN
+        assert np.array_equal(res.maps != hp.UNSEEN, seen)
+        assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
+    test_make_maps_mpi_padding()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

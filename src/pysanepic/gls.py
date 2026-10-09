@@ -82,6 +82,22 @@ def _block_circulant(ip, c, c2, s2, nobs, pol):
             stop = start
             while stop < ns and ip[k, order[stop]] == p:
                 stop += 1
+            n = stop - start
+            # Contiguous run of samples with no polarization sensitivity (e.g. the
+            # padding of a chunk): sum over lags in O(n) instead of O(n^2)
+            unpol = True
+            if pol:
+                for a in range(start, stop):
+                    if c2[k, order[a]] != 0.0 or s2[k, order[a]] != 0.0:
+                        unpol = False
+                        break
+            if unpol and order[stop - 1] - order[start] == n - 1:
+                acc = 0.0
+                for lag in range(-(n - 1), n):
+                    acc += (n - abs(lag)) * c[k, lag % ns]
+                out[p, 0] += acc
+                start = stop
+                continue
             for a in range(start, stop):
                 ta = order[a]
                 for b in range(start, stop):
@@ -109,10 +125,11 @@ class GLS:
         Polarization angle of each sample. None for intensity only.
     weights : float array (nchunk, ns//2+1), or list (one per block)
         Inverse noise power spectrum of each chunk on the rfft grid.
-    pol_efficiency : float array (nchunk,), or list (one per block), or None
-        Polarization efficiency of each chunk; None means 1.
+    pol_efficiency : float array (nchunk,) or (nchunk, ns), or list (one per block), or None
+        Polarization efficiency of each chunk or sample; None means 1. Samples with
+        efficiency < 0.5 do not count as polarized hits (as in SANEPIC).
     min_pol_hits : int
-        Q/U are not solved in pixels with fewer hits (degenerate).
+        Q/U are not solved in pixels with fewer polarized hits (degenerate).
     min_pol_rcond : float
         Q/U are not solved in pixels whose angle-coverage matrix
         sum_t w_t w_t^T, w = (1, gamma cos 2a, gamma sin 2a), has a reciprocal
@@ -142,14 +159,19 @@ class GLS:
         if self.pol:
             psi = _blocks(psi)
             eff = [1.0] * len(psi) if pol_efficiency is None else _blocks(pol_efficiency)
-            g = [np.asarray(e, dtype=float).reshape(-1, 1) for e in eff]
+            g = [np.asarray(e, dtype=float) for e in eff]
+            g = [e.reshape(-1, 1) if e.ndim <= 1 else e for e in g]
             self.cos2 = [gb * np.cos(2 * s) for gb, s in zip(g, psi)]
             self.sin2 = [gb * np.sin(2 * s) for gb, s in zip(g, psi)]
 
         self.hits = self._sum(sum((np.bincount(ip.ravel(), minlength=self.nobs) for ip in self.ip), np.zeros(self.nobs, np.int64)))
         self.mask = np.ones((self.ncomp, self.nobs), dtype=bool)
         if self.pol:
-            self.mask[1:] = self.hits >= min_pol_hits
+            polarized = [(c2 * c2 + s2 * s2) > 0.25 for c2, s2 in zip(self.cos2, self.sin2)]
+            pol_hits = self._sum(
+                sum((np.bincount(ip.ravel(), w.ravel(), minlength=self.nobs) for ip, w in zip(self.ip, polarized)), np.zeros(self.nobs))
+            )
+            self.mask[1:] = pol_hits >= min_pol_hits
             if min_pol_rcond > 0:
                 self.mask[1:] &= self._pol_rcond() >= min_pol_rcond
 
@@ -175,8 +197,9 @@ class GLS:
         n, c, s, cc, cs, ss = self.hits.astype(float), *cov[1:]
         M = np.stack([n, c, s, c, cc, cs, s, cs, ss], axis=1).reshape(-1, 3, 3)
         rcond = np.zeros(self.nobs)
-        seen = self.hits > 0
-        rcond[seen] = 1.0 / np.linalg.cond(M[seen])
+        seen = self.mask[1]  # pixels with enough polarized hits
+        with np.errstate(divide="ignore"):
+            rcond[seen] = 1.0 / np.linalg.cond(M[seen])
         return rcond
 
     def _set_preconditioner(self, blocks, kind):
@@ -283,5 +306,6 @@ class GLS:
     def to_healpix(self, m, nside, fill=np.nan):
         """Expand (ncomp, nobs) to full RING maps (ncomp, 12 nside^2)."""
         full = np.full((m.shape[0], 12 * nside * nside), fill)
-        full[:, self.pixels] = np.where(self.mask, m, fill)
+        sky = self.pixels < full.shape[1]  # labels beyond the map are virtual pixels
+        full[:, self.pixels[sky]] = np.where(self.mask, m, fill)[:, sky]
         return full

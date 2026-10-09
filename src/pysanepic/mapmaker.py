@@ -98,6 +98,35 @@ def _pixels_and_angles(d, nside, coordinates, nthreads):
     return pix, angle
 
 
+def _pad(tod, m, fill, nfit_max=20000):
+    """Extend a chunk by m samples on each side so that N^-1, applied with FFTs,
+    does not see the jump between its two ends (the SANEPIC "inpaint").
+
+    "zeros": zero padding. "extrapolate" (SANEPIC's choice, with its bugs fixed):
+    linear fit over the first/last samples, extrapolated into the margins and
+    tapered with a cosine to the chunk mean, so that the two ends join
+    continuously.
+    """
+    if fill == "zeros":
+        return np.concatenate([np.zeros(m), tod, np.zeros(m)])
+    if fill != "extrapolate":
+        raise ValueError(f"Unknown pad_fill {fill!r}: use 'extrapolate' or 'zeros'")
+    nfit = min(nfit_max, tod.size)
+    x = np.arange(nfit) - (nfit - 1) / 2
+
+    def fit(seg):
+        a = seg.mean()
+        return a, np.dot(seg - a, x) / np.dot(x, x)
+
+    a_l, b_l = fit(tod[:nfit])
+    a_r, b_r = fit(tod[-nfit:])
+    left = a_l + b_l * (np.arange(-m, 0) - (nfit - 1) / 2)
+    right = a_r + b_r * (np.arange(nfit, nfit + m) - (nfit - 1) / 2)
+    mean = tod.mean()
+    taper = (1 - np.cos(np.pi * np.arange(m) / m)) / 2  # 0 far from the data, -> 1 next to it
+    return np.concatenate([(left - mean) * taper + mean, tod, (right - mean) * taper[::-1] + mean])
+
+
 def _chunk_bounds(n, ns):
     """Split n samples into chunks of ns; the leftover goes into the last chunk."""
     nchunk = max(1, n // ns)
@@ -110,6 +139,8 @@ def make_maps(
     nside,
     coordinates="G",
     chunk_s=3600.0,
+    pad_s=0.0,
+    pad_fill="zeros",
     pol=True,
     preconditioner="block",
     min_pol_rcond=1e-2,
@@ -132,6 +163,17 @@ def make_maps(
     chunk_s : float
         N^-1 is applied independently on chunks of this duration (seconds);
         longer chunks capture lower frequencies but cost more.
+    pad_s : float
+        Each chunk is extended by this duration (seconds) on both sides before
+        applying N^-1, to avoid the wrap-around of the FFT (SANEPIC's "inpaint").
+        The padding is fitted by one offset per margin ("virtual pixels", not in
+        the output maps). 0 (default) disables it.
+    pad_fill : str
+        "zeros" (default) or "extrapolate" (SANEPIC's default: linear
+        extrapolation tapered to the chunk mean). Zeros are exactly described by
+        the margin offsets, so they add no bias; "extrapolate" leaves a small
+        unmodelled signal that 1/f weighting spreads into the map, but with a
+        steep 1/f noise (drifting data) it reduces the edge effects more.
     pol : bool
         Solve for I/Q/U (True) or I only.
     preconditioner : str
@@ -150,18 +192,32 @@ def make_maps(
     """
     # Group chunks by length: each group is one GLS block
     nthreads = resolve_nthreads(nthreads)
+    npix = 12 * nside * nside
+    rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
+    n_virtual = 0  # padding margins on this rank; labels are unique across ranks
     groups = {}
     for d in data:
         pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
         fs = d.sampling_rate_hz
         sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
+        m = int(round(pad_s * fs))
         for a, b in _chunk_bounds(len(d.tod), max(1, int(round(chunk_s * fs)))):
-            g = groups.setdefault(b - a, {"pix": [], "psi": [], "tod": [], "w": [], "gamma": []})
-            g["pix"].append(pix[a:b])
-            g["psi"].append(angle[a:b])
-            g["tod"].append(d.tod[a:b])
-            g["gamma"].append(d.pol_efficiency)
-            g["w"].append(one_over_f_weights(b - a, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz))
+            n = b - a + 2 * m
+            g = groups.setdefault(n, {"pix": [], "psi": [], "tod": [], "w": [], "gamma": []})
+            if m == 0:
+                g["pix"].append(pix[a:b])
+                g["psi"].append(angle[a:b])
+                g["tod"].append(d.tod[a:b])
+                g["gamma"].append(d.pol_efficiency)
+            else:
+                left = npix + 2 * (n_virtual * size + rank)
+                n_virtual += 1
+                g["pix"].append(np.concatenate([np.full(m, left), pix[a:b], np.full(m, left + 1)]))
+                g["psi"].append(np.concatenate([np.zeros(m), angle[a:b], np.zeros(m)]))
+                g["tod"].append(_pad(d.tod[a:b], m, pad_fill))
+                # the margins carry no polarization: their virtual pixels are intensity only
+                g["gamma"].append(np.concatenate([np.zeros(m), np.full(b - a, d.pol_efficiency), np.zeros(m)]))
+            g["w"].append(one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz))
 
     blocks = {k: [np.array(g[k]) for g in groups.values()] for k in ("pix", "psi", "tod", "w", "gamma")}
     gls = GLS(
@@ -176,8 +232,9 @@ def make_maps(
     )
     m, info = gls.solve(blocks["tod"], tol=tol, maxiter=maxiter, verbose=verbose)
 
-    hit_map = np.zeros(12 * nside * nside, dtype=np.int64)
-    hit_map[gls.pixels] = gls.hits
+    hit_map = np.zeros(npix, dtype=np.int64)
+    sky = gls.pixels < npix
+    hit_map[gls.pixels[sky]] = gls.hits[sky]
     return MapResult(
         maps=gls.to_healpix(m, nside, fill=hp.UNSEEN),
         hit_map=hit_map,

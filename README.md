@@ -43,7 +43,9 @@ Example notebooks:
   without HWP and with 1/f noise, compared with the litebird_sim binner and
   destriper;
 - [`preconditioner.ipynb`](notebooks/preconditioner.ipynb): block vs SANEPIC's
-  Jacobi preconditioner, and the Q/U conditioning criterion.
+  Jacobi preconditioner, and the Q/U conditioning criterion;
+- [`padding.ipynb`](notebooks/padding.ipynb): chunk length and padding, with
+  the IMO 1/f noise and with a steeper 1/f noise.
 
 ## Usage without litebird_sim
 
@@ -104,6 +106,8 @@ The conventions are the same as litebird_sim:
 | `nside` | | HEALPix resolution of the output maps (RING) |
 | `coordinates` | `"G"` | Coordinate system of the output maps |
 | `chunk_s` | 3600 | N⁻¹ is applied on chunks of this duration [s]; longer chunks capture lower frequencies |
+| `pad_s` | 0 | Padding added on both sides of each chunk [s], so that the FFT wrap-around falls outside the data (SANEPIC's "inpaint"); each margin is fitted by an offset not included in the maps |
+| `pad_fill` | `"zeros"` | `"zeros"` (no bias) or `"extrapolate"` (SANEPIC's linear extrapolation tapered to the chunk mean; better with a steep 1/f noise, slightly biased otherwise) |
 | `pol` | `True` | Solve for I, Q, U, or I only |
 | `min_pol_rcond` | 1e-2 | Q/U are solved only in pixels whose polarization-angle coverage has a reciprocal condition number ≥ this (and ≥ 4 hits); elsewhere only I. 0 disables the check, as in SANEPIC |
 | `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of PᵀN⁻¹P per pixel; `"jacobi"`: original SANEPIC (I diagonal, Q/U = 2/diag_I) |
