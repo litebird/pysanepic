@@ -7,8 +7,11 @@ pysanepic is a Python port of [SANEPIC](https://github.com/patanch/SANEPIC)
 problem (PᵀN⁻¹P) m = PᵀN⁻¹d with preconditioned conjugate gradients, applying
 N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
 
+- Designed for experiments **without HWP**, where 1/f noise affects both
+  intensity and polarization. An ideal HWP is supported too: pysanepic only
+  needs the TOD and the pointings (and the HWP angle, if any).
 - Pure Python with numba, scipy.fft and ducc0; runs with MPI (mpi4py).
-- Supports an ideal HWP, polarization efficiency and any coordinate system.
+- Supports polarization efficiency and any coordinate system.
 - Independent of any simulation pipeline: data are passed as plain arrays.
 - Validated against the original C++ code, which is kept in `cpp/`.
 
@@ -36,10 +39,11 @@ merged, install litebird_sim from the `sanepic_gls` branch.
 
 Example notebooks:
 
-- [`lbs_example.ipynb`](notebooks/lbs_example.ipynb): one day of LiteBIRD with
-  HWP and 1/f noise, compared with the litebird_sim binner and destriper;
+- [`lbs_example.ipynb`](notebooks/lbs_example.ipynb): one day of LiteBIRD
+  without HWP and with 1/f noise, compared with the litebird_sim binner and
+  destriper;
 - [`preconditioner.ipynb`](notebooks/preconditioner.ipynb): block vs SANEPIC's
-  Jacobi preconditioner, with and without HWP.
+  Jacobi preconditioner, and the Q/U conditioning criterion.
 
 ## Usage without litebird_sim
 
