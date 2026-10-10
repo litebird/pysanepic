@@ -82,10 +82,10 @@ def _efficiency_chunks(eff, psi):
 
 
 def _filter(t, w, nthreads):
-    """irfft(rfft(t) * w); ducc0 parallelizes a single 1D FFT, scipy does not."""
-    f = ducc0.fft.r2c(t, nthreads=nthreads)
+    """irfft(rfft(t) * w) along the last axis; t may be a batch of chunks (2D)."""
+    f = ducc0.fft.r2c(t, axes=(-1,), nthreads=nthreads)
     f *= w
-    return ducc0.fft.c2r(f, lastsize=t.size, forward=False, inorm=2, nthreads=nthreads)
+    return ducc0.fft.c2r(f, axes=(-1,), lastsize=t.shape[-1], forward=False, inorm=2, nthreads=nthreads)
 
 
 @numba.njit(parallel=True, cache=True)
@@ -227,12 +227,15 @@ class GLS:
         are replicated on all ranks and P^T is summed with Allreduce.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
+    pol_weights : (cos2, sin2) or None
+        Instead of psi and pol_efficiency: gamma cos 2a and gamma sin 2a of each
+        sample, laid out like `pix` (used without copies if of `angle_dtype`).
     angle_dtype : np.float32 (default) or np.float64
         Storage of gamma cos 2a and gamma sin 2a (angle error ~1e-7 rad in
         float32; pass angles reduced mod pi for that precision).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_weights=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -243,10 +246,12 @@ class GLS:
         self.weights = _chunks(weights)
         nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
-        self.pol = psi is not None
+        self.pol = psi is not None or pol_weights is not None
         self.ncomp = 3 if self.pol else 1
         self._dummy = np.zeros(1, angle_dtype)
-        if self.pol:
+        if pol_weights is not None:
+            self.cos2, self.sin2 = ([np.ascontiguousarray(x, dtype=angle_dtype) for x in _chunks(w)] for w in pol_weights)
+        elif self.pol:
             eff = [1.0] * len(_as_list(psi)) if pol_efficiency is None else _as_list(pol_efficiency)
             gamma = _efficiency_chunks(eff, psi)
             psi = _chunks(psi)
@@ -275,6 +280,15 @@ class GLS:
         if np.any(blocks[self.mask[0], 0] <= 0):
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
         self._set_preconditioner(blocks, preconditioner)
+        # ponytail: batches of nthreads chunks; temporaries ~24 bytes per sample of
+        # the batch (1.2 GB for 8 one-day chunks at 75 Hz); cap the batch if it matters
+        self._batches = []
+        for k, ip in enumerate(self.ip):
+            b = self._batches[-1] if self._batches else None
+            if b and len(b) < self.nthreads and self.ip[b[0]].size == ip.size:
+                b.append(k)
+            else:
+                self._batches.append([k])
         # private maps of the threads for P^T
         self._buf = np.zeros((min(self.nthreads, numba.config.NUMBA_NUM_THREADS), self.ncomp, self.nobs))
 
@@ -332,14 +346,22 @@ class GLS:
         buf[:] = 0.0
         with numba_threads(self.nthreads):
             nt = numba.get_num_threads()
-            for k, ip in enumerate(self.ip):
-                pol, c2, s2 = self._pol_arrays(k)
-                if m is None:
-                    t = np.asarray(tod[k], dtype=float)
-                else:
-                    t = np.empty(ip.size)
-                    _project(ip, m, c2, s2, pol, t)
-                _backproject(ip, _filter(t, self.weights[k], self.nthreads), c2, s2, pol, buf[:nt])
+            for batch in self._batches:
+                # consecutive chunks of the same length: one FFT call, one thread per chunk
+                t = np.empty((len(batch), self.ip[batch[0]].size))
+                for i, k in enumerate(batch):
+                    pol, c2, s2 = self._pol_arrays(k)
+                    if m is None:
+                        t[i] = tod[k]
+                    else:
+                        _project(self.ip[k], m, c2, s2, pol, t[i])
+                w = self.weights[batch[0]]
+                if any(self.weights[k] is not w for k in batch):
+                    w = np.stack([self.weights[k] for k in batch])
+                t = _filter(t, w, self.nthreads)
+                for i, k in enumerate(batch):
+                    pol, c2, s2 = self._pol_arrays(k)
+                    _backproject(self.ip[k], t[i], c2, s2, pol, buf[:nt])
         return self._sum(buf.sum(axis=0)) * self.mask
 
     def apply_A(self, m):
