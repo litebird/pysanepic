@@ -125,6 +125,9 @@ numba kernels use `nthreads` threads. As in litebird_sim, the default is
 when several MPI processes share a node: set
 `OMP_NUM_THREADS = cores per node / processes per node`.
 
+The projection P and its transpose Pᵀ are parallel numba kernels; Pᵀ keeps one
+private copy of the I/Q/U map per thread (about 75 MB per thread at nside 512).
+
 ### Low-level interface
 
 `pysanepic.GLS` works directly on pixel indices, polarization angles and noise

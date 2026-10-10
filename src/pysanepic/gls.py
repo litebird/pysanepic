@@ -61,6 +61,39 @@ def _filter(t, w, workers):
     return scipy.fft.irfft(scipy.fft.rfft(t, axis=-1, workers=workers) * w, n=ns, axis=-1, workers=workers)
 
 
+@numba.njit(parallel=True, cache=True)
+def _project(ip, m, c2, s2, pol, out):
+    """out[i] = I[p] + c2[i] Q[p] + s2[i] U[p], p = ip[i] (flattened samples)."""
+    for i in numba.prange(ip.size):
+        p = ip[i]
+        v = m[0, p]
+        if pol:
+            v += m[1, p] * c2[i] + m[2, p] * s2[i]
+        out[i] = v
+
+
+@numba.njit(parallel=True, cache=True)
+def _backproject(ip, t, c2, s2, pol, out, nthreads):
+    """out += P^T t (flattened samples). Each thread accumulates into a private
+    copy of the map, then the copies are summed pixel by pixel."""
+    # ponytail: nthreads private maps (~75 MB each at nside 512, I/Q/U); switch to
+    # pixel-sorted samples if memory per process becomes the limit
+    ncomp, nobs = out.shape
+    buf = np.zeros((nthreads, ncomp, nobs))
+    step = (ip.size + nthreads - 1) // nthreads
+    for th in numba.prange(nthreads):
+        for i in range(th * step, min(ip.size, (th + 1) * step)):
+            p = ip[i]
+            buf[th, 0, p] += t[i]
+            if pol:
+                buf[th, 1, p] += t[i] * c2[i]
+                buf[th, 2, p] += t[i] * s2[i]
+    for j in numba.prange(nobs):
+        for th in range(nthreads):
+            for c in range(ncomp):
+                out[c, j] += buf[th, c, j]
+
+
 @numba.njit(cache=True)
 def _block_circulant(ip, c, c2, s2, nobs, pol):
     """Exact per-pixel blocks of P^T C P, C circulant per chunk.
@@ -153,6 +186,7 @@ class GLS:
         local = np.unique(np.concatenate([p.ravel() for p in pix] or [np.empty(0, np.int64)]))
         self.pixels = local if comm is None else np.unique(np.concatenate(comm.allgather(local)))
         self.ip = [np.searchsorted(self.pixels, p) for p in pix]
+        self._dummy = np.zeros(1)
         self.nobs = self.pixels.size
         self.pol = psi is not None
         self.ncomp = 3 if self.pol else 1
@@ -238,25 +272,29 @@ class GLS:
         self.comm.Allreduce(np.ascontiguousarray(x), out)
         return out
 
+    def _pol_arrays(self, k):
+        if self.pol:
+            return True, self.cos2[k].ravel(), self.sin2[k].ravel()
+        return False, self._dummy, self._dummy
+
     def project(self, m):
         """P m: map (ncomp, nobs) -> list of timeline blocks."""
         out = []
-        for k, ip in enumerate(self.ip):
-            t = m[0][ip]
-            if self.pol:
-                t = t + m[1][ip] * self.cos2[k] + m[2][ip] * self.sin2[k]
-            out.append(t)
+        with numba_threads(self.nthreads):
+            for k, ip in enumerate(self.ip):
+                t = np.empty(ip.shape)
+                pol, c2, s2 = self._pol_arrays(k)
+                _project(ip.ravel(), m, c2, s2, pol, t.ravel())
+                out.append(t)
         return out
 
     def backproject(self, tod):
         """P^T t: timeline block(s) -> map (ncomp, nobs)."""
         out = np.zeros((self.ncomp, self.nobs))
-        for k, (ip, t) in enumerate(zip(self.ip, _blocks(tod))):
-            ip = ip.ravel()
-            out[0] += np.bincount(ip, t.ravel(), minlength=self.nobs)
-            if self.pol:
-                out[1] += np.bincount(ip, (t * self.cos2[k]).ravel(), minlength=self.nobs)
-                out[2] += np.bincount(ip, (t * self.sin2[k]).ravel(), minlength=self.nobs)
+        with numba_threads(self.nthreads):
+            for k, (ip, t) in enumerate(zip(self.ip, _blocks(tod))):
+                pol, c2, s2 = self._pol_arrays(k)
+                _backproject(ip.ravel(), np.ascontiguousarray(t).ravel(), c2, s2, pol, out, numba.get_num_threads())
         return self._sum(out) * self.mask
 
     def _filter_all(self, tod):
