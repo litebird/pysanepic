@@ -149,15 +149,15 @@ private copy of the I/Q/U map per thread (about 75 MB per thread at nside 512).
 
 The TODs are used without copies, and P, N⁻¹ and Pᵀ are applied one chunk at a
 time. Besides the TODs, pysanepic keeps 12 bytes per sample (int32 pixel,
-float32 γ cos 2a and γ sin 2a; 20 with `angle_dtype=np.float64`), 16 during the
-setup, plus a few maps. The maps are replicated on every process: I/Q/U at
+float32 γ cos 2a and γ sin 2a, computed from the float64 angles; 20 with
+`angle_dtype=np.float64`), also during the setup, plus a few maps. The maps are replicated on every process: I/Q/U at
 nside 2048 takes 1.2 GB per vector, and the PCG needs about ten of them
 (vectors, 3×3 preconditioner, one private map per thread), so the
 resolution, not the data, sets the memory above nside ~1024. Pixel indices
 are int32, which is enough up to nside 8192. With
 litebird_sim the pointings are computed one detector at a time and never stored.
 On G100 (16 detectors at 75 Hz for 7 days, nside 512, 16 processes × 3 threads),
-the peak memory per process is 2.7 GB, of which 1.2 GB are the simulation.
+the peak memory per process is 2.5 GB, of which 1.2 GB are the simulation.
 
 ### Low-level interface
 

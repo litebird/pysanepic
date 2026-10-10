@@ -227,11 +227,11 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
-    pix_c, psi_c, gamma_c, tod_c, w_c = [], [], [], [], []
+    pix_c, cos_c, sin_c, tod_c, w_c = [], [], [], [], []
     weights = {}  # chunks with the same length and noise share one array
+    dtype = params.angle_dtype
     for d in data:  # one detector at a time: only its pointings are in memory
         pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
-        angle = np.mod(angle, np.pi)  # only 2a matters; keeps float32 precise with a spinning HWP
         fs = d.sampling_rate_hz
         sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
         m = int(round(params.pad_s * fs))
@@ -241,37 +241,37 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
             if key not in weights:
                 weights[key] = one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
             w_c.append(weights[key])
+            # gamma cos 2a, gamma sin 2a computed in float64, then stored as `dtype`;
+            # the margins of a padded chunk carry no polarization (intensity-only
+            # virtual pixels)
+            if params.pol:
+                c2, s2 = np.zeros(n, dtype), np.zeros(n, dtype)
+                c2[m : n - m] = d.pol_efficiency * np.cos(2 * angle[a:b])
+                s2[m : n - m] = d.pol_efficiency * np.sin(2 * angle[a:b])
+                cos_c.append(c2)
+                sin_c.append(s2)
             if m == 0:
                 pix_c.append(pix[a:b].astype(np.int32))
-                psi_c.append(angle[a:b].astype(params.angle_dtype))
                 tod_c.append(d.tod[a:b])  # a view: the TOD is not copied
-                gamma_c.append(d.pol_efficiency)
             else:
                 left = npix + 2 * (n_virtual * size + rank)
                 n_virtual += 1
                 pix_c.append(np.concatenate([np.full(m, left), pix[a:b], np.full(m, left + 1)]).astype(np.int32))
-                psi_c.append(np.concatenate([np.zeros(m), angle[a:b], np.zeros(m)]).astype(params.angle_dtype))
                 tod_c.append(_pad(d.tod[a:b], m, params.pad_fill))
-                # the margins carry no polarization: their virtual pixels are intensity only
-                g = np.full(n, d.pol_efficiency, dtype=np.float32)
-                g[:m] = g[-m:] = 0
-                gamma_c.append(g)
         del pix, angle
 
-    # ponytail: psi_c (4 B/sample) and GLS's cos/sin (8 B) coexist during setup;
-    # build cos/sin here directly if this peak matters
     gls = GLS(
         pix_c,
-        psi_c if params.pol else None,
+        None,
         w_c,
-        pol_efficiency=gamma_c if params.pol else None,
+        pol_weights=(cos_c, sin_c) if params.pol else None,
         preconditioner=params.preconditioner,
         min_pol_rcond=params.min_pol_rcond,
         comm=comm,
         nthreads=nthreads,
-        angle_dtype=params.angle_dtype,
+        angle_dtype=dtype,
     )
-    del pix_c, psi_c, gamma_c
+    del pix_c, cos_c, sin_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
 
     hit_map = np.zeros(npix, dtype=np.int64)

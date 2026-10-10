@@ -82,7 +82,9 @@ def _efficiency_chunks(eff, psi):
 
 
 def _filter(t, w, nthreads):
-    """irfft(rfft(t) * w); ducc0 parallelizes a single 1D FFT, scipy does not."""
+    """irfft(rfft(t) * w); ducc0 parallelizes a single 1D FFT, scipy does not.
+    Batching several chunks per call was 2.4x faster on an idle node but gave
+    nothing on a full one (memory bandwidth bound), so chunks go one at a time."""
     f = ducc0.fft.r2c(t, nthreads=nthreads)
     f *= w
     return ducc0.fft.c2r(f, lastsize=t.size, forward=False, inorm=2, nthreads=nthreads)
@@ -227,12 +229,15 @@ class GLS:
         are replicated on all ranks and P^T is summed with Allreduce.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
+    pol_weights : (cos2, sin2) or None
+        Instead of psi and pol_efficiency: gamma cos 2a and gamma sin 2a of each
+        sample, laid out like `pix` (used without copies if of `angle_dtype`).
     angle_dtype : np.float32 (default) or np.float64
         Storage of gamma cos 2a and gamma sin 2a (angle error ~1e-7 rad in
         float32; pass angles reduced mod pi for that precision).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_weights=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -243,10 +248,12 @@ class GLS:
         self.weights = _chunks(weights)
         nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
-        self.pol = psi is not None
+        self.pol = psi is not None or pol_weights is not None
         self.ncomp = 3 if self.pol else 1
         self._dummy = np.zeros(1, angle_dtype)
-        if self.pol:
+        if pol_weights is not None:
+            self.cos2, self.sin2 = ([np.ascontiguousarray(x, dtype=angle_dtype) for x in _chunks(w)] for w in pol_weights)
+        elif self.pol:
             eff = [1.0] * len(_as_list(psi)) if pol_efficiency is None else _as_list(pol_efficiency)
             gamma = _efficiency_chunks(eff, psi)
             psi = _chunks(psi)
