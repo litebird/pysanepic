@@ -1,8 +1,10 @@
 """High-level map-making: from detector timelines and pointings to maps.
 
-Any pipeline (litebird_sim, files on disk, ...) only needs to fill a list of
-:class:`DetectorData`; pysanepic computes pixels, polarization angles, chunks
-and noise weights itself, with one set of conventions documented here.
+Any pipeline (litebird_sim, files on disk, ...) only needs to provide
+:class:`DetectorData` objects, as a list or as a generator (then only one
+detector's pointings are in memory at a time); pysanepic computes pixels,
+polarization angles, chunks and noise weights itself, with one set of
+conventions documented here.
 """
 
 from dataclasses import dataclass
@@ -15,13 +17,16 @@ import numpy as np
 from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DetectorData:
     """One detector over one contiguous stretch of time.
 
-    Pointing and polarization conventions (same as litebird_sim):
-    theta, phi are colatitude and longitude in `coordinates`; psi is the
-    orientation angle of the detector's frame. The polarization angle seen by
+    Pointing: either `theta`, `phi` (colatitude and longitude in `coordinates`)
+    or `pix`, the HEALPix RING pixel at resolution `nside`; with `pix`,
+    `coordinates` and `nside` must be those of the output maps. `psi` is the
+    orientation angle of the detector's frame in `coordinates`.
+
+    Polarization conventions (same as litebird_sim): The polarization angle seen by
     the sky is psi + pol_angle_rad without HWP, and
     psi + 2 hwp_angle - pol_angle_rad with an ideal HWP. The TOD model is
     d = I + pol_efficiency (Q cos 2a + U sin 2a) + noise, with `a` that angle.
@@ -31,9 +36,11 @@ class DetectorData:
     """
 
     tod: np.ndarray
-    theta: np.ndarray
-    phi: np.ndarray
     psi: np.ndarray
+    theta: np.ndarray | None = None
+    phi: np.ndarray | None = None
+    pix: np.ndarray | None = None
+    nside: int | None = None  # resolution of pix
     sampling_rate_hz: float
     net_ukrts: float
     fknee_hz: float = 0.0
@@ -84,7 +91,15 @@ def _rotate(theta, phi, psi, R, out):
 
 def _pixels_and_angles(d, nside, coordinates, nthreads):
     theta, phi, psi = d.theta, d.phi, d.psi
-    if d.coordinates != coordinates:
+    if d.pix is not None:
+        if d.nside != nside or d.coordinates != coordinates:
+            raise ValueError(
+                f"DetectorData.pix is at nside={d.nside}, coordinates={d.coordinates!r}: "
+                f"the maps need nside={nside}, coordinates={coordinates!r}"
+            )
+    elif theta is None or phi is None:
+        raise ValueError("DetectorData needs either theta and phi, or pix")
+    elif d.coordinates != coordinates:
         R = hp.Rotator(coord=[d.coordinates, coordinates]).mat
         out = np.empty((3, theta.size))
         with numba_threads(nthreads):
@@ -94,6 +109,8 @@ def _pixels_and_angles(d, nside, coordinates, nthreads):
         angle = psi + d.pol_angle_rad
     else:
         angle = psi + 2 * d.hwp_angle - d.pol_angle_rad
+    if d.pix is not None:
+        return d.pix, angle
     pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=nthreads)
     return pix, angle
 
@@ -154,8 +171,10 @@ def make_maps(
 
     Parameters
     ----------
-    data : list of DetectorData
-        With MPI, the data local to this rank (possibly empty).
+    data : iterable of DetectorData
+        A list, or a generator to keep the pointings of only one detector in
+        memory at a time (the TODs are used without copies). With MPI, the data
+        local to this rank (possibly empty).
     nside : int
         HEALPix resolution of the output maps (RING ordering).
     coordinates : str
@@ -190,51 +209,59 @@ def make_maps(
         else 1, as in litebird_sim; with MPI, use (cores per node) / (processes
         per node).
     """
-    # Group chunks by length: each group is one GLS block
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
-    groups = {}
-    for d in data:
+    pix_c, psi_c, gamma_c, tod_c, w_c = [], [], [], [], []
+    weights = {}  # chunks with the same length and noise share one array
+    for d in data:  # one detector at a time: only its pointings are in memory
         pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
+        angle = np.mod(angle, np.pi)  # only 2a matters; keeps float32 precise with a spinning HWP
         fs = d.sampling_rate_hz
         sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
         m = int(round(pad_s * fs))
         for a, b in _chunk_bounds(len(d.tod), max(1, int(round(chunk_s * fs)))):
             n = b - a + 2 * m
-            g = groups.setdefault(n, {"pix": [], "psi": [], "tod": [], "w": [], "gamma": []})
+            key = (n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
+            if key not in weights:
+                weights[key] = one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
+            w_c.append(weights[key])
             if m == 0:
-                g["pix"].append(pix[a:b])
-                g["psi"].append(angle[a:b])
-                g["tod"].append(d.tod[a:b])
-                g["gamma"].append(d.pol_efficiency)
+                pix_c.append(pix[a:b].astype(np.int32))
+                psi_c.append(angle[a:b].astype(np.float32))
+                tod_c.append(d.tod[a:b])  # a view: the TOD is not copied
+                gamma_c.append(d.pol_efficiency)
             else:
                 left = npix + 2 * (n_virtual * size + rank)
                 n_virtual += 1
-                g["pix"].append(np.concatenate([np.full(m, left), pix[a:b], np.full(m, left + 1)]))
-                g["psi"].append(np.concatenate([np.zeros(m), angle[a:b], np.zeros(m)]))
-                g["tod"].append(_pad(d.tod[a:b], m, pad_fill))
+                pix_c.append(np.concatenate([np.full(m, left), pix[a:b], np.full(m, left + 1)]).astype(np.int32))
+                psi_c.append(np.concatenate([np.zeros(m), angle[a:b], np.zeros(m)]).astype(np.float32))
+                tod_c.append(_pad(d.tod[a:b], m, pad_fill))
                 # the margins carry no polarization: their virtual pixels are intensity only
-                g["gamma"].append(np.concatenate([np.zeros(m), np.full(b - a, d.pol_efficiency), np.zeros(m)]))
-            g["w"].append(one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz))
+                g = np.full(n, d.pol_efficiency, dtype=np.float32)
+                g[:m] = g[-m:] = 0
+                gamma_c.append(g)
+        del pix, angle
 
-    blocks = {k: [np.array(g[k]) for g in groups.values()] for k in ("pix", "psi", "tod", "w", "gamma")}
+    # ponytail: psi_c (4 B/sample) and GLS's cos/sin (8 B) coexist during setup;
+    # build cos/sin here directly if this peak matters
     gls = GLS(
-        blocks["pix"],
-        blocks["psi"] if pol else None,
-        blocks["w"],
-        pol_efficiency=blocks["gamma"] if pol else None,
+        pix_c,
+        psi_c if pol else None,
+        w_c,
+        pol_efficiency=gamma_c if pol else None,
         preconditioner=preconditioner,
         min_pol_rcond=min_pol_rcond,
         comm=comm,
         nthreads=nthreads,
     )
-    m, info = gls.solve(blocks["tod"], tol=tol, maxiter=maxiter, verbose=verbose)
+    del pix_c, psi_c, gamma_c
+    m, info = gls.solve(tod_c, tol=tol, maxiter=maxiter, verbose=verbose)
 
     hit_map = np.zeros(npix, dtype=np.int64)
-    sky = gls.pixels < npix
-    hit_map[gls.pixels[sky]] = gls.hits[sky]
+    n = min(npix, gls.nobs)
+    hit_map[:n] = gls.hits[:n]
     return MapResult(
         maps=gls.to_healpix(m, nside, fill=hp.UNSEEN),
         hit_map=hit_map,

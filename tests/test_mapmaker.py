@@ -9,6 +9,7 @@ Run with: pytest tests/  (or: python tests/test_mapmaker.py)
 
 import healpy as hp
 import numpy as np
+import pytest
 
 from pysanepic import DetectorData, make_maps
 
@@ -50,14 +51,15 @@ def test_noiseless_recovers_sky():
         )
 
     # white noise model (fknee = 0): no degenerate offsets, so the sky is recovered to
-    # machine precision; tight tol because pixels with 4 hits are ill-conditioned
+    # the precision of the float32 cos/sin (~1e-8); tight tol because pixels with
+    # 4 hits are ill-conditioned
     res = make_maps(data, nside, coordinates="G", chunk_s=1700.0, tol=1e-24)
     assert res.converged
     seen = res.maps[1] != hp.UNSEEN
     assert seen.sum() > 0.5 * seen.size
     assert res.hit_map.sum() == 2 * n
     for i in range(3):
-        assert np.abs(res.maps[i][seen] - sky[i][seen]).max() < 1e-9 * np.abs(sky).max(), i
+        assert np.abs(res.maps[i][seen] - sky[i][seen]).max() < 1e-7 * np.abs(sky).max(), i
 
 
 def _four_detectors(n, fs, rng, sky, nside, noise=False):
@@ -100,6 +102,26 @@ def test_padding_noiseless():
     assert np.median(np.abs(err)) < 1e-2 * 1e-4
 
 
+def test_pixel_input_and_generator():
+    """Pixels instead of theta/phi, and a generator instead of a list: same maps."""
+    import dataclasses
+
+    nside, n, fs = 16, 40_000, 10.0
+    rng = np.random.default_rng(2)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _four_detectors(n, fs, rng, sky, nside)
+    common = dict(coordinates="E", chunk_s=1000.0, maxiter=20)
+    ref = make_maps(data, nside, **common)
+    with_pix = (
+        dataclasses.replace(d, theta=None, phi=None, pix=hp.ang2pix(nside, d.theta, d.phi), nside=nside)
+        for d in data
+    )
+    res = make_maps(with_pix, nside, **common)
+    assert np.array_equal(res.maps, ref.maps)
+    with pytest.raises(ValueError, match="nside"):
+        make_maps([dataclasses.replace(data[0], pix=np.zeros(n, int), nside=8)], nside, **common)
+
+
 def test_contiguous_run_kernel():
     """O(n) formula for contiguous unpolarized runs == sum over all sample pairs."""
     from pysanepic.gls import _block_circulant
@@ -112,7 +134,9 @@ def test_contiguous_run_kernel():
     ip[0, 50] = 2  # pixel 2 is not contiguous
     c = rng.normal(size=(1, ns))
     c = c + c[:, (-np.arange(ns)) % ns]  # symmetric, like a circulant correlation
-    fast = _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), 3, False)[:, 0]
+    fast = np.zeros((3, 6))
+    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, fast)
+    fast = fast[:, 0]
     t = np.arange(ns)
     brute = [c[0, (t[ip[0] == q][:, None] - t[ip[0] == q][None, :]) % ns].sum() for q in range(3)]
     assert np.allclose(fast, brute)
@@ -121,5 +145,6 @@ def test_contiguous_run_kernel():
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_padding_noiseless()
+    test_pixel_input_and_generator()
     test_contiguous_run_kernel()
     print("ok")

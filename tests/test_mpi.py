@@ -28,7 +28,7 @@ def test_mpi_matches_serial():
     if comm.rank == 0:
         gs = GLS(inp["pix"], inp["psi"], inp["weights"])
         ms, infos = gs.solve(inp["tod"])
-        assert np.array_equal(g.pixels, gs.pixels)
+        assert np.array_equal(g.mask, gs.mask)
         rel = np.abs(m - ms).max() / np.abs(ms).max()
         print(f"ranks={comm.size} iters mpi/serial={info['iterations']}/{infos['iterations']} max rel diff={rel:.1e}")
         assert rel < 1e-8
