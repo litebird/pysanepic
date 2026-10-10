@@ -15,6 +15,7 @@ gamma cos 2a and gamma sin 2a).
 import os
 from contextlib import contextmanager
 
+import ducc0
 import numba
 import numpy as np
 import scipy.fft
@@ -80,8 +81,11 @@ def _efficiency_chunks(eff, psi):
     return out
 
 
-def _filter(t, w, workers):
-    return scipy.fft.irfft(scipy.fft.rfft(t, workers=workers) * w, n=t.size, workers=workers)
+def _filter(t, w, nthreads):
+    """irfft(rfft(t) * w); ducc0 parallelizes a single 1D FFT, scipy does not."""
+    f = ducc0.fft.r2c(t, nthreads=nthreads)
+    f *= w
+    return ducc0.fft.c2r(f, lastsize=t.size, forward=False, inorm=2, nthreads=nthreads)
 
 
 @numba.njit(parallel=True, cache=True)
@@ -130,26 +134,30 @@ def _coverage(ip, c2, s2, pol, out):
             out[p, 6] += s * s
 
 
-@numba.njit(cache=True)
+@numba.njit(parallel=True, cache=True)
 def _block_circulant(ip, c, c2, s2, pol, out):
     """Exact per-pixel blocks of P^T C P, C circulant per chunk.
 
     For each pixel, sums c[(t - t') mod ns] w_t w_t'^T over all sample pairs
     that fall in it, with w = (1, c2, s2), and adds them to out (nobs, 6) with the
     entries II, IQ, IU, QQ, QU, UU (only II if pol is False).
-    Cost is sum over pixels of hits^2 per chunk.
+    Cost is sum over pixels of hits^2 per chunk; the pixels of a chunk are
+    processed in parallel (each one writes its own row of out).
     """
     # ponytail: O(hits^2) per pixel per chunk; switch to a lag cutoff or the
     # SANEPIC N_[0] shortcut if deep pixels with long chunks become a bottleneck
     nchunk, ns = ip.shape
     for k in range(nchunk):
         order = np.argsort(ip[k], kind="mergesort")
-        start = 0
-        while start < ns:
-            p = ip[k, order[start]]
-            stop = start
-            while stop < ns and ip[k, order[stop]] == p:
-                stop += 1
+        sorted_ip = ip[k][order]
+        starts = np.flatnonzero(np.diff(sorted_ip)) + 1
+        bounds = np.empty(starts.size + 2, np.int64)
+        bounds[0] = 0
+        bounds[1:-1] = starts
+        bounds[-1] = ns
+        for r in numba.prange(bounds.size - 1):
+            start, stop = bounds[r], bounds[r + 1]
+            p = sorted_ip[start]
             n = stop - start
             # Contiguous run of samples with no polarization sensitivity (e.g. the
             # padding of a chunk): sum over lags in O(n) instead of O(n^2)
@@ -164,21 +172,26 @@ def _block_circulant(ip, c, c2, s2, pol, out):
                 for lag in range(-(n - 1), n):
                     acc += (n - abs(lag)) * c[k, lag % ns]
                 out[p, 0] += acc
-                start = stop
                 continue
+            b0 = b1 = b2 = b3 = b4 = b5 = 0.0
             for a in range(start, stop):
                 ta = order[a]
                 for b in range(start, stop):
                     tb = order[b]
                     cab = c[k, (ta - tb) % ns]
-                    out[p, 0] += cab
+                    b0 += cab
                     if pol:
-                        out[p, 1] += cab * c2[k, tb]
-                        out[p, 2] += cab * s2[k, tb]
-                        out[p, 3] += cab * c2[k, ta] * c2[k, tb]
-                        out[p, 4] += cab * c2[k, ta] * s2[k, tb]
-                        out[p, 5] += cab * s2[k, ta] * s2[k, tb]
-            start = stop
+                        b1 += cab * c2[k, tb]
+                        b2 += cab * s2[k, tb]
+                        b3 += cab * c2[k, ta] * c2[k, tb]
+                        b4 += cab * c2[k, ta] * s2[k, tb]
+                        b5 += cab * s2[k, ta] * s2[k, tb]
+            out[p, 0] += b0
+            out[p, 1] += b1
+            out[p, 2] += b2
+            out[p, 3] += b3
+            out[p, 4] += b4
+            out[p, 5] += b5
 
 
 class GLS:
