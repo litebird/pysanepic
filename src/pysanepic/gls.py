@@ -253,13 +253,14 @@ class GLS:
         cov = np.zeros((self.nobs, 7))
         for k, ip in enumerate(self.ip):
             _coverage(ip, *self._pol_arrays(k)[1:], self.pol, cov)
-        self._cov = self._sum(cov)
-        self.hits = self._cov[:, 0].astype(np.int64)
+        cov = self._sum(cov)
+        self.hits = cov[:, 0].astype(np.int64)
         self.mask = np.repeat((self.hits > 0)[None], self.ncomp, axis=0)
         if self.pol:
-            self.mask[1:] &= self._cov[:, 1] >= min_pol_hits
+            self.mask[1:] &= cov[:, 1] >= min_pol_hits
             if min_pol_rcond > 0:
-                self.mask[1:] &= self._pol_rcond() >= min_pol_rcond
+                self.mask[1:] &= self._pol_rcond(cov) >= min_pol_rcond
+        del cov
 
         blocks = np.zeros((self.nobs, 6))
         with numba_threads(self.nthreads):
@@ -274,9 +275,9 @@ class GLS:
         # private maps of the threads for P^T
         self._buf = np.zeros((min(self.nthreads, numba.config.NUMBA_NUM_THREADS), self.ncomp, self.nobs))
 
-    def _pol_rcond(self):
+    def _pol_rcond(self, cov):
         """Reciprocal condition number of the angle-coverage matrix of each pixel."""
-        n, c, s, cc, cs, ss = self._cov[:, 0], *self._cov[:, 2:].T
+        n, c, s, cc, cs, ss = cov[:, 0], *cov[:, 2:].T
         M = np.stack([n, c, s, c, cc, cs, s, cs, ss], axis=1).reshape(-1, 3, 3)
         rcond = np.zeros(self.nobs)
         seen = self.mask[1]  # pixels with enough polarized hits
