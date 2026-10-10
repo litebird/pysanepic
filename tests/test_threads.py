@@ -4,7 +4,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from pysanepic import DetectorData, make_maps, resolve_nthreads
+from pysanepic import DetectorData, GLSParameters, make_maps, resolve_nthreads
 from pysanepic.gls import numba_threads
 from test_mapmaker import _scan
 
@@ -41,8 +41,8 @@ def test_same_result_any_thread_count():
             )
         )
     # coordinates="G" exercises the numba rotation kernel and ducc0 with threads
-    one = make_maps(data, nside, coordinates="G", chunk_s=1200.0, nthreads=1)
-    four = make_maps(data, nside, coordinates="G", chunk_s=1200.0, nthreads=4)
+    one = make_maps(data, nside, coordinates="G", params=GLSParameters(chunk_s=1200.0), nthreads=1)
+    four = make_maps(data, nside, coordinates="G", params=GLSParameters(chunk_s=1200.0), nthreads=4)
     assert one.iterations == four.iterations
     seen = one.maps != hp.UNSEEN
     assert np.array_equal(four.maps != hp.UNSEEN, seen)

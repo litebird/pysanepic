@@ -11,7 +11,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, make_maps
+from pysanepic import DetectorData, GLSParameters, make_maps
 
 
 def _scan(n, rng):
@@ -51,15 +51,17 @@ def test_noiseless_recovers_sky():
         )
 
     # white noise model (fknee = 0): no degenerate offsets, so the sky is recovered to
-    # the precision of the float32 cos/sin (~1e-8); tight tol because pixels with
+    # the precision of the cos/sin (~1e-8 in float32); tight tol because pixels with
     # 4 hits are ill-conditioned
-    res = make_maps(data, nside, coordinates="G", chunk_s=1700.0, tol=1e-24)
-    assert res.converged
-    seen = res.maps[1] != hp.UNSEEN
-    assert seen.sum() > 0.5 * seen.size
-    assert res.hit_map.sum() == 2 * n
-    for i in range(3):
-        assert np.abs(res.maps[i][seen] - sky[i][seen]).max() < 1e-7 * np.abs(sky).max(), i
+    for dtype, rel in [(np.float32, 1e-7), (np.float64, 1e-9)]:
+        params = GLSParameters(chunk_s=1700.0, tol=1e-24, angle_dtype=dtype)
+        res = make_maps(data, nside, coordinates="G", params=params)
+        assert res.converged
+        seen = res.maps[1] != hp.UNSEEN
+        assert seen.sum() > 0.5 * seen.size
+        assert res.hit_map.sum() == 2 * n
+        for i in range(3):
+            assert np.abs(res.maps[i][seen] - sky[i][seen]).max() < rel * np.abs(sky).max(), (dtype, i)
 
 
 def _four_detectors(n, fs, rng, sky, nside, noise=False):
@@ -85,18 +87,18 @@ def test_padding_noiseless():
     sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
     data = _four_detectors(n, fs, rng, sky, nside)
     # compare only pixels where Q/U are well conditioned (the default criterion)
-    good = make_maps(data, nside, coordinates="E", chunk_s=1200.0, maxiter=1).maps[1] != hp.UNSEEN
-    common = dict(coordinates="E", chunk_s=1200.0, pad_s=300.0, tol=1e-24, min_pol_rcond=0.0)
+    good = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, maxiter=1)).maps[1] != hp.UNSEEN
+    common = dict(chunk_s=1200.0, pad_s=300.0, tol=1e-24, min_pol_rcond=0.0)
 
     # zeros are exactly described by the margin offsets: exact recovery
-    res = make_maps(data, nside, pad_fill="zeros", **common)
+    res = make_maps(data, nside, coordinates="E", params=GLSParameters(pad_fill="zeros", **common))
     assert res.hit_map.sum() == 4 * n  # padded samples are not hits
     err = res.maps[:, good] - sky[:, good]
     err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
     assert np.abs(err).max() < 1e-4 * np.abs(sky).max()
 
     # SANEPIC's extrapolation leaves a small bias (unmodelled padding shape)
-    res = make_maps(data, nside, pad_fill="extrapolate", **common)
+    res = make_maps(data, nside, coordinates="E", params=GLSParameters(pad_fill="extrapolate", **common))
     err = res.maps[:, good] - sky[:, good]
     err[0] -= err[0].mean()
     assert np.median(np.abs(err)) < 1e-2 * 1e-4
@@ -110,7 +112,7 @@ def test_pixel_input_and_generator():
     rng = np.random.default_rng(2)
     sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
     data = _four_detectors(n, fs, rng, sky, nside)
-    common = dict(coordinates="E", chunk_s=1000.0, maxiter=20)
+    common = dict(coordinates="E", params=GLSParameters(chunk_s=1000.0, maxiter=20))
     ref = make_maps(data, nside, **common)
     with_pix = (
         dataclasses.replace(d, theta=None, phi=None, pix=hp.ang2pix(nside, d.theta, d.phi), nside=nside)

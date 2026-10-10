@@ -65,6 +65,43 @@ class MapResult:
     residuals: np.ndarray
 
 
+@dataclass(kw_only=True)
+class GLSParameters:
+    """Settings of the GLS map-maker (everything but the data, the output
+    pixelization and the parallelization).
+
+    chunk_s : N^-1 is applied independently on chunks of this duration [s];
+        longer chunks capture lower frequencies but cost more.
+    pad_s : each chunk is extended by this duration [s] on both sides before
+        applying N^-1, to avoid the wrap-around of the FFT (SANEPIC's "inpaint").
+        The padding is fitted by one offset per margin ("virtual pixels", not in
+        the output maps). 0 disables it.
+    pad_fill : "zeros" or "extrapolate" (SANEPIC's choice: linear extrapolation
+        tapered to the chunk mean). Zeros are exactly described by the margin
+        offsets, so they add no bias; "extrapolate" leaves a small unmodelled
+        signal that 1/f weighting spreads into the map, but with a steep 1/f
+        noise (drifting data) it reduces the edge effects more.
+    pol : solve for I/Q/U (True) or I only.
+    preconditioner : "block" (3x3 I/Q/U block per pixel) or "jacobi" (SANEPIC's).
+    min_pol_rcond : Q/U are solved only in pixels whose polarization-angle
+        coverage gives a reciprocal condition number >= this value (0: no
+        check, as SANEPIC).
+    tol, maxiter : PCG stops when |r|^2/|b|^2 < tol or after maxiter iterations.
+    angle_dtype : storage of gamma cos 2a and gamma sin 2a: np.float32 (4 bytes
+        per sample each, angle error ~1e-7 rad) or np.float64 (exact).
+    """
+
+    chunk_s: float = 3600.0
+    pad_s: float = 0.0
+    pad_fill: str = "zeros"
+    pol: bool = True
+    preconditioner: str = "block"
+    min_pol_rcond: float = 1e-2
+    tol: float = 1e-12
+    maxiter: int = 2000
+    angle_dtype: type = np.float32
+
+
 @numba.njit(parallel=True, cache=True)
 def _rotate(theta, phi, psi, R, out):
     """Rotate pointings by matrix R into out[0]=theta, out[1]=phi, out[2]=psi.
@@ -151,22 +188,7 @@ def _chunk_bounds(n, ns):
     return zip(starts, np.append(starts[1:], n))
 
 
-def make_maps(
-    data,
-    nside,
-    coordinates="G",
-    chunk_s=3600.0,
-    pad_s=0.0,
-    pad_fill="zeros",
-    pol=True,
-    preconditioner="block",
-    min_pol_rcond=1e-2,
-    tol=1e-12,
-    maxiter=2000,
-    comm=None,
-    nthreads=None,
-    verbose=False,
-):
+def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=None, verbose=False):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
 
     Parameters
@@ -179,29 +201,8 @@ def make_maps(
         HEALPix resolution of the output maps (RING ordering).
     coordinates : str
         Coordinate system of the output maps ("G", "E" or "C").
-    chunk_s : float
-        N^-1 is applied independently on chunks of this duration (seconds);
-        longer chunks capture lower frequencies but cost more.
-    pad_s : float
-        Each chunk is extended by this duration (seconds) on both sides before
-        applying N^-1, to avoid the wrap-around of the FFT (SANEPIC's "inpaint").
-        The padding is fitted by one offset per margin ("virtual pixels", not in
-        the output maps). 0 (default) disables it.
-    pad_fill : str
-        "zeros" (default) or "extrapolate" (SANEPIC's default: linear
-        extrapolation tapered to the chunk mean). Zeros are exactly described by
-        the margin offsets, so they add no bias; "extrapolate" leaves a small
-        unmodelled signal that 1/f weighting spreads into the map, but with a
-        steep 1/f noise (drifting data) it reduces the edge effects more.
-    pol : bool
-        Solve for I/Q/U (True) or I only.
-    preconditioner : str
-        "block" (default, 3x3 I/Q/U block per pixel) or "jacobi" (SANEPIC's).
-    min_pol_rcond : float
-        Q/U are solved only in pixels whose polarization-angle coverage gives a
-        reciprocal condition number >= this value (0: no check, as SANEPIC).
-    tol, maxiter : float, int
-        PCG stops when |r|^2/|b|^2 < tol or after maxiter iterations.
+    params : GLSParameters or None
+        Settings of the map-maker; None: the defaults.
     comm : mpi4py communicator or None
         Every rank of `comm` must call this function.
     nthreads : int or None
@@ -209,6 +210,7 @@ def make_maps(
         else 1, as in litebird_sim; with MPI, use (cores per node) / (processes
         per node).
     """
+    params = GLSParameters() if params is None else params
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
@@ -220,8 +222,8 @@ def make_maps(
         angle = np.mod(angle, np.pi)  # only 2a matters; keeps float32 precise with a spinning HWP
         fs = d.sampling_rate_hz
         sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
-        m = int(round(pad_s * fs))
-        for a, b in _chunk_bounds(len(d.tod), max(1, int(round(chunk_s * fs)))):
+        m = int(round(params.pad_s * fs))
+        for a, b in _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs)))):
             n = b - a + 2 * m
             key = (n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
             if key not in weights:
@@ -229,15 +231,15 @@ def make_maps(
             w_c.append(weights[key])
             if m == 0:
                 pix_c.append(pix[a:b].astype(np.int32))
-                psi_c.append(angle[a:b].astype(np.float32))
+                psi_c.append(angle[a:b].astype(params.angle_dtype))
                 tod_c.append(d.tod[a:b])  # a view: the TOD is not copied
                 gamma_c.append(d.pol_efficiency)
             else:
                 left = npix + 2 * (n_virtual * size + rank)
                 n_virtual += 1
                 pix_c.append(np.concatenate([np.full(m, left), pix[a:b], np.full(m, left + 1)]).astype(np.int32))
-                psi_c.append(np.concatenate([np.zeros(m), angle[a:b], np.zeros(m)]).astype(np.float32))
-                tod_c.append(_pad(d.tod[a:b], m, pad_fill))
+                psi_c.append(np.concatenate([np.zeros(m), angle[a:b], np.zeros(m)]).astype(params.angle_dtype))
+                tod_c.append(_pad(d.tod[a:b], m, params.pad_fill))
                 # the margins carry no polarization: their virtual pixels are intensity only
                 g = np.full(n, d.pol_efficiency, dtype=np.float32)
                 g[:m] = g[-m:] = 0
@@ -248,16 +250,17 @@ def make_maps(
     # build cos/sin here directly if this peak matters
     gls = GLS(
         pix_c,
-        psi_c if pol else None,
+        psi_c if params.pol else None,
         w_c,
-        pol_efficiency=gamma_c if pol else None,
-        preconditioner=preconditioner,
-        min_pol_rcond=min_pol_rcond,
+        pol_efficiency=gamma_c if params.pol else None,
+        preconditioner=params.preconditioner,
+        min_pol_rcond=params.min_pol_rcond,
         comm=comm,
         nthreads=nthreads,
+        angle_dtype=params.angle_dtype,
     )
     del pix_c, psi_c, gamma_c
-    m, info = gls.solve(tod_c, tol=tol, maxiter=maxiter, verbose=verbose)
+    m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
 
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)

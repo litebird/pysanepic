@@ -9,7 +9,7 @@ the same length, or a list of 1D chunks and/or 2D blocks. Noise weights have
 one row of length ns//2+1 per chunk, defined so that the filter is
 irfft(rfft(t) * w). Chunks are used as views (no copies) and processed one at a
 time, so the memory per sample is the TOD plus 12 bytes (int32 pixel, float32
-gamma cos 2a and gamma sin 2a).
+gamma cos 2a and gamma sin 2a; 20 bytes with angle_dtype=np.float64).
 """
 
 import os
@@ -227,9 +227,12 @@ class GLS:
         are replicated on all ranks and P^T is summed with Allreduce.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
+    angle_dtype : np.float32 (default) or np.float64
+        Storage of gamma cos 2a and gamma sin 2a (angle error ~1e-7 rad in
+        float32; pass angles reduced mod pi for that precision).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -242,13 +245,13 @@ class GLS:
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
         self.pol = psi is not None
         self.ncomp = 3 if self.pol else 1
-        self._dummy = np.zeros(1, np.float32)
+        self._dummy = np.zeros(1, angle_dtype)
         if self.pol:
             eff = [1.0] * len(_as_list(psi)) if pol_efficiency is None else _as_list(pol_efficiency)
             gamma = _efficiency_chunks(eff, psi)
             psi = _chunks(psi)
-            self.cos2 = [(g * np.cos(2 * a)).astype(np.float32) for g, a in zip(gamma, psi)]
-            self.sin2 = [(g * np.sin(2 * a)).astype(np.float32) for g, a in zip(gamma, psi)]
+            self.cos2 = [(g * np.cos(2 * a)).astype(angle_dtype) for g, a in zip(gamma, psi)]
+            self.sin2 = [(g * np.sin(2 * a)).astype(angle_dtype) for g, a in zip(gamma, psi)]
 
         cov = np.zeros((self.nobs, 7))
         for k, ip in enumerate(self.ip):
