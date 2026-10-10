@@ -29,7 +29,9 @@ pointings, HWP angle, TOD and the 1/f noise parameters used to simulate the
 noise are passed to pysanepic automatically.
 
 ```python
-result = sim.make_sanepic_gls_map(nside=64, chunk_s=3600.0)
+from pysanepic import GLSParameters
+
+result = sim.make_sanepic_gls_map(nside=64, params=GLSParameters(chunk_s=3600.0))
 result.maps       # (3, npix) I, Q, U; healpy.UNSEEN where not solved
 result.hit_map    # samples per pixel
 ```
@@ -46,21 +48,25 @@ Example notebooks:
   Jacobi preconditioner, and the Q/U conditioning criterion;
 - [`padding.ipynb`](notebooks/padding.ipynb): chunk length and padding, with
   the IMO 1/f noise and with a steeper 1/f noise.
+- [`memory.ipynb`](notebooks/memory.ipynb): generators of `DetectorData`, pixel
+  input and memory per sample (no litebird_sim needed).
 
 ## Usage without litebird_sim
 
-Any pipeline, or data read from disk, can be used by filling one
-`DetectorData` per detector and contiguous stretch of time:
+Any pipeline, or data read from disk, can be used by providing one
+`DetectorData` per detector and contiguous stretch of time, as a list or, to
+save memory, as a generator (pysanepic then keeps the pointings of only one
+detector at a time):
 
 ```python
 import numpy as np
-from pysanepic import DetectorData, make_maps
+from pysanepic import DetectorData, GLSParameters, make_maps
 
-data = []
-for name in ["det0", "det1"]:
-    f = np.load(f"{name}.npz")  # your own files: one per detector and time span
-    data.append(
-        DetectorData(
+
+def data():
+    for name in ["det0", "det1"]:
+        f = np.load(f"{name}.npz")  # your own files: one per detector and time span
+        yield DetectorData(
             tod=f["tod"],  # K
             theta=f["theta"], phi=f["phi"], psi=f["psi"],  # rad
             coordinates="E",  # pointings in Ecliptic coordinates
@@ -69,9 +75,9 @@ for name in ["det0", "det1"]:
             sampling_rate_hz=19.0,
             net_ukrts=40.0, fknee_hz=0.02, alpha=1.0, fmin_hz=1e-5,
         )
-    )
 
-result = make_maps(data, nside=64, coordinates="G", chunk_s=3600.0)
+
+result = make_maps(data(), nside=64, coordinates="G", params=GLSParameters(chunk_s=3600.0))
 print(result.converged, result.iterations)
 i_map, q_map, u_map = result.maps  # healpy.UNSEEN where not solved
 ```
@@ -82,6 +88,7 @@ i_map, q_map, u_map = result.maps  # healpy.UNSEEN where not solved
 |---|---|
 | `tod` | Time-ordered data, in K |
 | `theta`, `phi` | Colatitude and longitude of the pointing [rad] |
+| `pix`, `nside` | Alternative to `theta`, `phi`: HEALPix RING pixel of each sample, at the `nside` and in the `coordinates` of the output maps |
 | `psi` | Orientation of the detector frame [rad] |
 | `coordinates` | Coordinate system of the pointings: `"E"` (default), `"G"` or `"C"` |
 | `hwp_angle` | HWP angle per sample [rad], or `None` |
@@ -105,6 +112,17 @@ The conventions are the same as litebird_sim:
 |---|---|---|
 | `nside` | | HEALPix resolution of the output maps (RING) |
 | `coordinates` | `"G"` | Coordinate system of the output maps |
+| `params` | `GLSParameters()` | Settings of the map-maker, see below |
+| `comm` | `None` | mpi4py communicator; each rank passes only its own data |
+| `nthreads` | `None` | Threads per process (FFTs, ducc0, numba); `None`: `OMP_NUM_THREADS` if set, else 1 |
+
+### `GLSParameters` fields
+
+The same object is passed by litebird_sim (`Simulation.make_sanepic_gls_map(params=...)`),
+so new options need no change on the litebird_sim side.
+
+| Field | Default | Meaning |
+|---|---|---|
 | `chunk_s` | 3600 | N⁻¹ is applied on chunks of this duration [s]; longer chunks capture lower frequencies |
 | `pad_s` | 0 | Padding added on both sides of each chunk [s], so that the FFT wrap-around falls outside the data (SANEPIC's "inpaint"); each margin is fitted by an offset not included in the maps |
 | `pad_fill` | `"zeros"` | `"zeros"` (no bias) or `"extrapolate"` (SANEPIC's linear extrapolation tapered to the chunk mean; better with a steep 1/f noise, slightly biased otherwise) |
@@ -112,8 +130,7 @@ The conventions are the same as litebird_sim:
 | `min_pol_rcond` | 1e-2 | Q/U are solved only in pixels whose polarization-angle coverage has a reciprocal condition number ≥ this (and ≥ 4 hits); elsewhere only I. 0 disables the check, as in SANEPIC |
 | `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of PᵀN⁻¹P per pixel; `"jacobi"`: original SANEPIC (I diagonal, Q/U = 2/diag_I) |
 | `tol`, `maxiter` | 1e-12, 2000 | PCG stops when \|r\|²/\|b\|² < `tol` |
-| `comm` | `None` | mpi4py communicator; each rank passes only its own data |
-| `nthreads` | `None` | Threads per process (FFTs, ducc0, numba); `None`: `OMP_NUM_THREADS` if set, else 1 |
+| `angle_dtype` | `np.float32` | Storage of γ cos 2a, γ sin 2a: float32 (angle error ~1e-7 rad, i.e. 0.02 mas) or `np.float64` (exact, 8 more bytes per sample) |
 
 ### MPI and threads
 
@@ -127,6 +144,20 @@ when several MPI processes share a node: set
 
 The projection P and its transpose Pᵀ are parallel numba kernels; Pᵀ keeps one
 private copy of the I/Q/U map per thread (about 75 MB per thread at nside 512).
+
+### Memory
+
+The TODs are used without copies, and P, N⁻¹ and Pᵀ are applied one chunk at a
+time. Besides the TODs, pysanepic keeps 12 bytes per sample (int32 pixel,
+float32 γ cos 2a and γ sin 2a; 20 with `angle_dtype=np.float64`), 16 during the
+setup, plus a few maps. The maps are replicated on every process: I/Q/U at
+nside 2048 takes 1.2 GB per vector, and the PCG needs about ten of them
+(vectors, 3×3 preconditioner, one private map per thread), so the
+resolution, not the data, sets the memory above nside ~1024. Pixel indices
+are int32, which is enough up to nside 8192. With
+litebird_sim the pointings are computed one detector at a time and never stored.
+On G100 (16 detectors at 75 Hz for 7 days, nside 512, 16 processes × 3 threads),
+the peak memory per process is 2.7 GB, of which 1.2 GB are the simulation.
 
 ### Low-level interface
 

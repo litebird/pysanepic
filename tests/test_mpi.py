@@ -28,7 +28,7 @@ def test_mpi_matches_serial():
     if comm.rank == 0:
         gs = GLS(inp["pix"], inp["psi"], inp["weights"])
         ms, infos = gs.solve(inp["tod"])
-        assert np.array_equal(g.pixels, gs.pixels)
+        assert np.array_equal(g.mask, gs.mask)
         rel = np.abs(m - ms).max() / np.abs(ms).max()
         print(f"ranks={comm.size} iters mpi/serial={info['iterations']}/{infos['iterations']} max rel diff={rel:.1e}")
         assert rel < 1e-8
@@ -38,7 +38,7 @@ def test_make_maps_mpi_padding():
     """make_maps with padding: data split across ranks gives the serial result."""
     import healpy as hp
 
-    from pysanepic import make_maps
+    from pysanepic import GLSParameters, make_maps
     from test_mapmaker import _four_detectors
 
     comm = MPI.COMM_WORLD
@@ -46,7 +46,7 @@ def test_make_maps_mpi_padding():
     rng = np.random.default_rng(0)
     sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
     data = _four_detectors(n, fs, rng, sky, nside)
-    kw = dict(coordinates="E", chunk_s=1200.0, pad_s=300.0, tol=1e-20)
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, pad_s=300.0, tol=1e-20))
     res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
     if comm.rank == 0:
         ref = make_maps(data, nside, **kw)
