@@ -21,10 +21,12 @@ from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads
 class DetectorData:
     """One detector over one contiguous stretch of time.
 
-    Pointing: either `theta`, `phi` (colatitude and longitude in `coordinates`)
-    or `pix`, the HEALPix RING pixel at resolution `nside`; with `pix`,
-    `coordinates` and `nside` must be those of the output maps. `psi` is the
-    orientation angle of the detector's frame in `coordinates`.
+    Pointing: either `theta`, `phi` (colatitude and longitude in `coordinates`,
+    which is then required: "E" ecliptic, "G" galactic, "C" equatorial), or
+    `pix`, the HEALPix pixel at resolution `nside` in `ordering` ("RING" or
+    "NESTED"). With `pix`, `nside` and `coordinates` (None: the same as the
+    output) must be those of the output maps. `psi` is the orientation angle of
+    the detector's frame in `coordinates`.
 
     Polarization conventions (same as litebird_sim): The polarization angle seen by
     the sky is psi + pol_angle_rad without HWP, and
@@ -41,6 +43,7 @@ class DetectorData:
     phi: np.ndarray | None = None
     pix: np.ndarray | None = None
     nside: int | None = None  # resolution of pix
+    ordering: str = "RING"  # ordering of pix: "RING" or "NESTED"
     sampling_rate_hz: float
     net_ukrts: float
     fknee_hz: float = 0.0
@@ -49,7 +52,7 @@ class DetectorData:
     pol_angle_rad: float = 0.0
     pol_efficiency: float = 1.0
     hwp_angle: np.ndarray | None = None
-    coordinates: str = "E"  # healpy code: "E" ecliptic, "G" galactic, "C" equatorial
+    coordinates: str | None = None  # healpy code: "E" ecliptic, "G" galactic, "C" equatorial
 
 
 @dataclass
@@ -129,13 +132,17 @@ def _rotate(theta, phi, psi, R, out):
 def _pixels_and_angles(d, nside, coordinates, nthreads):
     theta, phi, psi = d.theta, d.phi, d.psi
     if d.pix is not None:
-        if d.nside != nside or d.coordinates != coordinates:
+        if d.nside != nside or d.coordinates not in (None, coordinates):
             raise ValueError(
                 f"DetectorData.pix is at nside={d.nside}, coordinates={d.coordinates!r}: "
                 f"the maps need nside={nside}, coordinates={coordinates!r}"
             )
+        if d.ordering not in ("RING", "NESTED"):
+            raise ValueError(f"Unknown ordering {d.ordering!r}: use 'RING' or 'NESTED'")
     elif theta is None or phi is None:
         raise ValueError("DetectorData needs either theta and phi, or pix")
+    elif d.coordinates is None:
+        raise ValueError("DetectorData.coordinates is required with theta and phi")
     elif d.coordinates != coordinates:
         R = hp.Rotator(coord=[d.coordinates, coordinates]).mat
         out = np.empty((3, theta.size))
@@ -147,7 +154,12 @@ def _pixels_and_angles(d, nside, coordinates, nthreads):
     else:
         angle = psi + 2 * d.hwp_angle - d.pol_angle_rad
     if d.pix is not None:
-        return d.pix, angle
+        pix = np.asarray(d.pix)
+        if pix.size and (pix.min() < 0 or pix.max() >= 12 * nside * nside):
+            raise ValueError(f"DetectorData.pix outside [0, 12 nside^2) for nside={nside}")
+        if d.ordering == "NESTED":
+            pix = ducc0.healpix.Healpix_Base(nside, "NEST").nest2ring(pix, nthreads=nthreads)
+        return pix, angle
     pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=nthreads)
     return pix, angle
 

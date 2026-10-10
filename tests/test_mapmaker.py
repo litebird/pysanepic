@@ -114,14 +114,26 @@ def test_pixel_input_and_generator():
     data = _four_detectors(n, fs, rng, sky, nside)
     common = dict(coordinates="E", params=GLSParameters(chunk_s=1000.0, maxiter=20))
     ref = make_maps(data, nside, **common)
-    with_pix = (
-        dataclasses.replace(d, theta=None, phi=None, pix=hp.ang2pix(nside, d.theta, d.phi), nside=nside)
-        for d in data
-    )
-    res = make_maps(with_pix, nside, **common)
-    assert np.array_equal(res.maps, ref.maps)
-    with pytest.raises(ValueError, match="nside"):
-        make_maps([dataclasses.replace(data[0], pix=np.zeros(n, int), nside=8)], nside, **common)
+    for ordering, nest in [("RING", False), ("NESTED", True)]:
+        # coordinates=None: pixels and psi are in the coordinates of the output
+        with_pix = (
+            dataclasses.replace(
+                d, theta=None, phi=None, coordinates=None, nside=nside, ordering=ordering,
+                pix=hp.ang2pix(nside, d.theta, d.phi, nest=nest),
+            )
+            for d in data
+        )
+        res = make_maps(with_pix, nside, **common)
+        assert np.array_equal(res.maps, ref.maps), ordering
+
+    def bad(**kw):
+        with pytest.raises(ValueError, match=kw.pop("match")):
+            make_maps([dataclasses.replace(data[0], **kw)], nside, **common)
+
+    bad(pix=np.zeros(n, int), nside=8, match="nside")
+    bad(pix=np.full(n, 12 * nside**2), nside=nside, match="outside")
+    bad(pix=np.zeros(n, int), nside=nside, coordinates="G", match="coordinates")
+    bad(coordinates=None, match="required")
 
 
 def test_contiguous_run_kernel():

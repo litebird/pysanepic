@@ -88,9 +88,9 @@ i_map, q_map, u_map = result.maps  # healpy.UNSEEN where not solved
 |---|---|
 | `tod` | Time-ordered data, in K |
 | `theta`, `phi` | Colatitude and longitude of the pointing [rad] |
-| `pix`, `nside` | Alternative to `theta`, `phi`: HEALPix RING pixel of each sample, at the `nside` and in the `coordinates` of the output maps |
+| `pix`, `nside`, `ordering` | Alternative to `theta`, `phi`: HEALPix pixel of each sample, at the `nside` and in the coordinates of the output maps; `ordering` `"RING"` (default) or `"NESTED"`. Pixels outside the map raise an error |
 | `psi` | Orientation of the detector frame [rad] |
-| `coordinates` | Coordinate system of the pointings: `"E"` (default), `"G"` or `"C"` |
+| `coordinates` | Coordinate system of the pointings and `psi`: `"E"`, `"G"` or `"C"`. Required with `theta`, `phi`; with `pix`, `None` (default) means the output coordinates |
 | `hwp_angle` | HWP angle per sample [rad], or `None` |
 | `pol_angle_rad` | Polarization angle of the detector [rad] |
 | `pol_efficiency` | Polarization efficiency γ (default 1) |
