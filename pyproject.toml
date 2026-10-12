@@ -13,6 +13,7 @@ dependencies = ["numpy", "scipy", "healpy", "numba", "ducc0"]
 [project.optional-dependencies]
 mpi = ["mpi4py"]
 test = ["pytest", "mpi4py"]
+docs = ["sphinx", "myst-nb", "furo"]
 
 [tool.hatch.version]
 path = "src/pysanepic/__init__.py"

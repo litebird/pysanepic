@@ -360,7 +360,7 @@ class GLS:
     def solve(self, tod, x0=None, tol=1e-15, maxiter=2000, recompute_every=10, verbose=False):
         """Run PCG on `tod` (same chunk layout as `pix`).
 
-        Stops when |r|^2 / |b|^2 < tol (same criterion as SANEPIC).
+        Stops when norm(r)^2 / norm(b)^2 < tol (same criterion as SANEPIC).
         Returns (map (ncomp, nobs), info dict).
         """
         b = self.rhs(tod)
