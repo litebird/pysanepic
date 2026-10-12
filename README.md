@@ -67,4 +67,4 @@ sphinx-build -b html docs docs/_build/html
 
 ## License
 
-GPL-3.0, like litebird_sim.
+Distributed under the [GPL3 License](https://github.com/litebird/litebird_sim/blob/master/LICENSE).
