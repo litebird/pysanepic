@@ -14,7 +14,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads
+from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads, two_angle
 
 
 @dataclass(kw_only=True)
@@ -103,8 +103,8 @@ class GLSParameters:
         coverage gives a reciprocal condition number >= this value (0: no
         check, as SANEPIC).
     tol, maxiter : PCG stops when norm(r)^2 / norm(b)^2 < tol or after maxiter iterations.
-    angle_dtype : storage of gamma cos 2a and gamma sin 2a: np.float32 (4 bytes
-        per sample each, angle error ~1e-7 rad) or np.float64 (exact).
+    angle_dtype : storage of twice the polarization angle: np.float32 (4 bytes
+        per sample, angle error ~1e-7 rad) or np.float64 (exact).
     """
 
     chunk_s: float = 3600.0
@@ -240,7 +240,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
-    pix_c, cos_c, sin_c, tod_c, w_c = [], [], [], [], []
+    pix_c, a2_c, gamma_c, tod_c, w_c = [], [], [], [], []
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
     for d in data:  # one detector at a time: only its pointings are in memory
@@ -254,15 +254,19 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
             if key not in weights:
                 weights[key] = one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
             w_c.append(weights[key])
-            # gamma cos 2a, gamma sin 2a computed in float64, then stored as `dtype`;
-            # the margins of a padded chunk carry no polarization (intensity-only
-            # virtual pixels)
+            # 2a computed in float64, then stored as `dtype`; the margins of a
+            # padded chunk carry no polarization (gamma = 0: intensity-only
+            # virtual pixels), so only padded chunks need gamma per sample
             if params.pol:
-                c2, s2 = np.zeros(n, dtype), np.zeros(n, dtype)
-                c2[m : n - m] = d.pol_efficiency * np.cos(2 * angle[a:b])
-                s2[m : n - m] = d.pol_efficiency * np.sin(2 * angle[a:b])
-                cos_c.append(c2)
-                sin_c.append(s2)
+                a2 = np.zeros(n, dtype)
+                a2[m : n - m] = two_angle(angle[a:b])
+                a2_c.append(a2)
+                if m == 0:
+                    gamma_c.append(d.pol_efficiency)
+                else:
+                    g = np.zeros(n, dtype)
+                    g[m : n - m] = d.pol_efficiency
+                    gamma_c.append(g)
             if m == 0:
                 pix_c.append(pix[a:b].astype(np.int32))
                 tod_c.append(d.tod[a:b])  # a view: the TOD is not copied
@@ -277,14 +281,14 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         pix_c,
         None,
         w_c,
-        pol_weights=(cos_c, sin_c) if params.pol else None,
+        pol_angles=(a2_c, gamma_c) if params.pol else None,
         preconditioner=params.preconditioner,
         min_pol_rcond=params.min_pol_rcond,
         comm=comm,
         nthreads=nthreads,
         angle_dtype=dtype,
     )
-    del pix_c, cos_c, sin_c
+    del pix_c, a2_c, gamma_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
 
     hit_map = np.zeros(npix, dtype=np.int64)
