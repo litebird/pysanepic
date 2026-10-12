@@ -47,8 +47,10 @@ with litebird_sim, one-day observations and `chunk_s=86400`, nside 512.
 | resources | 1 node, 16 processes × 3 threads | 16 nodes, 128 processes × 6 threads |
 | peak memory per process (with the simulation) | 2.5 GB | 37.6 GB |
 | GLS time, `tol=1e-12` | 108 s (28 iterations) | 62 min (25 iterations) |
-| GLS time, `tol=1e-8` | 56 s (10 iterations) | |
+| GLS time, `tol=1e-8` | 56 s (10 iterations) | 57 min (20 iterations) |
 
 In the one-year run each iteration takes about 105 s and the setup (pixels,
 angles, preconditioner) about 15 minutes; the memory is dominated by the
-TODs (1.1 TB in float32) and the 12 bytes per sample (3.6 TB).
+TODs (1.1 TB in float32) and the 12 bytes per sample (3.6 TB). The time per
+iteration is set by the slowest node: most nodes computed in 69 s and waited
+37 s in the `Allreduce` for a few nodes that needed up to 106 s.
