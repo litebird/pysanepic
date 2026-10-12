@@ -36,8 +36,10 @@ print(info["iterations"], info["converged"], np.abs(m - sky).max())
 Noiseless data give back the input sky to numerical precision. Other options
 of `GLS`:
 
-- `pol_efficiency` (scalar, per chunk or per sample), or `pol_weights=(cos2, sin2)`
-  with γ cos 2a and γ sin 2a already computed (used without copies);
+- `pol_efficiency` (scalar, per chunk or per sample), or
+  `pol_angles=(angle2, gamma)` with 2a already computed and reduced to
+  [−π, π) (see `two_angle`; used without copies) and γ per chunk or per
+  sample;
 - `psi=None` for intensity only;
 - `comm` and `nthreads`, as in `make_maps`;
 - `preconditioner`, `min_pol_rcond`, `min_pol_hits`, `angle_dtype`.

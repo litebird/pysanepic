@@ -14,7 +14,7 @@ so new options need no change on the litebird_sim side.
 | `min_pol_rcond` | 1e-2 | Q/U are solved only in pixels whose polarization-angle coverage has a reciprocal condition number ≥ this (and ≥ 4 hits); elsewhere only I. 0 disables the check, as in SANEPIC |
 | `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of $P^T N^{-1} P$ per pixel; `"jacobi"`: original SANEPIC |
 | `tol`, `maxiter` | 1e-12, 2000 | The PCG stops when $\lvert r\rvert^2/\lvert b\rvert^2 <$ `tol` or after `maxiter` iterations |
-| `angle_dtype` | `np.float32` | Storage of γ cos 2a, γ sin 2a: float32 (angle error ~1e-7 rad) or `np.float64` (exact, 8 more bytes per sample) |
+| `angle_dtype` | `np.float32` | Storage of 2a: float32 (angle error ~1e-7 rad) or `np.float64` (exact, 4 more bytes per sample) |
 
 The sections below explain how to choose them.
 
@@ -87,7 +87,8 @@ the same map.
 
 ## Angle precision
 
-γ cos 2a and γ sin 2a are computed in float64 and stored in float32 by
-default, an error of ~1e-7 rad on the angle, irrelevant for any application;
-`angle_dtype=np.float64` stores them exactly at the cost of 8 more bytes per
-sample.
+Twice the polarization angle, 2a, is computed in float64, reduced to
+[−π, π) and stored in float32 by default, an error of ~1e-7 rad on the angle,
+irrelevant for any application; γ cos 2a and γ sin 2a are recomputed for each
+chunk when it is used. `angle_dtype=np.float64` stores 2a exactly at the cost
+of 4 more bytes per sample.

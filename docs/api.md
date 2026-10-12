@@ -23,5 +23,7 @@
 
 .. autofunction:: pysanepic.one_over_f_weights
 
+.. autofunction:: pysanepic.two_angle
+
 .. autofunction:: pysanepic.resolve_nthreads
 ```

@@ -8,8 +8,9 @@ Data layout: data come as *chunks*. Pass a 2D array (nchunk, ns) for chunks of
 the same length, or a list of 1D chunks and/or 2D blocks. Noise weights have
 one row of length ns//2+1 per chunk, defined so that the filter is
 irfft(rfft(t) * w). Chunks are used as views (no copies) and processed one at a
-time, so the memory per sample is the TOD plus 12 bytes (int32 pixel, float32
-gamma cos 2a and gamma sin 2a; 20 bytes with angle_dtype=np.float64).
+time, so the memory per sample is the TOD plus 8 bytes (int32 pixel and
+float32 2a; 12 bytes with angle_dtype=np.float64). gamma cos 2a and
+gamma sin 2a are recomputed for each chunk when it is used.
 """
 
 import os
@@ -53,6 +54,11 @@ def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0):
     num, den = fa + fmin_hz**alpha, fa + fknee_hz**alpha
     ratio = np.divide(num, den, out=np.ones_like(fa), where=den > 0)  # fknee = 0: white
     return ratio / sigma**2
+
+
+def two_angle(a):
+    """2a reduced to [-pi, pi), where float32 has its best absolute precision."""
+    return np.remainder(2 * np.asarray(a, dtype=float) + np.pi, 2 * np.pi) - np.pi
 
 
 def _as_list(x):
@@ -115,6 +121,18 @@ def _backproject(ip, t, c2, s2, pol, buf):
             if pol:
                 buf[th, 1, p] += t[i] * c2[i]
                 buf[th, 2, p] += t[i] * s2[i]
+
+
+@numba.njit(parallel=True, cache=True)
+def _cos_sin(a2, gamma, c2, s2):
+    """c2 = gamma cos(a2), s2 = gamma sin(a2), in float64 then stored; gamma has
+    one value or one per sample."""
+    one = gamma.size == 1
+    for i in numba.prange(a2.size):
+        g = gamma[0] if one else gamma[i]
+        a = np.float64(a2[i])
+        c2[i] = g * np.cos(a)
+        s2[i] = g * np.sin(a)
 
 
 @numba.njit(cache=True)
@@ -229,15 +247,18 @@ class GLS:
         are replicated on all ranks and P^T is summed with Allreduce.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
-    pol_weights : (cos2, sin2) or None
-        Instead of psi and pol_efficiency: gamma cos 2a and gamma sin 2a of each
-        sample, laid out like `pix` (used without copies if of `angle_dtype`).
+    pol_angles : (angle2, gamma) or None
+        Instead of psi and pol_efficiency: `angle2`, twice the polarization
+        angle of each sample laid out like `pix`, reduced to [-pi, pi) (see
+        :func:`two_angle`; used without copies if of `angle_dtype`), and
+        `gamma`, the polarization efficiency of each chunk (scalar, or one
+        value per sample, e.g. 0 in intensity-only samples).
     angle_dtype : np.float32 (default) or np.float64
-        Storage of gamma cos 2a and gamma sin 2a (angle error ~1e-7 rad in
-        float32; pass angles reduced mod pi for that precision).
+        Storage of 2a (and of a per-sample efficiency): float32 gives an angle
+        error of ~1e-7 rad.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_weights=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -248,17 +269,22 @@ class GLS:
         self.weights = _chunks(weights)
         nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
-        self.pol = psi is not None or pol_weights is not None
+        self.pol = psi is not None or pol_angles is not None
         self.ncomp = 3 if self.pol else 1
         self._dummy = np.zeros(1, angle_dtype)
-        if pol_weights is not None:
-            self.cos2, self.sin2 = ([np.ascontiguousarray(x, dtype=angle_dtype) for x in _chunks(w)] for w in pol_weights)
+        if pol_angles is not None:
+            angle2, gamma = pol_angles
+            self.angle2 = [np.ascontiguousarray(a, dtype=angle_dtype) for a in _chunks(angle2)]
+            gamma = _as_list(gamma)
         elif self.pol:
             eff = [1.0] * len(_as_list(psi)) if pol_efficiency is None else _as_list(pol_efficiency)
             gamma = _efficiency_chunks(eff, psi)
-            psi = _chunks(psi)
-            self.cos2 = [(g * np.cos(2 * a)).astype(angle_dtype) for g, a in zip(gamma, psi)]
-            self.sin2 = [(g * np.sin(2 * a)).astype(angle_dtype) for g, a in zip(gamma, psi)]
+            self.angle2 = [two_angle(a).astype(angle_dtype) for a in _chunks(psi)]
+        if self.pol:
+            # one value per chunk in float64, or one per sample in angle_dtype
+            self.gamma = [np.atleast_1d(np.asarray(g, dtype=float if np.ndim(g) == 0 else angle_dtype)) for g in gamma]
+            nmax = max((ip.size for ip in self.ip), default=0)
+            self._c2, self._s2 = np.empty(nmax, angle_dtype), np.empty(nmax, angle_dtype)
 
         cov = np.zeros((self.nobs, 7))
         for k, ip in enumerate(self.ip):
@@ -329,9 +355,15 @@ class GLS:
         return out
 
     def _pol_arrays(self, k):
-        if self.pol:
-            return True, self.cos2[k], self.sin2[k]
-        return False, self._dummy, self._dummy
+        """(pol, gamma cos 2a, gamma sin 2a) of chunk k, computed into buffers
+        that the next call overwrites."""
+        if not self.pol:
+            return False, self._dummy, self._dummy
+        n = self.ip[k].size
+        c2, s2 = self._c2[:n], self._s2[:n]
+        with numba_threads(self.nthreads):
+            _cos_sin(self.angle2[k], self.gamma[k], c2, s2)
+        return True, c2, s2
 
     def _apply(self, m=None, tod=None):
         """P^T N^-1 P m (if m is given) or P^T N^-1 tod, one chunk at a time."""
