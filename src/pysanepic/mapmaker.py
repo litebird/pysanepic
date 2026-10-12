@@ -57,7 +57,18 @@ class DetectorData:
 
 @dataclass
 class MapResult:
-    """maps: (3, npix) I/Q/U, or (1, npix) if pol=False; hp.UNSEEN where not solved."""
+    """Output of :func:`make_maps`.
+
+    Attributes
+    ----------
+    maps : (3, npix) I/Q/U in K, or (1, npix) if pol=False; RING ordering,
+        hp.UNSEEN where not solved.
+    hit_map : number of samples per pixel.
+    nside, coordinates : pixelization of the maps.
+    iterations : number of PCG iterations.
+    converged : whether norm(r)^2 / norm(b)^2 < tol was reached.
+    residuals : norm(r)^2 / norm(b)^2 at each iteration.
+    """
 
     maps: np.ndarray
     hit_map: np.ndarray
@@ -73,6 +84,8 @@ class GLSParameters:
     """Settings of the GLS map-maker (everything but the data, the output
     pixelization and the parallelization).
 
+    Attributes
+    ----------
     chunk_s : N^-1 is applied independently on chunks of this duration [s];
         longer chunks capture lower frequencies but cost more.
     pad_s : each chunk is extended by this duration [s] on both sides before
@@ -89,7 +102,7 @@ class GLSParameters:
     min_pol_rcond : Q/U are solved only in pixels whose polarization-angle
         coverage gives a reciprocal condition number >= this value (0: no
         check, as SANEPIC).
-    tol, maxiter : PCG stops when |r|^2/|b|^2 < tol or after maxiter iterations.
+    tol, maxiter : PCG stops when norm(r)^2 / norm(b)^2 < tol or after maxiter iterations.
     angle_dtype : storage of gamma cos 2a and gamma sin 2a: np.float32 (4 bytes
         per sample each, angle error ~1e-7 rad) or np.float64 (exact).
     """
