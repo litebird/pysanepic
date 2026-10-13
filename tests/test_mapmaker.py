@@ -11,7 +11,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, GLSParameters, make_maps
+from pysanepic import DetectorData, GLSParameters, Pointing, make_maps
 
 
 def _scan(n, rng):
@@ -45,7 +45,7 @@ def test_noiseless_recovers_sky():
         tod = sky[0, p] + gamma * (sky[1, p] * np.cos(2 * angle) + sky[2, p] * np.sin(2 * angle))
         data.append(
             DetectorData(
-                tod=tod, theta=theta, phi=phi, psi=psi, hwp_angle=hwp, coordinates="E",
+                tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), hwp_angle=hwp,
                 sampling_rate_hz=fs, net_ukrts=40.0, pol_angle_rad=pol_angle, pol_efficiency=gamma,
             )
         )
@@ -74,7 +74,7 @@ def _four_detectors(n, fs, rng, sky, nside, noise=False):
         tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a)
         data.append(
             DetectorData(
-                tod=tod, theta=theta, phi=phi, psi=psi, coordinates="E", sampling_rate_hz=fs,
+                tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,
                 net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4, pol_angle_rad=pol_angle,
             )
         )
@@ -114,26 +114,51 @@ def test_pixel_input_and_generator():
     data = _four_detectors(n, fs, rng, sky, nside)
     common = dict(coordinates="E", params=GLSParameters(chunk_s=1000.0, maxiter=20))
     ref = make_maps(data, nside, **common)
-    for ordering, nest in [("RING", False), ("NESTED", True)]:
-        # coordinates=None: pixels and psi are in the coordinates of the output
-        with_pix = (
-            dataclasses.replace(
-                d, theta=None, phi=None, coordinates=None, nside=nside, ordering=ordering,
-                pix=hp.ang2pix(nside, d.theta, d.phi, nest=nest),
+
+    def with_pix(ordering, nest):
+        for d in data:
+            p = d.pointing
+            pix = hp.ang2pix(nside, p.theta, p.phi, nest=nest).astype(np.int32)
+            yield dataclasses.replace(
+                d, pointing=Pointing(pix=pix, nside=nside, ordering=ordering, psi=p.psi, coordinates="E")
             )
-            for d in data
-        )
-        res = make_maps(with_pix, nside, **common)
+
+    for ordering, nest in [("RING", False), ("NESTED", True)]:
+        res = make_maps(with_pix(ordering, nest), nside, **common)
         assert np.array_equal(res.maps, ref.maps), ordering
 
-    def bad(**kw):
-        with pytest.raises(ValueError, match=kw.pop("match")):
-            make_maps([dataclasses.replace(data[0], **kw)], nside, **common)
+    # pixels must be at the output nside and in the output coordinates
+    pix = np.zeros(n, np.int32)
+    for kw, match in [(dict(nside=8), "nside=8"), (dict(nside=nside, coordinates="G"), "coordinates")]:
+        bad = Pointing(pix=pix, psi=data[0].pointing.psi, **{"coordinates": "E", **kw})
+        with pytest.raises(ValueError, match=match):
+            make_maps([dataclasses.replace(data[0], pointing=bad)], nside, **common)
 
-    bad(pix=np.zeros(n, int), nside=8, match="nside")
-    bad(pix=np.full(n, 12 * nside**2), nside=nside, match="outside")
-    bad(pix=np.zeros(n, int), nside=nside, coordinates="G", match="coordinates")
-    bad(coordinates=None, match="required")
+
+def test_pointing_checks():
+    psi, n = np.zeros(10), 10
+    ok = dict(psi=psi, coordinates="E")
+    for kw, match in [
+        (dict(theta=psi, phi=psi, coordinates="X", psi=psi), "coordinates"),
+        (dict(**ok), "either"),
+        (dict(theta=psi, **ok), "either"),
+        (dict(theta=psi, phi=psi[:5], **ok), "same length"),
+        (dict(theta=psi, phi=psi, nside=16, **ok), "only for pix"),
+        (dict(theta=psi, phi=psi, pix=np.zeros(n, int), nside=16, **ok), "not both"),
+        (dict(pix=np.zeros(n), nside=16, **ok), "integer"),
+        (dict(pix=np.zeros(n, int), **ok), "nside"),
+        (dict(pix=np.zeros(n, int), nside=12, ordering="NESTED", **ok), "nside"),
+        (dict(pix=np.zeros(n, int), nside=16, ordering="X", **ok), "ordering"),
+        (dict(pix=np.full(n, 12 * 16**2), nside=16, **ok), "outside"),
+        (dict(pix=np.zeros(5, int), nside=16, **ok), "same length"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            Pointing(**kw)
+    p = Pointing(pix=np.zeros(n, int), nside=16, **ok)
+    with pytest.raises(ValueError, match="11 samples"):
+        DetectorData(tod=np.zeros(11), pointing=p, sampling_rate_hz=1.0, net_ukrts=1.0)
+    with pytest.raises(TypeError):
+        DetectorData(tod=np.zeros(n), pointing=None, sampling_rate_hz=1.0, net_ukrts=1.0)
 
 
 def test_contiguous_run_kernel():
@@ -160,5 +185,6 @@ if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_padding_noiseless()
     test_pixel_input_and_generator()
+    test_pointing_checks()
     test_contiguous_run_kernel()
     print("ok")

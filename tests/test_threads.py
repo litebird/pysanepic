@@ -4,7 +4,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from pysanepic import DetectorData, GLSParameters, make_maps, resolve_nthreads
+from pysanepic import DetectorData, GLSParameters, Pointing, make_maps, resolve_nthreads
 from pysanepic.gls import numba_threads
 from test_mapmaker import _scan
 
@@ -36,7 +36,7 @@ def test_same_result_any_thread_count():
         tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a) + rng.normal(0, 1e-4, n)
         data.append(
             DetectorData(
-                tod=tod, theta=theta, phi=phi, psi=psi, coordinates="E", sampling_rate_hz=fs,
+                tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,
                 net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4, pol_angle_rad=pol_angle,
             )
         )
