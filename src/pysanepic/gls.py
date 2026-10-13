@@ -57,7 +57,21 @@ def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0):
 
 def two_angle(a):
     """2a reduced to [-pi, pi), where float32 has its best absolute precision."""
-    return np.remainder(2 * np.asarray(a, dtype=float) + np.pi, 2 * np.pi) - np.pi
+    return _reduce_angle(2 * np.asarray(a, dtype=float))
+
+
+def _reduce_angle(x):
+    """x reduced to [-pi, pi), as _cos_sin requires."""
+    return np.remainder(np.asarray(x, dtype=float) + np.pi, 2 * np.pi) - np.pi
+
+
+def _reduced(a, dtype):
+    """a as dtype, reduced to [-pi, pi) only if needed (make_maps passes it
+    reduced already; float32 rounding of +-pi is within 1e-7)."""
+    a = np.asarray(a)
+    if a.size and (a.min() < -np.pi - 1e-6 or a.max() > np.pi + 1e-6):
+        a = _reduce_angle(a)
+    return np.ascontiguousarray(a, dtype=dtype)
 
 
 def _check_mpi_count(n):
@@ -144,26 +158,24 @@ _TRIG_SIN = np.sin(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
 @numba.njit(parallel=True, cache=True)
 def _cos_sin(a2, gamma, c2, s2, tc, ts):
     """c2 = gamma cos(a2), s2 = gamma sin(a2), in float64 then stored; gamma has
-    one value or one per sample. cos and sin come from the grid point below a2
-    (tables tc, ts) and the Taylor series of the remainder d < 2pi/4096, exact
-    to ~1e-16 and 2.5x faster than libm (numba without SVML)."""
+    one value or one per sample; a2 in [-pi, pi) (float32 rounding may put it
+    just outside). cos and sin come from the grid point below a2 (tables tc, ts)
+    and the Taylor series of the remainder d < 2pi/4096: exact to ~1e-16 and
+    10x faster than libm on G100 (numba without SVML). No branch: with a libm
+    fallback for unreduced angles LLVM computed cos and sin for every sample."""
     one = gamma.size == 1
     n = tc.size
     step = 2 * np.pi / n
     for i in numba.prange(a2.size):
         g = gamma[0] if one else gamma[i]
-        a = np.float64(a2[i])
-        k = int(np.floor((a + np.pi) / step))
-        if 0 <= k < n:
-            d = a + np.pi - k * step
-            d2 = d * d
-            cd = 1.0 - d2 * (0.5 - d2 / 24.0)
-            sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
-            c, s = tc[k] * cd - ts[k] * sd, ts[k] * cd + tc[k] * sd
-        else:  # 2a not reduced to [-pi, pi)
-            c, s = np.cos(a), np.sin(a)
-        c2[i] = g * c
-        s2[i] = g * s
+        x = np.float64(a2[i]) + np.pi
+        k = min(max(int(x / step), 0), n - 1)
+        d = x - k * step
+        d2 = d * d
+        cd = 1.0 - d2 * (0.5 - d2 / 24.0)
+        sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
+        c2[i] = g * (tc[k] * cd - ts[k] * sd)
+        s2[i] = g * (ts[k] * cd + tc[k] * sd)
 
 
 @numba.njit(cache=True)
@@ -327,7 +339,7 @@ class GLS:
         self._dummy = np.zeros(1, angle_dtype)
         if pol_angles is not None:
             angle2, gamma = pol_angles
-            self.angle2 = [np.ascontiguousarray(a, dtype=angle_dtype) for a in _chunks(angle2)]
+            self.angle2 = [_reduced(a, angle_dtype) for a in _chunks(angle2)]
             gamma = _as_list(gamma)
         elif self.pol:
             eff = [1.0] * len(_as_list(psi)) if pol_efficiency is None else _as_list(pol_efficiency)
