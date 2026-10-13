@@ -28,8 +28,11 @@ oversubscription when several MPI processes share a node: set
 `OMP_NUM_THREADS = cores per node / processes per node`. Set
 `NUMBA_NUM_THREADS` to at least the same value.
 
-$P^T$ keeps one private copy of the I/Q/U map per thread (about 75 MB per
-thread at nside 512), so the threads never write to the same memory.
+In $P^T$ each thread owns a range of pixels, chosen so that the ranges hold
+the same number of this process's samples. Every thread reads the pixel
+indices of the whole chunk but adds only the samples of its own pixels, so
+the threads share one map without races and without private copies. On a
+laptop this was as fast as one private map per thread, with 4 and 8 threads.
 
 ## Memory
 
@@ -44,13 +47,14 @@ and γ sin 2a are recomputed for each chunk when it is used. With padding
   one detector are in memory at a time (litebird_sim does this).
 - Maps: the PCG vectors and the 3×3 preconditioner (~300 bytes per pixel)
   are divided among the processes. Each process keeps in full only the search
-  direction for $P$ (24 bytes per pixel, I/Q/U in float64) and one private
-  map per thread for $P^T$ (24 bytes per pixel and thread), plus during the
-  setup the coverage and the preconditioner blocks (56 and 48 bytes per pixel,
-  one after the other). At nside 2048 (50 million pixels) with 4 threads,
-  this is about 6 GB per process.
-  On a laptop (nside 1024, 4 processes × 2 threads, little data), the peak
-  per process went from 324 to 142 bytes per pixel with this distribution.
+  direction for $P$ and the map accumulating $P^T$ (24 bytes per pixel each,
+  I/Q/U in float64, whatever the number of threads), plus during the setup
+  the coverage and the preconditioner blocks (56 and 48 bytes per pixel, one
+  after the other). At nside 2048 (50 million pixels) this is about 2.4 GB
+  per process during the iterations, and 2.8 GB at the peak of the setup.
+  On a laptop (nside 1024, 4 processes × 2 threads, little data),
+  distributing the PCG state took the peak per process from 324 to 142
+  bytes per pixel, before the private maps of the threads were removed.
 - Pixel indices are int32, enough up to nside 8192.
 
 See the [memory notebook](notebooks/memory).

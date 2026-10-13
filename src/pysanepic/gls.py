@@ -107,20 +107,20 @@ def _project(ip, m, c2, s2, pol, out):
 
 
 @numba.njit(parallel=True, cache=True)
-def _backproject(ip, t, c2, s2, pol, buf):
-    """buf[th] += P^T t over the samples of thread th, buf (nthreads, npix, ncomp);
-    the caller sums buf over threads."""
-    # ponytail: one private I/Q/U map per thread (~75 MB each at nside 512); switch
-    # to pixel-sorted samples if memory per process becomes the limit
-    nthreads = buf.shape[0]
-    step = (ip.size + nthreads - 1) // nthreads
-    for th in numba.prange(nthreads):
-        for i in range(th * step, min(ip.size, (th + 1) * step)):
+def _backproject(ip, t, c2, s2, pol, edges, buf):
+    """buf += P^T t, buf (npix, ncomp). Thread th owns the pixels
+    [edges[th], edges[th + 1]): it reads all the pixel indices of the chunk but
+    adds only the samples of its pixels, so the threads share one map without
+    races and without private copies."""
+    for th in numba.prange(edges.size - 1):
+        lo, hi = edges[th], edges[th + 1]
+        for i in range(ip.size):
             p = ip[i]
-            buf[th, p, 0] += t[i]
-            if pol:
-                buf[th, p, 1] += t[i] * c2[i]
-                buf[th, p, 2] += t[i] * s2[i]
+            if lo <= p < hi:
+                buf[p, 0] += t[i]
+                if pol:
+                    buf[p, 1] += t[i] * c2[i]
+                    buf[p, 2] += t[i] * s2[i]
 
 
 @numba.njit(parallel=True, cache=True)
@@ -266,8 +266,7 @@ class GLS:
         is summed over ranks with a reduce-scatter that delivers to each rank
         its pixels, and the search direction is rebuilt on every rank for P
         with an allgather (together, the same traffic as one Allreduce). Only
-        the map used by P and the private maps of the threads for P^T are full
-        size.
+        the map used by P and the map accumulating P^T are full size.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -319,6 +318,13 @@ class GLS:
         cov = np.zeros((self.nobs, 7))
         for k, ip in enumerate(self.ip):
             _coverage(ip, *self._pol_arrays(k)[1:], self.pol, cov)
+        # P^T: each thread owns a range of pixels holding ~1/nthreads of this
+        # rank's samples
+        nt = min(self.nthreads, numba.config.NUMBA_NUM_THREADS)
+        cum = np.cumsum(cov[:, 0])
+        target = (cum[-1] if cum.size else 0.0) * np.arange(nt + 1) / nt
+        self._edges = np.searchsorted(cum, target).astype(np.int64)
+        self._edges[[0, -1]] = 0, self.nobs
         cov = self._scatter_sum(cov)
         self.hits = cov[:, 0].astype(np.int64)  # this rank's pixels, like mask and precond
         self.mask = np.repeat((self.hits > 0)[None], self.ncomp, axis=0)
@@ -429,15 +435,14 @@ class GLS:
         """P^T N^-1 P m (m: this rank's pixels, (ncomp, nloc)) or P^T N^-1 tod,
         one chunk at a time; returns this rank's pixels (ncomp, nloc)."""
         if self._buf is None:
-            # the search direction for P, and one private map per thread for P^T
+            # the search direction for P, and the map for P^T
             self._full = np.empty((self.nobs, self.ncomp))
-            self._buf = np.empty((min(self.nthreads, numba.config.NUMBA_NUM_THREADS), self.nobs, self.ncomp))
+            self._buf = np.empty((self.nobs, self.ncomp))
         if m is not None:
             self._gather(m.T, out=self._full)  # the whole map, for P
         buf = self._buf
         buf[:] = 0.0
         with numba_threads(self.nthreads):
-            nt = numba.get_num_threads()
             for k, ip in enumerate(self.ip):
                 pol, c2, s2 = self._pol_arrays(k)
                 if m is None:
@@ -445,10 +450,8 @@ class GLS:
                 else:
                     t = np.empty(ip.size)
                     _project(ip, self._full, c2, s2, pol, t)
-                _backproject(ip, _filter(t, self.weights[k], self.nthreads), c2, s2, pol, buf[:nt])
-        for th in range(1, nt):
-            buf[0] += buf[th]
-        return self._scatter_sum(buf[0]).T * self.mask
+                _backproject(ip, _filter(t, self.weights[k], self.nthreads), c2, s2, pol, self._edges, buf)
+        return self._scatter_sum(buf).T * self.mask
 
     def apply_A(self, m):
         """P^T N^-1 P m for this rank's pixels of a map, (ncomp, nloc) (without

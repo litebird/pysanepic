@@ -95,6 +95,6 @@ the maps and then discarded, so the padding does not enter the maps.
 - No correlations between chunks or between detectors (see above).
 - No data splits (half-mission, detector subsets) in one call: run
   `make_maps` once per split.
-- Every process still holds two kinds of full-size maps, the search direction
-  for $P$ and one private map per thread for $P^T$, so the memory per process
-  grows with nside (see [memory](performance.md#memory)).
+- Every process still holds two full-size maps, the search direction for $P$
+  and the map accumulating $P^T$, so the memory per process grows with nside
+  (see [memory](performance.md#memory)).
