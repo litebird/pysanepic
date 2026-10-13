@@ -28,8 +28,14 @@ oversubscription when several MPI processes share a node: set
 `OMP_NUM_THREADS = cores per node / processes per node`. Set
 `NUMBA_NUM_THREADS` to at least the same value.
 
-$P^T$ keeps one private copy of the I/Q/U map per thread (about 75 MB per
-thread at nside 512), so the threads never write to the same memory.
+In $P^T$ each thread owns a range of pixels, chosen so that the ranges hold
+the same number of this process's samples. Every thread reads the pixel
+indices of the whole chunk but adds only the samples of its own pixels, so
+the threads share one map without races and without private copies. With
+4–8 threads this was as fast as one private map per thread on a laptop, and
+faster on G100 (3 threads). Since every thread reads all the pixel indices,
+prefer several MPI processes per node with a few threads each over one
+process with many threads.
 
 ## Memory
 
@@ -44,15 +50,18 @@ and γ sin 2a are recomputed for each chunk when it is used. With padding
   one detector are in memory at a time (litebird_sim does this).
 - Maps: the PCG vectors and the 3×3 preconditioner (~300 bytes per pixel)
   are divided among the processes. Each process keeps in full only the search
-  direction for $P$ (24 bytes per pixel, I/Q/U in float64) and one private
-  map per thread for $P^T$ (24 bytes per pixel and thread), plus during the
-  setup the coverage and the preconditioner blocks (56 and 48 bytes per pixel,
-  one after the other). These two are reduce-scattered one column at a time:
-  with a single call Intel MPI allocates a temporary copy of the whole array
-  (about 2 GB more per process at nside 2048 on G100). At nside 2048
-  (50 million pixels) with 4 threads, this is about 6 GB per process.
-  On a laptop (nside 1024, 4 processes × 2 threads, little data), the peak
-  per process went from 324 to 142 bytes per pixel with this distribution.
+  direction for $P$ and the map accumulating $P^T$ (24 bytes per pixel each,
+  I/Q/U in float64, whatever the number of threads), plus during the setup
+  the coverage and the preconditioner blocks (56 and 48 bytes per pixel, one
+  after the other). These two are reduce-scattered one column at a time:
+  with a single call Intel MPI allocates a temporary copy of the whole array.
+  At nside 2048 (50 million pixels) this is about 2.4 GB per process during
+  the iterations, and 2.8 GB at the peak of the setup. On G100 (nside 2048,
+  8 processes × 2 threads, little data), the column-wise setup took the peak
+  RSS per process from 7.6 to 5.7 GB, for 3 s more.
+  On a laptop (nside 1024, 4 processes × 2 threads, little data),
+  distributing the PCG state took the peak per process from 324 to 142
+  bytes per pixel, before the private maps of the threads were removed.
 - Pixel indices are int32, enough up to nside 8192. With MPI, the maps
   exchanged are limited by the int32 counts of MPI to nside 4096.
 
