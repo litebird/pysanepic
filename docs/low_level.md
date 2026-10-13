@@ -49,4 +49,5 @@ public, e.g. to use another solver. With MPI they work on the pixels owned by
 the process, `[gls.lo, gls.hi)`, as arrays `(ncomp, gls.nloc)` (without MPI,
 the whole map), and must be called by every process. `GLS.full` gathers such
 an array into the full map on every process, and `GLS.to_healpix` expands the
-solution to full HEALPix maps. `solve` returns the full map on every process.
+solution to full HEALPix maps (after `solve`, also on one process only). `solve`
+returns the full map on every process.

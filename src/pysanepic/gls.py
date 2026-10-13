@@ -497,12 +497,17 @@ class GLS:
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history)}
         del b, r, z, d  # q does not exist if maxiter == 0
         self._full = self._buf = None  # free the work maps before gathering the result
+        # full mask now, while all ranks are here, so that to_healpix is not collective
+        self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
         return self._gather(x.T).T, info
 
     def to_healpix(self, m, nside, fill=np.nan):
         """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2); labels
-        beyond the map (virtual pixels) are dropped. Collective with MPI."""
-        unseen = self.full(self.mask.astype(np.uint8)) == 0
+        beyond the map (virtual pixels) are dropped. Collective with MPI only if
+        called before solve()."""
+        if getattr(self, "_full_mask", None) is None:
+            self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
+        unseen = ~self._full_mask
         full = np.full((m.shape[0], 12 * nside * nside), fill)
         n = min(full.shape[1], self.nobs)
         full[:, :n] = m[:, :n]
