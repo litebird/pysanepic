@@ -38,10 +38,11 @@ result.maps       # (3, npix) I, Q, U; healpy.UNSEEN where not solved
 With any other pipeline, one `DetectorData` per detector and stretch of time:
 
 ```python
-from pysanepic import DetectorData, make_maps
+from pysanepic import DetectorData, Pointing, make_maps
 
-data = [DetectorData(tod=tod, theta=theta, phi=phi, psi=psi, coordinates="E",
-                     pol_angle_rad=0.0, sampling_rate_hz=19.0,
+# angles in any coordinate system, or Pointing(pix=..., nside=..., psi=..., coordinates=...)
+pointing = Pointing(theta=theta, phi=phi, psi=psi, coordinates="E")
+data = [DetectorData(tod=tod, pointing=pointing, pol_angle_rad=0.0, sampling_rate_hz=19.0,
                      net_ukrts=40.0, fknee_hz=0.02, alpha=1.0, fmin_hz=1e-5)]
 result = make_maps(data, nside=64, coordinates="G")
 ```

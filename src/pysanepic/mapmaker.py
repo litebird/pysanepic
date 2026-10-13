@@ -2,9 +2,11 @@
 
 Any pipeline (litebird_sim, files on disk, ...) only needs to provide
 :class:`DetectorData` objects, as a list or as a generator (then only one
-detector's pointings are in memory at a time); pysanepic computes pixels,
-polarization angles, chunks and noise weights itself, with one set of
-conventions documented here.
+detector's pointings are in memory at a time), each with a :class:`Pointing`:
+either angles, which pysanepic rotates to the output coordinates and
+pixelizes at the output resolution, or HEALPix pixels already computed at that
+resolution and in those coordinates. pysanepic computes polarization angles,
+chunks and noise weights itself, with one set of conventions documented here.
 """
 
 from dataclasses import dataclass
@@ -17,33 +19,104 @@ import numpy as np
 from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads, two_angle
 
 
-@dataclass(kw_only=True)
+_COORDINATES = ("E", "G", "C")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Pointing:
+    """Pointing of one detector over one stretch of time, in one of two forms.
+
+    - Angles: `theta`, `phi` (colatitude and longitude [rad]) in `coordinates`.
+      :func:`make_maps` rotates them to the coordinates of the output maps (with
+      `psi`) and computes the pixels at the output resolution.
+    - Pixels: `pix`, HEALPix pixel indices at resolution `nside` in `ordering`
+      ("RING" or "NESTED"), computed in `coordinates`. They are used as they
+      are, so `nside` and `coordinates` must be those of the output maps; pass
+      them as int32 to avoid a copy.
+
+    `psi` is the orientation angle of the detector frame [rad] in
+    `coordinates`; `coordinates` is "E" (ecliptic), "G" (galactic) or "C"
+    (equatorial). The arrays are checked when the object is created.
+    """
+
+    psi: np.ndarray
+    coordinates: str
+    theta: np.ndarray | None = None
+    phi: np.ndarray | None = None
+    pix: np.ndarray | None = None
+    nside: int | None = None
+    ordering: str = "RING"
+
+    def __post_init__(self):
+        if self.coordinates not in _COORDINATES:
+            raise ValueError(f"Pointing.coordinates must be one of {_COORDINATES}, not {self.coordinates!r}")
+        n = np.shape(self.psi)
+        if len(n) != 1:
+            raise ValueError("Pointing.psi must be a 1D array")
+        if self.pix is None:
+            if self.theta is None or self.phi is None:
+                raise ValueError("Pointing needs either theta and phi, or pix and nside")
+            if self.nside is not None:
+                raise ValueError("Pointing.nside is only for pix: angles are pixelized at the output nside")
+            if np.shape(self.theta) != n or np.shape(self.phi) != n:
+                raise ValueError("Pointing.theta, phi and psi must have the same length")
+            return
+        if self.theta is not None or self.phi is not None:
+            raise ValueError("Pointing takes either theta and phi, or pix, not both")
+        if np.shape(self.pix) != n:
+            raise ValueError("Pointing.pix and psi must have the same length")
+        if not np.issubdtype(np.asarray(self.pix).dtype, np.integer):
+            raise ValueError("Pointing.pix must be an integer array")
+        if self.ordering not in ("RING", "NESTED"):
+            raise ValueError(f"Unknown ordering {self.ordering!r}: use 'RING' or 'NESTED'")
+        if self.nside is None or self.nside < 1 or (self.ordering == "NESTED" and self.nside & (self.nside - 1)):
+            raise ValueError(f"Pointing.pix needs a valid nside, not {self.nside!r}")
+        pix = np.asarray(self.pix)
+        if pix.size and (pix.min() < 0 or pix.max() >= 12 * self.nside**2):
+            raise ValueError(f"Pointing.pix outside [0, 12 nside^2) for nside={self.nside}")
+
+    def __len__(self):
+        return len(self.psi)
+
+    def pixels_and_psi(self, nside, coordinates, nthreads=1):
+        """RING pixels at `nside` and psi in `coordinates` (the output maps)."""
+        if self.pix is not None:
+            if self.nside != nside or self.coordinates != coordinates:
+                raise ValueError(
+                    f"Pointing.pix is at nside={self.nside} in coordinates {self.coordinates!r}: "
+                    f"the maps need nside={nside} in coordinates {coordinates!r}"
+                )
+            pix = np.asarray(self.pix)
+            if self.ordering == "NESTED":
+                pix = ducc0.healpix.Healpix_Base(nside, "NEST").nest2ring(pix, nthreads=nthreads)
+            return pix, np.asarray(self.psi)
+        theta, phi, psi = self.theta, self.phi, self.psi
+        if self.coordinates != coordinates:
+            R = hp.Rotator(coord=[self.coordinates, coordinates]).mat
+            out = np.empty((3, len(psi)))
+            with numba_threads(nthreads):
+                _rotate(np.ascontiguousarray(theta), np.ascontiguousarray(phi), np.ascontiguousarray(psi), R, out)
+            theta, phi, psi = out
+        pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=nthreads)
+        return pix, psi
+
+
+@dataclass(frozen=True, kw_only=True)
 class DetectorData:
     """One detector over one contiguous stretch of time.
 
-    Pointing: either `theta`, `phi` (colatitude and longitude in `coordinates`,
-    which is then required: "E" ecliptic, "G" galactic, "C" equatorial), or
-    `pix`, the HEALPix pixel at resolution `nside` in `ordering` ("RING" or
-    "NESTED"). With `pix`, `nside` and `coordinates` (None: the same as the
-    output) must be those of the output maps. `psi` is the orientation angle of
-    the detector's frame in `coordinates`.
-
-    Polarization conventions (same as litebird_sim): The polarization angle seen by
+    Polarization conventions (same as litebird_sim): the polarization angle seen by
     the sky is psi + pol_angle_rad without HWP, and
-    psi + 2 hwp_angle - pol_angle_rad with an ideal HWP. The TOD model is
-    d = I + pol_efficiency (Q cos 2a + U sin 2a) + noise, with `a` that angle.
+    psi + 2 hwp_angle - pol_angle_rad with an ideal HWP, with psi from `pointing`.
+    The TOD model is d = I + pol_efficiency (Q cos 2a + U sin 2a) + noise, with
+    `a` that angle.
 
     Noise: P(f) = sigma^2 (f^alpha + fknee^alpha) / (f^alpha + fmin^alpha) with
     sigma = net_ukrts * sqrt(sampling_rate_hz) * 1e-6, i.e. TOD in K.
     """
 
     tod: np.ndarray
-    psi: np.ndarray
-    theta: np.ndarray | None = None
-    phi: np.ndarray | None = None
-    pix: np.ndarray | None = None
-    nside: int | None = None  # resolution of pix
-    ordering: str = "RING"  # ordering of pix: "RING" or "NESTED"
+    pointing: Pointing
     sampling_rate_hz: float
     net_ukrts: float
     fknee_hz: float = 0.0
@@ -52,7 +125,14 @@ class DetectorData:
     pol_angle_rad: float = 0.0
     pol_efficiency: float = 1.0
     hwp_angle: np.ndarray | None = None
-    coordinates: str | None = None  # healpy code: "E" ecliptic, "G" galactic, "C" equatorial
+
+    def __post_init__(self):
+        if not isinstance(self.pointing, Pointing):
+            raise TypeError("DetectorData.pointing must be a pysanepic.Pointing")
+        if len(self.tod) != len(self.pointing):
+            raise ValueError(f"DetectorData.tod has {len(self.tod)} samples, the pointing {len(self.pointing)}")
+        if self.hwp_angle is not None and len(self.hwp_angle) != len(self.tod):
+            raise ValueError("DetectorData.hwp_angle and tod must have the same length")
 
 
 @dataclass
@@ -143,38 +223,10 @@ def _rotate(theta, phi, psi, R, out):
 
 
 def _pixels_and_angles(d, nside, coordinates, nthreads):
-    theta, phi, psi = d.theta, d.phi, d.psi
-    if d.pix is not None:
-        if d.nside != nside or d.coordinates not in (None, coordinates):
-            raise ValueError(
-                f"DetectorData.pix is at nside={d.nside}, coordinates={d.coordinates!r}: "
-                f"the maps need nside={nside}, coordinates={coordinates!r}"
-            )
-        if d.ordering not in ("RING", "NESTED"):
-            raise ValueError(f"Unknown ordering {d.ordering!r}: use 'RING' or 'NESTED'")
-    elif theta is None or phi is None:
-        raise ValueError("DetectorData needs either theta and phi, or pix")
-    elif d.coordinates is None:
-        raise ValueError("DetectorData.coordinates is required with theta and phi")
-    elif d.coordinates != coordinates:
-        R = hp.Rotator(coord=[d.coordinates, coordinates]).mat
-        out = np.empty((3, theta.size))
-        with numba_threads(nthreads):
-            _rotate(np.ascontiguousarray(theta), np.ascontiguousarray(phi), np.ascontiguousarray(psi), R, out)
-        theta, phi, psi = out
+    pix, psi = d.pointing.pixels_and_psi(nside, coordinates, nthreads)
     if d.hwp_angle is None:
-        angle = psi + d.pol_angle_rad
-    else:
-        angle = psi + 2 * d.hwp_angle - d.pol_angle_rad
-    if d.pix is not None:
-        pix = np.asarray(d.pix)
-        if pix.size and (pix.min() < 0 or pix.max() >= 12 * nside * nside):
-            raise ValueError(f"DetectorData.pix outside [0, 12 nside^2) for nside={nside}")
-        if d.ordering == "NESTED":
-            pix = ducc0.healpix.Healpix_Base(nside, "NEST").nest2ring(pix, nthreads=nthreads)
-        return pix, angle
-    pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=nthreads)
-    return pix, angle
+        return pix, psi + d.pol_angle_rad
+    return pix, psi + 2 * d.hwp_angle - d.pol_angle_rad
 
 
 def _pad(tod, m, fill, nfit_max=20000):

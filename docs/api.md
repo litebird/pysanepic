@@ -8,6 +8,9 @@
 .. autoclass:: pysanepic.DetectorData
    :no-members:
 
+.. autoclass:: pysanepic.Pointing
+   :members: pixels_and_psi
+
 .. autoclass:: pysanepic.GLSParameters
    :no-members:
 

@@ -30,7 +30,7 @@ pointings of only one detector at a time):
 
 ```python
 import numpy as np
-from pysanepic import DetectorData, GLSParameters, make_maps
+from pysanepic import DetectorData, GLSParameters, Pointing, make_maps
 
 
 def data():
@@ -38,8 +38,8 @@ def data():
         f = np.load(f"{name}.npz")  # your own files: one per detector and time span
         yield DetectorData(
             tod=f["tod"],  # K
-            theta=f["theta"], phi=f["phi"], psi=f["psi"],  # rad
-            coordinates="E",  # pointings in Ecliptic coordinates
+            # angles [rad] in Ecliptic coordinates, rotated and pixelized by pysanepic
+            pointing=Pointing(theta=f["theta"], phi=f["phi"], psi=f["psi"], coordinates="E"),
             hwp_angle=None,  # rad, per sample; None without HWP
             pol_angle_rad=float(f["pol_angle"]),
             sampling_rate_hz=19.0,
@@ -55,15 +55,36 @@ i_map, q_map, u_map = result.maps  # healpy.UNSEEN where not solved
 With MPI, every process calls `make_maps` with its own data and the same
 `comm`; see [MPI and threads](performance.md#mpi-and-threads).
 
+## Pointing
+
+A {class}`~pysanepic.Pointing` gives where a detector looks, in one of two
+forms:
+
+- **angles**: `Pointing(theta=..., phi=..., psi=..., coordinates=...)`. pysanepic
+  rotates them to the coordinates of the output maps (correcting ψ) and
+  computes the pixels at the output `nside`;
+- **pixels already computed**: `Pointing(pix=..., nside=..., psi=..., coordinates=..., ordering="RING")`.
+  They are used as they are, so `nside` and `coordinates` must be those of the
+  output maps (otherwise `make_maps` raises an error), and ψ must be in the same
+  coordinates. Pass `pix` as int32 to avoid a copy. litebird_sim uses this form.
+
+| Field | Meaning |
+|---|---|
+| `theta`, `phi` | Colatitude and longitude [rad] |
+| `pix`, `nside`, `ordering` | HEALPix pixel of each sample, its resolution and ordering (`"RING"` or `"NESTED"`) |
+| `psi` | Orientation of the detector frame [rad] |
+| `coordinates` | Coordinate system of the angles or pixels and of `psi`: `"E"`, `"G"` or `"C"` |
+
+The arrays are checked when the object is created: one form only, same
+lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
+`ordering`.
+
 ## `DetectorData` fields
 
 | Field | Meaning |
 |---|---|
 | `tod` | Time-ordered data, in K |
-| `theta`, `phi` | Colatitude and longitude of the pointing [rad] |
-| `pix`, `nside`, `ordering` | Alternative to `theta`, `phi`: HEALPix pixel of each sample, at the `nside` and in the coordinates of the output maps; `ordering` `"RING"` (default) or `"NESTED"`. Pixels outside the map raise an error |
-| `psi` | Orientation of the detector frame [rad] |
-| `coordinates` | Coordinate system of the pointings and `psi`: `"E"`, `"G"` or `"C"`. Required with `theta`, `phi`; with `pix`, `None` (default) means the output coordinates |
+| `pointing` | A `Pointing`, with as many samples as `tod` |
 | `hwp_angle` | HWP angle per sample [rad], or `None` |
 | `pol_angle_rad` | Polarization angle of the detector [rad] |
 | `pol_efficiency` | Polarization efficiency γ (default 1) |
