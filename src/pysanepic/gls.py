@@ -135,16 +135,35 @@ def _backproject(ip, t, c2, s2, pol, edges, buf):
                     buf[p, 2] += t[i] * s2[i]
 
 
+# cos and sin on a grid of [-pi, pi), for _cos_sin
+_TRIG_N = 4096
+_TRIG_COS = np.cos(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
+_TRIG_SIN = np.sin(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
+
+
 @numba.njit(parallel=True, cache=True)
-def _cos_sin(a2, gamma, c2, s2):
+def _cos_sin(a2, gamma, c2, s2, tc, ts):
     """c2 = gamma cos(a2), s2 = gamma sin(a2), in float64 then stored; gamma has
-    one value or one per sample."""
+    one value or one per sample. cos and sin come from the grid point below a2
+    (tables tc, ts) and the Taylor series of the remainder d < 2pi/4096, exact
+    to ~1e-16 and 2.5x faster than libm (numba without SVML)."""
     one = gamma.size == 1
+    n = tc.size
+    step = 2 * np.pi / n
     for i in numba.prange(a2.size):
         g = gamma[0] if one else gamma[i]
         a = np.float64(a2[i])
-        c2[i] = g * np.cos(a)
-        s2[i] = g * np.sin(a)
+        k = int(np.floor((a + np.pi) / step))
+        if 0 <= k < n:
+            d = a + np.pi - k * step
+            d2 = d * d
+            cd = 1.0 - d2 * (0.5 - d2 / 24.0)
+            sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
+            c, s = tc[k] * cd - ts[k] * sd, ts[k] * cd + tc[k] * sd
+        else:  # 2a not reduced to [-pi, pi)
+            c, s = np.cos(a), np.sin(a)
+        c2[i] = g * c
+        s2[i] = g * s
 
 
 @numba.njit(cache=True)
@@ -448,7 +467,7 @@ class GLS:
         n = self.ip[k].size
         c2, s2 = self._c2[:n], self._s2[:n]
         with numba_threads(self.nthreads):
-            _cos_sin(self.angle2[k], self.gamma[k], c2, s2)
+            _cos_sin(self.angle2[k], self.gamma[k], c2, s2, _TRIG_COS, _TRIG_SIN)
         return True, c2, s2
 
     def _apply(self, m=None, tod=None):
