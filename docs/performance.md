@@ -47,11 +47,14 @@ and γ sin 2a are recomputed for each chunk when it is used. With padding
   direction for $P$ (24 bytes per pixel, I/Q/U in float64) and one private
   map per thread for $P^T$ (24 bytes per pixel and thread), plus during the
   setup the coverage and the preconditioner blocks (56 and 48 bytes per pixel,
-  one after the other). At nside 2048 (50 million pixels) with 4 threads,
+  one after the other). These two are reduce-scattered one column at a time:
+  with a single call Intel MPI allocates a temporary copy of the whole array
+  (about 2 GB more per process at nside 2048 on G100). At nside 2048 (50 million pixels) with 4 threads,
   this is about 6 GB per process.
   On a laptop (nside 1024, 4 processes × 2 threads, little data), the peak
   per process went from 324 to 142 bytes per pixel with this distribution.
-- Pixel indices are int32, enough up to nside 8192.
+- Pixel indices are int32, enough up to nside 8192. With MPI, the maps
+  exchanged are limited by the int32 counts of MPI to nside 4096.
 
 See the [memory notebook](notebooks/memory).
 
