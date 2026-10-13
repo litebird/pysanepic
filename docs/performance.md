@@ -31,8 +31,11 @@ oversubscription when several MPI processes share a node: set
 In $P^T$ each thread owns a range of pixels, chosen so that the ranges hold
 the same number of this process's samples. Every thread reads the pixel
 indices of the whole chunk but adds only the samples of its own pixels, so
-the threads share one map without races and without private copies. On a
-laptop this was as fast as one private map per thread, with 4 and 8 threads.
+the threads share one map without races and without private copies. With
+4–8 threads this was as fast as one private map per thread on a laptop, and
+faster on G100 (3 threads). Since every thread reads all the pixel indices,
+prefer several MPI processes per node with a few threads each over one
+process with many threads.
 
 ## Memory
 
