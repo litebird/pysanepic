@@ -4,8 +4,22 @@
 
 With MPI each process passes only its own data (`DetectorData` objects, or
 litebird_sim observations) and all processes call `make_maps` with the same
-communicator. The maps are replicated on all processes and summed with one
-`Allreduce` per iteration; the result is available on every process.
+communicator; the result is available on every process.
+
+The PCG state is distributed by pixel: each process owns a contiguous range
+of pixels, 1/N of the map, and keeps the PCG vectors, the preconditioner and
+the mask only there. In each application of $P^T N^{-1} P$:
+
+1. every process projects the full search direction on its samples ($P$),
+   applies $N^{-1}$ and accumulates $P^T$ in a full-size map;
+2. a **reduce-scatter** sums these maps over the processes and delivers to
+   each one only its own pixels, where the PCG algebra is done;
+3. an **allgather** rebuilds the full search direction on every process for
+   the next $P$.
+
+Together, the reduce-scatter and the allgather move the same data as one
+`Allreduce` of the map, and every PCG operation is done once instead of on
+every process. Dot products are local sums plus an `Allreduce` of a number.
 
 Within each process, FFTs (ducc0), pixelization (ducc0) and the projection
 kernels (numba) use `nthreads` threads. As in litebird_sim, the default is
@@ -28,11 +42,19 @@ and γ sin 2a are recomputed for each chunk when it is used. With padding
 
 - Pass the data as a generator of `DetectorData`: then the pointings of only
   one detector are in memory at a time (litebird_sim does this).
-- The maps are replicated on every process: I/Q/U at nside 2048 takes 1.2 GB
-  per vector, and the PCG needs about ten of them (vectors, 3×3
-  preconditioner, one private map per thread), so above nside ~1024 the
-  resolution, not the data, sets the memory.
-- Pixel indices are int32, enough up to nside 8192.
+- Maps: the PCG vectors and the 3×3 preconditioner (~300 bytes per pixel)
+  are divided among the processes. Each process keeps in full only the search
+  direction for $P$ (24 bytes per pixel, I/Q/U in float64) and one private
+  map per thread for $P^T$ (24 bytes per pixel and thread), plus during the
+  setup the coverage and the preconditioner blocks (56 and 48 bytes per pixel,
+  one after the other). These two are reduce-scattered one column at a time:
+  with a single call Intel MPI allocates a temporary copy of the whole array
+  (about 2 GB more per process at nside 2048 on G100). At nside 2048
+  (50 million pixels) with 4 threads, this is about 6 GB per process.
+  On a laptop (nside 1024, 4 processes × 2 threads, little data), the peak
+  per process went from 324 to 142 bytes per pixel with this distribution.
+- Pixel indices are int32, enough up to nside 8192. With MPI, the maps
+  exchanged are limited by the int32 counts of MPI to nside 4096.
 
 See the [memory notebook](notebooks/memory).
 

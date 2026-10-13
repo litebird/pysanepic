@@ -22,7 +22,7 @@
 
 ```{eval-rst}
 .. autoclass:: pysanepic.GLS
-   :members: solve, apply_A, rhs, to_healpix
+   :members: solve, apply_A, rhs, full, to_healpix
 
 .. autofunction:: pysanepic.one_over_f_weights
 
