@@ -333,7 +333,7 @@ class GLS:
         cov = np.zeros((self.nobs, 7))
         for k, ip in enumerate(self.ip):
             _coverage(ip, *self._pol_arrays(k)[1:], self.pol, cov)
-        cov = self._scatter_sum(cov)
+        cov = self._scatter_sum(cov, by_column=True)
         self.hits = cov[:, 0].astype(np.int64)  # this rank's pixels, like mask and precond
         self.mask = np.repeat((self.hits > 0)[None], self.ncomp, axis=0)
         if self.pol:
@@ -352,7 +352,7 @@ class GLS:
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks)
-        blocks = self._scatter_sum(blocks)
+        blocks = self._scatter_sum(blocks, by_column=True)
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
@@ -395,15 +395,18 @@ class GLS:
             return self.precond * r
         return np.einsum("pij,jp->ip", self.precond, r)
 
-    def _scatter_sum(self, full):
+    def _scatter_sum(self, full, by_column=False):
         """Sum a full (nobs, k) array over ranks; return this rank's pixels (nloc, k).
-        A reduce-scatter: the first half of an Allreduce."""
+        A reduce-scatter: the first half of an Allreduce. by_column (setup) caps the
+        MPI temporaries at one column, not the whole array (2.8 GB for the coverage
+        at nside 2048), at the price of strided copies."""
         if self.comm is None:
             return full
         out = np.empty((self.nloc, full.shape[1]), full.dtype)
+        if not by_column:
+            self.comm.Reduce_scatter(np.ascontiguousarray(full), out, recvcounts=self._counts * full.shape[1])
+            return out
         col = np.empty(self.nloc, full.dtype)
-        # one column at a time: MPI temporaries are one column of the map, not the
-        # whole (nobs, k) array (2.8 GB for the coverage at nside 2048)
         for j in range(full.shape[1]):
             self.comm.Reduce_scatter(np.ascontiguousarray(full[:, j]), col, recvcounts=self._counts)
             out[:, j] = col
