@@ -29,6 +29,7 @@ def test_mpi_matches_serial():
     mask = g.full(g.mask.astype(np.uint8)).astype(bool)  # collective
 
     if comm.rank == 0:
+        g.to_healpix(m, NSIDE)  # not collective after solve: must not hang
         gs = GLS(inp["pix"], inp["psi"], inp["weights"])
         ms, infos = gs.solve(inp["tod"])
         assert np.array_equal(mask, gs.mask)
