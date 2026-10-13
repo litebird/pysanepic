@@ -83,8 +83,9 @@ the maps and then discarded, so the padding does not enter the maps.
 - noise weights computed from (NET, $f_\text{knee}$, α, $f_\text{min}$)
   rather than read from files;
 - zero padding (`pad_fill="zeros"`) besides SANEPIC's extrapolation;
-- MPI without a master process: each process handles its own data and the
-  maps are summed with `Allreduce`; threads within each process;
+- MPI without a master process: each process handles its own data, and the
+  PCG state is distributed over the processes by pixel (see
+  [MPI](performance.md#mpi-and-threads)); threads within each process;
 - a few bugs of the reference code fixed (see the history of `cpp/`).
 
 ## Limitations
@@ -94,5 +95,6 @@ the maps and then discarded, so the padding does not enter the maps.
 - No correlations between chunks or between detectors (see above).
 - No data splits (half-mission, detector subsets) in one call: run
   `make_maps` once per split.
-- The maps are replicated on every process, so the memory per process grows
-  with nside (see [memory](performance.md#memory)).
+- Every process still holds two kinds of full-size maps, the search direction
+  for $P$ and one private map per thread for $P^T$, so the memory per process
+  grows with nside (see [memory](performance.md#memory)).

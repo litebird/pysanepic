@@ -345,7 +345,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
 
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)
-    hit_map[:n] = gls.hits[:n]
+    hit_map[:n] = gls.full(gls.hits)[:n]
     return MapResult(
         maps=gls.to_healpix(m, nside, fill=hp.UNSEEN),
         hit_map=hit_map,

@@ -24,11 +24,14 @@ def test_mpi_matches_serial():
     mine = slice(comm.rank, None, comm.size)  # round-robin chunks; a rank may get none
     g = GLS(inp["pix"][mine], inp["psi"][mine], inp["weights"][mine], comm=comm)
     m, info = g.solve(inp["tod"][mine])
+    # each rank keeps the PCG state only on its own pixels
+    assert g.precond.shape[0] == g.nloc and comm.allreduce(g.nloc) == g.nobs
+    mask = g.full(g.mask.astype(np.uint8)).astype(bool)  # collective
 
     if comm.rank == 0:
         gs = GLS(inp["pix"], inp["psi"], inp["weights"])
         ms, infos = gs.solve(inp["tod"])
-        assert np.array_equal(g.mask, gs.mask)
+        assert np.array_equal(mask, gs.mask)
         rel = np.abs(m - ms).max() / np.abs(ms).max()
         print(f"ranks={comm.size} iters mpi/serial={info['iterations']}/{infos['iterations']} max rel diff={rel:.1e}")
         assert rel < 1e-8
