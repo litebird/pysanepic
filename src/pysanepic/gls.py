@@ -401,7 +401,12 @@ class GLS:
         if self.comm is None:
             return full
         out = np.empty((self.nloc, full.shape[1]), full.dtype)
-        self.comm.Reduce_scatter(np.ascontiguousarray(full), out, recvcounts=self._counts * full.shape[1])
+        col = np.empty(self.nloc, full.dtype)
+        # one column at a time: MPI temporaries are one column of the map, not the
+        # whole (nobs, k) array (2.8 GB for the coverage at nside 2048)
+        for j in range(full.shape[1]):
+            self.comm.Reduce_scatter(np.ascontiguousarray(full[:, j]), col, recvcounts=self._counts)
+            out[:, j] = col
         return out
 
     def _gather(self, loc, out=None):
