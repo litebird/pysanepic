@@ -6,9 +6,10 @@ Run with: mpirun -n 4 python tests/test_mpi.py  (under pytest it runs on 1 rank)
 import tempfile
 
 import numpy as np
+import pytest
 from mpi4py import MPI
 
-from pysanepic import GLS
+from pysanepic import GLS, one_over_f_weights
 from pysanepic.sanepic_io import read_inputs
 from test_vs_sanepic import DETS, NS, NSEG, NSIDE, _simulate
 
@@ -60,8 +61,35 @@ def test_make_maps_mpi_padding():
         assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
 
 
+def test_more_ranks_than_pixels():
+    """With MPI some ranks may own no pixels at all: same result as serial."""
+    comm = MPI.COMM_WORLD
+    rng = np.random.default_rng(0)
+    ns, nchunk = 256, 2 * comm.size
+    pix = rng.integers(0, 3, (nchunk, ns))  # 3 pixels: with 4+ ranks some own none
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.0, 1.0), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    mine = slice(comm.rank, None, comm.size)
+    g = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0)
+    m, _ = g.solve(tod[mine], tol=1e-20)
+    if comm.rank == 0:
+        ms, _ = GLS(pix, psi, w, min_pol_rcond=0.0).solve(tod, tol=1e-20)
+        assert np.allclose(m, ms, rtol=1e-10, atol=0)
+
+
+def test_mpi_count_check():
+    from pysanepic.gls import _check_mpi_count
+
+    _check_mpi_count(12 * 4096**2 * 7)  # nside 4096: fine
+    with pytest.raises(ValueError, match="nside 4096"):
+        _check_mpi_count(12 * 8192**2 * 7)
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
+    test_more_ranks_than_pixels()
+    test_mpi_count_check()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

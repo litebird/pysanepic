@@ -60,6 +60,18 @@ def two_angle(a):
     return np.remainder(2 * np.asarray(a, dtype=float) + np.pi, 2 * np.pi) - np.pi
 
 
+def _check_mpi_count(n):
+    """MPI counts and displacements are int32: raise early, with a clear message,
+    instead of failing inside a collective."""
+    # ponytail: fine up to nside 4096; beyond, count whole pixels with a derived
+    # datatype of k doubles
+    if n >= 2**31:
+        raise ValueError(
+            f"{n} values per MPI exchange exceed the int32 counts of MPI: the "
+            "distributed PCG supports maps up to nside 4096"
+        )
+
+
 def _as_list(x):
     return list(x) if isinstance(x, (list, tuple)) else [x]
 
@@ -311,6 +323,8 @@ class GLS:
 
         # pixels [lo, hi) of this rank
         size, rank = (1, 0) if comm is None else (comm.size, comm.rank)
+        if size > 1:
+            _check_mpi_count(self.nobs * 7)  # the largest array exchanged: the coverage
         bounds = np.arange(size + 1, dtype=np.int64) * self.nobs // size
         self._counts = np.diff(bounds)
         self.lo, self.hi = int(bounds[rank]), int(bounds[rank + 1])
@@ -392,9 +406,7 @@ class GLS:
 
     def _gather(self, loc, out=None):
         """Full (nobs, k) array from the (nloc, k) pieces of all ranks (allgather)."""
-        # ponytail: MPI counts and displacements are int32, so nobs * k must stay
-        # below 2^31: fine up to nside 4096 (k <= 7), too large at nside 8192;
-        # beyond that, count whole pixels with a derived datatype of k doubles
+        # counts fit in int32: checked by _check_mpi_count at setup
         out = np.empty((self.nobs, loc.shape[1]), loc.dtype) if out is None else out
         if self.comm is None:
             out[:] = loc
