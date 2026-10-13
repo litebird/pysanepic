@@ -19,7 +19,6 @@ from contextlib import contextmanager
 import ducc0
 import numba
 import numpy as np
-import scipy.fft
 
 
 def resolve_nthreads(nthreads=None):
@@ -154,6 +153,23 @@ def _coverage(ip, c2, s2, pol, out):
             out[p, 6] += s * s
 
 
+@numba.njit(cache=True)
+def _pixel_order(ip, npix):
+    """Indices of the samples sorted by pixel, in time order within each pixel:
+    a stable counting sort, O(ns + npix), instead of an O(ns log ns) argsort."""
+    start = np.zeros(npix + 1, np.int64)
+    for i in range(ip.size):
+        start[ip[i] + 1] += 1
+    for p in range(npix):
+        start[p + 1] += start[p]
+    order = np.empty(ip.size, np.int64)
+    for i in range(ip.size):
+        p = ip[i]
+        order[start[p]] = i
+        start[p] += 1
+    return order
+
+
 @numba.njit(parallel=True, cache=True)
 def _block_circulant(ip, c, c2, s2, pol, out):
     """Exact per-pixel blocks of P^T C P, C circulant per chunk.
@@ -168,7 +184,7 @@ def _block_circulant(ip, c, c2, s2, pol, out):
     # SANEPIC N_[0] shortcut if deep pixels with long chunks become a bottleneck
     nchunk, ns = ip.shape
     for k in range(nchunk):
-        order = np.argsort(ip[k], kind="mergesort")
+        order = _pixel_order(ip[k], out.shape[0])
         sorted_ip = ip[k][order]
         starts = np.flatnonzero(np.diff(sorted_ip)) + 1
         bounds = np.empty(starts.size + 2, np.int64)
@@ -299,9 +315,13 @@ class GLS:
         del cov
 
         blocks = np.zeros((self.nobs, 6))
+        last_w = c = None  # consecutive chunks often share their weights array
         with numba_threads(self.nthreads):
             for k, (ip, w) in enumerate(zip(self.ip, self.weights)):
-                c = scipy.fft.irfft(w, n=ip.size)
+                if w is not last_w or c.size != ip.size:
+                    # first row of the circulant N^-1 of the chunk
+                    c = ducc0.fft.c2r(np.asarray(w, dtype=complex), lastsize=ip.size, forward=False, inorm=2, nthreads=self.nthreads)
+                    last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks)
         blocks = self._sum(blocks)

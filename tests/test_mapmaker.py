@@ -181,10 +181,21 @@ def test_contiguous_run_kernel():
     assert np.allclose(fast, brute)
 
 
+def test_pixel_order():
+    """Counting sort == stable argsort, also with empty and unhit pixels."""
+    from pysanepic.gls import _pixel_order
+
+    rng = np.random.default_rng(3)
+    for npix, ns in [(1, 5), (50, 0), (50, 1000), (100_000, 20_000)]:
+        ip = rng.integers(0, npix, ns).astype(np.int32)
+        assert np.array_equal(_pixel_order(ip, npix), np.argsort(ip, kind="stable"))
+
+
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_padding_noiseless()
     test_pixel_input_and_generator()
     test_pointing_checks()
     test_contiguous_run_kernel()
+    test_pixel_order()
     print("ok")

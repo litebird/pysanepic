@@ -30,7 +30,7 @@ pip install git+https://github.com/litebird/pysanepic
 pip install "pysanepic[mpi] @ git+https://github.com/litebird/pysanepic"   # with MPI
 ```
 
-Requirements: Python ≥ 3.10, numpy, scipy, healpy, numba, ducc0 (and mpi4py
+Requirements: Python ≥ 3.10, numpy, healpy, numba, ducc0 (and mpi4py
 for MPI).
 
 ```{toctree}
