@@ -61,8 +61,11 @@ with respect to `tol=1e-12` (28 iterations) are
 | 1e-10 | 13 | 0.002 / 0.009 / 0.011 |
 
 compared with an rms difference between the GLS and the binned maps of
-3.5 / 5.3 / 5.3 µK. **`tol=1e-8` is enough for most purposes** and needs almost
-three times fewer iterations; check `result.residuals` if in doubt.
+3.5 / 5.3 / 5.3 µK. **`tol=1e-8` is enough for most purposes**; check
+`result.residuals` if in doubt. The saving depends on the data: almost three
+times fewer iterations here, but 20 instead of 25 on one year of 128 detectors,
+where the rms map change was 0.016 / 0.007 / 0.008 µK (GLS − binned:
+0.25 / 0.31 / 0.31 µK).
 
 ## Polarization-angle coverage
 

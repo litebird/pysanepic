@@ -73,17 +73,26 @@ See the [memory notebook](notebooks/memory).
 
 On G100 (CINECA; nodes with 48 cores and 375 GB), LiteBIRD channel M2_L
 (75 Hz, IMO 1/f noise: $f_\text{knee}$ = 20 mHz, α = 1), no HWP, simulated
-with litebird_sim, one-day observations and `chunk_s=86400`, nside 512.
+with litebird_sim, one-day observations and `chunk_s=86400`, nside 512,
+pysanepic 0.2.0.
 
 | | 7 days, 16 detectors | 1 year, 128 detectors |
 |---|---|---|
 | samples | 7.3·10⁸ | 3.0·10¹¹ |
-| resources | 1 node, 16 processes × 3 threads | 16 nodes, 128 processes × 6 threads |
-| peak memory per process (with the simulation) | 2.5 GB | 37.6 GB |
-| GLS time, `tol=1e-12` | 108 s (28 iterations) | 62 min (25 iterations) |
-| GLS time, `tol=1e-8` | 56 s (10 iterations) | |
+| resources | 1 node, 16 processes × 3 threads | 13 nodes, 10 processes × 4 threads per node |
+| peak memory per process (with the simulation) | 2.2 GB | 29 GB |
+| GLS time, `tol=1e-8` | 57 s (10 iterations) | 50 min (20 iterations) |
+| GLS time, `tol=1e-12` | 99 s (28 iterations) | 77 min (25 iterations) |
 
-In the one-year run each iteration takes about 105 s and the setup (pixels,
-angles, preconditioner) about 15 minutes; the memory is dominated by the
-TODs (1.1 TB in float32) and the 12 bytes per sample that pysanepic kept
-then (3.6 TB; 8 bytes now).
+In the one-year run the setup (pixels, angles, preconditioner) takes about 12
+minutes and each application of $P^T N^{-1} P$ about 98 s, of which:
+
+| | share |
+|---|---|
+| FFTs of $N^{-1}$ (ducc0) | ~60% |
+| $P$ and $P^T$ | ~20% |
+| γ cos 2a and γ sin 2a | ~15% before the cos/sin table, which cut it by ~5 times |
+| reduce-scatter and allgather | < 2% |
+
+The memory is dominated by the TODs (1.1 TB in float32) and the 8 bytes per
+sample of pysanepic; the maps take ~0.3 GB per process.
