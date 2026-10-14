@@ -191,6 +191,21 @@ def test_pixel_order():
         assert np.array_equal(_pixel_order(ip, npix), np.argsort(ip, kind="stable"))
 
 
+def test_cos_sin_table():
+    """Table + Taylor cos/sin == libm to 1e-15, also at the edges of [-pi, pi)
+    (float32 rounding goes just outside) and after reducing unreduced angles;
+    per-sample gamma."""
+    from pysanepic.gls import _TRIG_COS, _TRIG_SIN, _cos_sin, _reduced
+
+    rng = np.random.default_rng(4)
+    edges = np.float32([-np.pi, np.pi, 0.0]).astype(float)
+    a = np.concatenate([rng.uniform(-np.pi, np.pi, 100_000), edges, _reduced([7.0, -20.0, 1e4], float)])
+    g = rng.uniform(0.5, 1.0, a.size)
+    c, s = np.empty(a.size), np.empty(a.size)
+    _cos_sin(a, g, c, s, _TRIG_COS, _TRIG_SIN)
+    assert np.abs(c - g * np.cos(a)).max() < 1e-15 and np.abs(s - g * np.sin(a)).max() < 1e-15
+
+
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_padding_noiseless()

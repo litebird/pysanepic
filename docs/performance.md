@@ -43,7 +43,9 @@ The TODs are used without copies, and $P$, $N^{-1}$ and $P^T$ are applied one
 chunk at a time. Besides the TODs, pysanepic keeps **8 bytes per sample**
 (int32 pixel and float32 2a, computed from the float64 angles; 12 bytes with
 `angle_dtype=np.float64`), also during the setup, plus a few maps. γ cos 2a
-and γ sin 2a are recomputed for each chunk when it is used. With padding
+and γ sin 2a are recomputed for each chunk when it is used, from a table of
+cos and sin and a Taylor series of the remainder (exact to ~1e-16; numba
+without SVML calls a slow scalar libm, 10 times slower). With padding
 (`pad_s > 0`), γ is stored per sample (0 in the margins): 4 more bytes.
 
 - Pass the data as a generator of `DetectorData`: then the pointings of only
