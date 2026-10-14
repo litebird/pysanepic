@@ -104,5 +104,5 @@ sample of pysanepic; the maps take ~0.3 GB per process.
 application ends with a reduce-scatter. On G100 a few nodes per run computed
 20–30% slower than the others (once 7 times slower), of both node types and
 not always the same ones, so the same one-year run took 98, 131 or 137 s per
-application depending on the nodes it got. The rank timers of the example
-script (`rank_timers = true`) show which nodes they are.
+application depending on the nodes it got. Timing the computation and the
+wait of each process around `apply_A` shows which nodes they are.
