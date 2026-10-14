@@ -1,5 +1,15 @@
 # Changelog
 
+## HEAD
+
+Changes on `main` that are not in a release yet.
+
+- Noise spectrum chosen by the user: `DetectorData.noise_model="keshner"`
+  (the spectrum of litebird_sim's noise with `engine="ducc"`) besides the
+  default `"toast"`, and `DetectorData.noise_psd=(freqs_hz, psd)`, a tabulated
+  one-sided PSD in K²/Hz that replaces the model. `one_over_f_weights` has a
+  `model` argument and `psd_weights` computes the weights of a tabulated PSD.
+
 ## 0.2.1
 
 Packaging for PyPI: metadata, source distribution without the C++ code, and

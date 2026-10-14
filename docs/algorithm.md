@@ -19,8 +19,8 @@ and $P^T$ to the whole data set once.
 ## Noise model
 
 The noise of each detector is assumed stationary within a chunk of `chunk_s`
-seconds, with the power spectrum
-$P(f) = \sigma^2 (f^\alpha + f_\text{knee}^\alpha)/(f^\alpha + f_\text{min}^\alpha)$.
+seconds, with a power spectrum $P(f)$: a 1/f model ("toast" or "keshner", see
+[conventions](usage.md#conventions)) or a tabulated spectrum.
 $N^{-1}$ is applied as a circulant filter, in Fourier space with ducc0:
 $N^{-1} t = \mathrm{irfft}(\mathrm{rfft}(t)/P(f))$, one chunk at a time.
 With $f_\text{min} = 0$ the zero frequency has zero weight and the mean of each
@@ -35,8 +35,8 @@ Neglected:
   chunk to its start. `pad_s` moves this junction outside the data, see
   [padding](parameters.md#padding).
 
-The noise parameters are given by the user (or by litebird_sim, which uses
-those of the simulation); they are not estimated from the data.
+The noise parameters or spectra are given by the user (or by litebird_sim,
+which uses those of the simulation); they are not estimated from the data.
 
 ## Preconditioner
 
@@ -80,8 +80,8 @@ the maps and then discarded, so the padding does not enter the maps.
 - 3×3 block preconditioner (the C++ code has the Jacobi one, also available);
 - Q/U solved only where the angle coverage allows it (`min_pol_rcond`);
 - polarization efficiency, ideal HWP and rotation between coordinate systems;
-- noise weights computed from (NET, $f_\text{knee}$, α, $f_\text{min}$)
-  rather than read from files;
+- noise weights computed from (NET, $f_\text{knee}$, α, $f_\text{min}$),
+  or from a tabulated spectrum given as arrays rather than read from files;
 - zero padding (`pad_fill="zeros"`) besides SANEPIC's extrapolation;
 - MPI without a master process: each process handles its own data, and the
   PCG state is distributed over the processes by pixel (see

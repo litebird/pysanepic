@@ -41,18 +41,40 @@ def numba_threads(nthreads):
         numba.set_num_threads(old)
 
 
-def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0):
+def one_over_f_weights(ns, fsamp_hz, sigma, fknee_hz, alpha, fmin_hz=0.0, model="toast"):
     """Inverse noise PSD on the rfft grid of a chunk of `ns` samples.
 
-    Model: P(f) = sigma^2 (f^alpha + fknee^alpha) / (f^alpha + fmin^alpha), the
-    litebird_sim "toast" model; sigma is the white-noise rms per sample, so that
-    for white noise the filter is exactly 1/sigma^2. With fmin = 0 the DC weight
-    is 0 and the mean of each chunk is not used.
+    Models (the two of litebird_sim's `add_noise`), with sigma the white-noise
+    rms per sample, so that for white noise the filter is exactly 1/sigma^2:
+
+    - "toast": P(f) = sigma^2 (f^alpha + fknee^alpha) / (f^alpha + fmin^alpha);
+    - "keshner": P(f) = sigma^2 ((f^2 + fknee^2) / (f^2 + fmin^2))^(alpha/2),
+      the one of ducc0's OofaNoise (litebird_sim's engine="ducc").
+
+    With fmin = 0 the DC weight is 0 and the mean of each chunk is not used.
     """
-    fa = np.fft.rfftfreq(ns, 1.0 / fsamp_hz) ** alpha
-    num, den = fa + fmin_hz**alpha, fa + fknee_hz**alpha
-    ratio = np.divide(num, den, out=np.ones_like(fa), where=den > 0)  # fknee = 0: white
+    f = np.fft.rfftfreq(ns, 1.0 / fsamp_hz)
+    if model == "toast":
+        num, den = f**alpha + fmin_hz**alpha, f**alpha + fknee_hz**alpha
+    elif model == "keshner":
+        num, den = (f**2 + fmin_hz**2) ** (alpha / 2), (f**2 + fknee_hz**2) ** (alpha / 2)
+    else:
+        raise ValueError(f"Unknown noise model {model!r}: use 'toast' or 'keshner'")
+    ratio = np.divide(num, den, out=np.ones_like(f), where=den > 0)  # fknee = 0: white
     return ratio / sigma**2
+
+
+def psd_weights(ns, fsamp_hz, freqs_hz, psd):
+    """Inverse noise PSD on the rfft grid of a chunk of `ns` samples from a
+    tabulated one-sided PSD `psd` [K^2/Hz] at `freqs_hz` (increasing, > 0),
+    interpolated linearly in log f - log P and held constant outside the table
+    (also at f = 0). White noise of rms sigma per sample has P = 2 sigma^2 / fs,
+    and gives the same weights 1/sigma^2 as one_over_f_weights.
+    """
+    f = np.fft.rfftfreq(ns, 1.0 / fsamp_hz)
+    logf = np.log(np.maximum(f, freqs_hz[0]))
+    p = np.exp(np.interp(logf, np.log(freqs_hz), np.log(psd)))
+    return 2.0 / (fsamp_hz * p)
 
 
 def two_angle(a):
