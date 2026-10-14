@@ -25,6 +25,7 @@
    :members: solve, apply_A, rhs, full, to_healpix
 
 .. autofunction:: pysanepic.one_over_f_weights
+.. autofunction:: pysanepic.psd_weights
 
 .. autofunction:: pysanepic.two_angle
 

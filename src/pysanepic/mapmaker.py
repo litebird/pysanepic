@@ -16,7 +16,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from .gls import GLS, numba_threads, one_over_f_weights, resolve_nthreads, two_angle
+from .gls import GLS, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 
 
 _COORDINATES = ("E", "G", "C")
@@ -111,8 +111,16 @@ class DetectorData:
     The TOD model is d = I + pol_efficiency (Q cos 2a + U sin 2a) + noise, with
     `a` that angle.
 
-    Noise: P(f) = sigma^2 (f^alpha + fknee^alpha) / (f^alpha + fmin^alpha) with
-    sigma = net_ukrts * sqrt(sampling_rate_hz) * 1e-6, i.e. TOD in K.
+    Noise, one of:
+
+    - `noise_model="toast"` (default): P(f) = sigma^2 (f^alpha + fknee^alpha) /
+      (f^alpha + fmin^alpha);
+    - `noise_model="keshner"`: P(f) = sigma^2 ((f^2 + fknee^2) / (f^2 +
+      fmin^2))^(alpha/2), litebird_sim's noise with engine="ducc";
+    - `noise_psd=(freqs_hz, psd)`: a tabulated one-sided PSD in K^2/Hz, which
+      replaces the model (net_ukrts, fknee_hz, alpha, fmin_hz are not used);
+
+    with sigma = net_ukrts * sqrt(sampling_rate_hz) * 1e-6, i.e. TOD in K.
     """
 
     tod: np.ndarray
@@ -125,8 +133,19 @@ class DetectorData:
     pol_angle_rad: float = 0.0
     pol_efficiency: float = 1.0
     hwp_angle: np.ndarray | None = None
+    noise_model: str = "toast"
+    noise_psd: tuple | None = None
 
     def __post_init__(self):
+        if self.noise_model not in ("toast", "keshner"):
+            raise ValueError(f"DetectorData.noise_model must be 'toast' or 'keshner', not {self.noise_model!r}")
+        if self.noise_psd is not None:
+            f, p = (np.asarray(x, dtype=float) for x in self.noise_psd)
+            if f.ndim != 1 or f.shape != p.shape or f.size < 2:
+                raise ValueError("DetectorData.noise_psd must be (freqs_hz, psd), two 1D arrays of the same length >= 2")
+            if not (np.all(np.isfinite(f)) and np.all(np.isfinite(p)) and f[0] > 0 and np.all(np.diff(f) > 0) and np.all(p > 0)):
+                raise ValueError("DetectorData.noise_psd: frequencies must be > 0 and increasing, the PSD finite and > 0")
+            object.__setattr__(self, "noise_psd", (f, p))
         if not isinstance(self.pointing, Pointing):
             raise TypeError("DetectorData.pointing must be a pysanepic.Pointing")
         if len(self.tod) != len(self.pointing):
@@ -302,9 +321,14 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         m = int(round(params.pad_s * fs))
         for a, b in _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs)))):
             n = b - a + 2 * m
-            key = (n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
-            if key not in weights:
-                weights[key] = one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz)
+            if d.noise_psd is not None:
+                key = (n, fs, d.noise_psd[0].tobytes(), d.noise_psd[1].tobytes())  # by value: ids get reused
+                if key not in weights:
+                    weights[key] = psd_weights(n, fs, *d.noise_psd)
+            else:
+                key = (n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz, d.noise_model)
+                if key not in weights:
+                    weights[key] = one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz, d.noise_model)
             w_c.append(weights[key])
             # 2a computed in float64, then stored as `dtype`; the margins of a
             # padded chunk carry no polarization (gamma = 0: intensity-only

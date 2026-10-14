@@ -206,6 +206,52 @@ def test_cos_sin_table():
     assert np.abs(c - g * np.cos(a)).max() < 1e-15 and np.abs(s - g * np.sin(a)).max() < 1e-15
 
 
+def test_noise_models():
+    """keshner and toast weights follow their formulas and agree for white noise;
+    a tabulated PSD gives back the model it samples."""
+    from pysanepic import one_over_f_weights, psd_weights
+
+    ns, fs, sigma, fk, alpha, fmin = 4096, 10.0, 2e-4, 0.05, 1.3, 1e-3
+    f = np.fft.rfftfreq(ns, 1 / fs)
+    toast = one_over_f_weights(ns, fs, sigma, fk, alpha, fmin)
+    keshner = one_over_f_weights(ns, fs, sigma, fk, alpha, fmin, model="keshner")
+    assert np.allclose(1 / (toast * sigma**2), (f**alpha + fk**alpha) / (f**alpha + fmin**alpha))
+    assert np.allclose(1 / (keshner * sigma**2), ((f**2 + fk**2) / (f**2 + fmin**2)) ** (alpha / 2))
+    for model in ("toast", "keshner"):
+        assert np.allclose(one_over_f_weights(ns, fs, sigma, 0.0, alpha, model=model), 1 / sigma**2)
+    with pytest.raises(ValueError, match="noise model"):
+        one_over_f_weights(ns, fs, sigma, fk, alpha, model="pink")
+
+    # white noise: P = 2 sigma^2 / fs; a fine table of the keshner model
+    assert np.allclose(psd_weights(ns, fs, np.array([1e-3, 5.0]), np.full(2, 2 * sigma**2 / fs)), 1 / sigma**2)
+    ft = np.geomspace(f[1], f[-1], 2000)
+    pt = 2 * sigma**2 / fs * ((ft**2 + fk**2) / (ft**2 + fmin**2)) ** (alpha / 2)
+    assert np.allclose(psd_weights(ns, fs, ft, pt)[1:], keshner[1:], rtol=1e-4)
+
+
+def test_noise_psd_in_make_maps():
+    """DetectorData checks noise_model and noise_psd; a white tabulated PSD gives
+    the same map as the white NET model."""
+    nside, n, fs, net = 8, 40_000, 10.0, 50.0
+    rng = np.random.default_rng(5)
+    theta, phi, psi = _scan(n, rng)
+    ptg = Pointing(theta=theta, phi=phi, psi=psi, coordinates="G")
+    tod = rng.normal(0, net * np.sqrt(fs) * 1e-6, n)
+    with pytest.raises(ValueError, match="noise_model"):
+        DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, net_ukrts=net, noise_model="pink")
+    with pytest.raises(ValueError, match="noise_psd"):
+        DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, net_ukrts=net, noise_psd=([0.0, 1.0], [1.0, 1.0]))
+    sigma = net * np.sqrt(fs) * 1e-6
+    white = np.array([1e-3, 5.0]), np.full(2, 2 * sigma**2 / fs)
+    params = GLSParameters(chunk_s=1000.0, tol=1e-14)
+    maps = [
+        make_maps([DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, net_ukrts=net, **kw)],
+                  nside, coordinates="G", params=params).maps
+        for kw in ({}, {"noise_psd": white})
+    ]
+    assert np.allclose(maps[0], maps[1], rtol=1e-8, atol=0)
+
+
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_padding_noiseless()
