@@ -93,7 +93,6 @@ minutes and each application of $P^T N^{-1} P$ about 98 s, of which:
 | $P$ and $P^T$ | ~20% |
 | γ cos 2a and γ sin 2a | ~15% before the cos/sin table, which cut it by ~5 times |
 | reduce-scatter and allgather | < 2% |
-| waiting for the slowest process | ~3% |
 
 The memory is dominated by the TODs (1.1 TB in float32) and the 8 bytes per
 sample of pysanepic; the maps take ~0.3 GB per process.
