@@ -26,8 +26,9 @@ chunks of data, and returns I, Q, U HEALPix maps.
 ## Installation
 
 ```bash
-pip install git+https://github.com/litebird/pysanepic
-pip install "pysanepic[mpi] @ git+https://github.com/litebird/pysanepic"   # with MPI
+pip install pysanepic
+pip install "pysanepic[mpi]"                # with MPI
+pip install git+https://github.com/litebird/pysanepic   # development version
 ```
 
 Requirements: Python ≥ 3.10, numpy, healpy, numba, ducc0 (and mpi4py
