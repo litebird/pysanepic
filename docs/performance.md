@@ -82,9 +82,7 @@ pysanepic 0.2.0.
 | resources | 1 node, 16 processes × 3 threads | 13 nodes, 10 processes × 4 threads per node |
 | peak memory per process (with the simulation) | 2.2 GB | 29 GB |
 | GLS time, `tol=1e-8` | 57 s (10 iterations) | 50 min (20 iterations) |
-| GLS time, `tol=1e-12` | 99 s (28 iterations) | 77 min (25 iterations)* |
-
-\* On 5 slow nodes out of 13 (see below); about 60 minutes on uniform nodes.
+| GLS time, `tol=1e-12` | 99 s (28 iterations) | 77 min (25 iterations) |
 
 In the one-year run the setup (pixels, angles, preconditioner) takes about 12
 minutes and each application of $P^T N^{-1} P$ about 98 s, of which:
@@ -99,10 +97,3 @@ minutes and each application of $P^T N^{-1} P$ about 98 s, of which:
 
 The memory is dominated by the TODs (1.1 TB in float32) and the 8 bytes per
 sample of pysanepic; the maps take ~0.3 GB per process.
-
-**Slow nodes.** The time per iteration is set by the slowest node: every
-application ends with a reduce-scatter. On G100 a few nodes per run computed
-20–30% slower than the others (once 7 times slower), of both node types and
-not always the same ones, so the same one-year run took 98, 131 or 137 s per
-application depending on the nodes it got. Timing the computation and the
-wait of each process around `apply_A` shows which nodes they are.
