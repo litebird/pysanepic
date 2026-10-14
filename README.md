@@ -14,13 +14,14 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
 - Independent of any simulation pipeline: data are passed as plain arrays.
 - Validated against the original C++ code, which is kept in `cpp/`.
 
-**Documentation: https://pysanepic.readthedocs.io** (sources in [`docs/`](docs)).
+**Documentation: https://pysanepic.readthedocs.io** (sources in [`docs/`](https://github.com/litebird/pysanepic/tree/main/docs)).
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/litebird/pysanepic
-pip install "pysanepic[mpi] @ git+https://github.com/litebird/pysanepic"   # with MPI
+pip install pysanepic
+pip install "pysanepic[mpi]"                # with MPI
+pip install git+https://github.com/litebird/pysanepic   # development version
 ```
 
 ## Usage
@@ -48,7 +49,7 @@ result = make_maps(data, nside=64, coordinates="G")
 ```
 
 See the documentation for the conventions, the parameters and how to choose
-them, MPI, memory and benchmarks, and the [notebooks](notebooks).
+them, MPI, memory and benchmarks, and the [notebooks](https://github.com/litebird/pysanepic/tree/main/notebooks).
 
 ## Tests
 
@@ -68,4 +69,4 @@ sphinx-build -b html docs docs/_build/html
 
 ## License
 
-Distributed under the [GPL3 License](https://github.com/litebird/litebird_sim/blob/master/LICENSE).
+Distributed under the [GPL3 License](https://github.com/litebird/pysanepic/blob/main/LICENSE).

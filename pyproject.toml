@@ -6,8 +6,19 @@ build-backend = "hatchling.build"
 name = "pysanepic"
 dynamic = ["version"]
 description = "GLS map-making with correlated noise (SANEPIC algorithm) in Python"
+readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "GPL-3.0"}
+authors = [{name = "Luca Pagano"}, {name = "Guillaume Patanchon"}]
+keywords = ["CMB", "map-making", "GLS", "1/f noise", "LiteBIRD", "HEALPix"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = ["numpy", "healpy", "numba", "ducc0"]
 
 [project.optional-dependencies]
@@ -15,8 +26,17 @@ mpi = ["mpi4py"]
 test = ["pytest", "mpi4py"]
 docs = ["sphinx", "myst-nb", "furo"]
 
+[project.urls]
+Documentation = "https://pysanepic.readthedocs.io"
+Repository = "https://github.com/litebird/pysanepic"
+Changelog = "https://github.com/litebird/pysanepic/blob/main/CHANGELOG.md"
+
 [tool.hatch.version]
 path = "src/pysanepic/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+# the C++ SANEPIC, notebooks and docs stay in the repository
+include = ["/src", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

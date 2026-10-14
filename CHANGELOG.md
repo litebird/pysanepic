@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+Packaging for PyPI: metadata, source distribution without the C++ code, and
+publication from GitHub releases. No code changes.
+
 ## 0.2.0 (2026-10-14)
 
 First release: a standalone Python port of the SANEPIC GLS map-maker for
