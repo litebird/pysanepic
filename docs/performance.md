@@ -101,9 +101,8 @@ The memory is dominated by the TODs (1.1 TB in float32) and the 8 bytes per
 sample of pysanepic; the maps take ~0.3 GB per process.
 
 **Slow nodes.** The time per iteration is set by the slowest node: every
-application ends with a reduce-scatter. On G100 the nodes of the persistent
-memory partition (`rXXXnYYY`, also in `g100_usr_prod`) were ~40% slower than
-the standard ones (`rXXXcYYnZZ`), and a few standard nodes were 25% to 7 times
-slower in repeated runs. Exclude them (`sbatch --exclude=...`) for long runs:
-the same one-year run took 98, 131 or 137 s per application depending on the
-nodes it got.
+application ends with a reduce-scatter. On G100 a few nodes per run computed
+20–30% slower than the others (once 7 times slower), of both node types and
+not always the same ones, so the same one-year run took 98, 131 or 137 s per
+application depending on the nodes it got. The rank timers of the example
+script (`rank_timers = true`) show which nodes they are.
