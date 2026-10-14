@@ -9,7 +9,7 @@ correlated (1/f) noise, used by litebird_sim (`make_sanepic_maps`).
 
 - GLS solution of $(P^T N^{-1} P)\,m = P^T N^{-1} d$ with a preconditioned
   conjugate gradient; $N^{-1}$ applied per chunk as a Fourier filter (ducc0
-  FFTs), I or I/Q/U maps, optional HWP angle (#1).
+  FFTs), I or I/Q/U maps, optional HWP angle.
 - Block 3×3 preconditioner (Jacobi still available) and the Q/U
   angle-coverage criterion `min_pol_rcond` (#2).
 - Chunk padding, as SANEPIC's `-m`/`-q` options (#4).
