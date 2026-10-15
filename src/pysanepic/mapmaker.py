@@ -256,6 +256,9 @@ class GLSParameters:
         exact GLS without them; ~70 bytes per flagged sample) or "offset" (one
         unknown per run, its samples set to 0: no bias, nearly optimal, no
         memory).
+    fft_dtype : precision of the FFTs applying N^-1 to the PCG search
+        directions: np.float64 (default) or np.float32 (~45% faster FFTs; the
+        right-hand side and the true residual stay in float64, see GLS).
     split_gap_s : runs of flagged samples at least this long [s] split the
         chunk, and their samples are dropped: the noise correlations across
         the gap are neglected, but long gaps do not slow down the PCG. inf:
@@ -273,6 +276,7 @@ class GLSParameters:
     angle_dtype: type = np.float32
     flag_method: str = "marginalize"
     split_gap_s: float = 300.0
+    fft_dtype: type = np.float64
 
 
 @numba.njit(parallel=True, cache=True)
@@ -456,6 +460,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         angle_dtype=dtype,
         overwrite_pix=True,  # pix_c holds copies made here
         fft_lengths=nfft_c,
+        fft_dtype=params.fft_dtype,
     )
     del pix_c, a2_c, gamma_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)

@@ -4,6 +4,13 @@
 
 Changes on `main` that are not in a release yet.
 
+- The FFT work buffers of $N^{-1}$ are allocated once and reused (−9% on the
+  FFTs on G100).
+- `GLSParameters.fft_dtype` (and `GLS(fft_dtype=...)`): `np.float32` runs the
+  FFTs on the PCG search directions in single precision (~45% faster FFTs,
+  15–21% less GLS time on G100), with the right-hand side and the true
+  residual in float64. The default stays `np.float64`.
+
 ## 0.3.0 (2026-10-15)
 
 - **Breaking change**: the noise of a detector is an object,
