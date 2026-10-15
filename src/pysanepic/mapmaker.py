@@ -205,6 +205,43 @@ class DetectorData:
             raise ValueError("DetectorData.hwp_angle and tod must have the same length")
 
 
+@dataclass(frozen=True, kw_only=True)
+class CommonMode:
+    """A noise mode shared by the detectors of a DetectorGroup: detector i sees
+    coupling[i] * c(t), with c(t) of spectrum `noise` (a OneOverFNoise or a
+    TabulatedNoise, in the units of the TOD: K)."""
+
+    coupling: np.ndarray
+    noise: "OneOverFNoise | TabulatedNoise"
+
+    def __post_init__(self):
+        object.__setattr__(self, "coupling", np.asarray(self.coupling, dtype=float))
+        if self.coupling.ndim != 1 or not np.all(np.isfinite(self.coupling)):
+            raise ValueError("CommonMode.coupling must be a 1D array, one value per detector of the group")
+        if not callable(getattr(self.noise, "weights", None)):
+            raise TypeError("CommonMode.noise must be a OneOverFNoise or a TabulatedNoise")
+
+
+@dataclass(frozen=True, kw_only=True)
+class DetectorGroup:
+    """Detectors observed at the same times whose noise is correlated through
+    common modes: N = D + U Lambda U^T per frequency, with D the own noise of
+    each detector (DetectorData.noise), U the couplings and Lambda the spectra
+    of the modes. The detectors must have the same number of samples and
+    sampling rate; their chunks are not split at gaps (split_gap_s). A group
+    must be on one MPI process."""
+
+    detectors: list
+    modes: list
+
+    def __post_init__(self):
+        d0 = self.detectors[0]
+        if any(len(d.tod) != len(d0.tod) or d.sampling_rate_hz != d0.sampling_rate_hz for d in self.detectors):
+            raise ValueError("the detectors of a DetectorGroup must have the same samples and sampling rate")
+        if any(len(mode.coupling) != len(self.detectors) for mode in self.modes):
+            raise ValueError("each CommonMode needs one coupling per detector of the group")
+
+
 @dataclass
 class MapResult:
     """Output of :func:`make_maps`.
@@ -408,12 +445,17 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c = [], [], [], [], [], []
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
-    for d in data:  # one detector at a time: only its pointings are in memory
+    common_modes = []
+
+    def add(d, split=True):
+        """Chunks of one DetectorData; returns their indices."""
+        nonlocal n_virtual
+        first = len(pix_c)
         pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
-        gap = params.split_gap_s * fs
+        gap = params.split_gap_s * fs if split else np.inf
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, d.flags, gap)):
             n = b - a + 2 * m
             nfft = fast_fft_length(n)  # e.g. chunks split at gaps have any length
@@ -451,6 +493,21 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                 pix_c.append(np.concatenate([np.full(m, left, np.int32), p, np.full(m, left + 1, np.int32)]))
                 tod_c.append(_pad(tod, m, params.pad_fill))
         del pix, angle
+        return list(range(first, len(pix_c)))
+
+    for d in data:  # one detector (or group) at a time: only its pointings are in memory
+        if not isinstance(d, DetectorGroup):
+            add(d)
+            continue
+        # a group: chunks at the same times, not split at gaps (that would break
+        # the alignment); one common_modes entry per chunk of time
+        idx = [add(x, split=False) for x in d.detectors]
+        fs = d.detectors[0].sampling_rate_hz
+        U = np.array([mode.coupling for mode in d.modes], dtype=float).T  # (ndet, r)
+        for chunks in zip(*idx):
+            nfft = nfft_c[chunks[0]]
+            lam = np.array([1 / np.maximum(w, w.max() * 1e-12) for w in (mode.noise.weights(nfft, fs) for mode in d.modes)])
+            common_modes.append((list(chunks), U, lam))
 
     gls = GLS(
         pix_c,
@@ -465,6 +522,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         overwrite_pix=True,  # pix_c holds copies made here
         fft_lengths=nfft_c,
         fft_dtype=params.fft_dtype,
+        common_modes=common_modes,
     )
     del pix_c, a2_c, gamma_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)

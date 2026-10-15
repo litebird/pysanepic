@@ -16,7 +16,8 @@ see {func}`~pysanepic.fast_fft_length`), and `weights` are on their rfft
 grid. Negative pixels mark flagged samples: samples of a chunk with the same
 negative value share an unknown that is not in the maps (one value per sample
 for the exact GLS without them); `apply_A` and `rhs` are then not available,
-use `solve`.
+use `solve`. `common_modes` correlates chunks observed at the same times (see
+{class}`~pysanepic.GLS`).
 
 ```python
 import numpy as np

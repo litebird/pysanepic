@@ -387,12 +387,22 @@ class GLS:
         the true residual, recomputed every `recompute_every` iterations and
         at convergence, always use float64, so the solution is still
         controlled in double precision.
+    common_modes : list of (chunks, coupling, mode_psd), or None
+        Noise correlated between the chunks `chunks` (indices of chunks with
+        the same length and FFT length, observed at the same times, e.g. the
+        detectors of a wafer over one day): N = D + U Lambda U^T in Fourier
+        space, with D the diagonal of the chunks' own noise (1 / weights),
+        U = `coupling` (len(chunks), r) and Lambda = diag(`mode_psd`) (r,
+        m//2+1), the spectra of r common modes in the units of 1 / weights.
+        N^-1 is applied with the Woodbury identity in two passes over the
+        chunks (one chunk in memory at a time), in float64; the
+        preconditioner uses D only.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -411,6 +421,23 @@ class GLS:
         for p, w, m in zip(self.ip, self.weights, self._nfft):
             if m < p.size or len(w) != m // 2 + 1:
                 raise ValueError(f"a chunk of {p.size} samples needs an FFT length >= {p.size} and weights of length m//2+1 (FFT length m = {m}, weights {len(w)})")
+        self._groups = []  # (chunks, coupling, M = (I + Lambda S)^-1 Lambda per frequency)
+        self._grouped = np.zeros(len(self.ip), bool)
+        for chunks, coupling, mode_psd in common_modes or []:
+            chunks = [int(k) for k in chunks]
+            U = np.asarray(coupling, dtype=float).reshape(len(chunks), -1)
+            lam = np.atleast_2d(np.asarray(mode_psd, dtype=float))
+            m = self._nfft[chunks[0]]
+            if any(self._nfft[k] != m or self.ip[k].size != self.ip[chunks[0]].size for k in chunks):
+                raise ValueError("the chunks of a common mode must have the same length and FFT length")
+            if lam.shape != (U.shape[1], m // 2 + 1) or np.any(lam < 0) or np.any(self._grouped[chunks]):
+                raise ValueError("common_modes: mode_psd must be (r, m//2+1) and >= 0, and a chunk can be in one group only")
+            S = np.zeros((m // 2 + 1, U.shape[1], U.shape[1]))  # U^T D^-1 U per frequency
+            for j, k in enumerate(chunks):
+                S += np.asarray(self.weights[k])[:, None, None] * np.outer(U[j], U[j])
+            L = lam.T[:, :, None] * np.eye(U.shape[1])  # Lambda per frequency
+            self._groups.append((chunks, U, np.linalg.solve(np.eye(U.shape[1]) + L @ S, L)))
+            self._grouped[chunks] = True
         nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
         # flagged samples: labels nobs, nobs + 1, ... of unknowns local to this rank
@@ -624,16 +651,55 @@ class GLS:
         self._locbuf[:] = 0.0
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
+                if self._grouped[k]:
+                    continue
                 pol, c2, s2 = self._pol_arrays(k)
-                if v is None:
-                    t = np.asarray(tod[k], dtype=float)
-                    if self.nflag:  # the TOD of flagged samples is not used (it may be NaN)
-                        t = np.where(ip >= self.nobs, 0.0, t)
-                else:
-                    t = np.empty(ip.size)
-                    _project(ip, self._full, c2, s2, pol, loc, t)
+                t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
                 _backproject(ip, self._filter(t, k, single), c2, s2, pol, self._edges, buf, self._locbuf)
+            for chunks, U, M in self._groups:
+                self._apply_group(chunks, U, M, v, tod, loc, buf)
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf])
+
+    def _chunk_tod(self, k, v, tod, loc, c2, s2, pol):
+        """P v on chunk k (v given), or the TOD of chunk k (flagged samples set to 0)."""
+        ip = self.ip[k]
+        if v is None:
+            t = np.asarray(tod[k], dtype=float)
+            if self.nflag:  # the TOD of flagged samples is not used (it may be NaN)
+                t = np.where(ip >= self.nobs, 0.0, t)
+            return t
+        t = np.empty(ip.size)
+        _project(ip, self._full, c2, s2, pol, loc, t)
+        return t
+
+    def _apply_group(self, chunks, U, M, v, tod, loc, buf):
+        """P^T N^-1 P on chunks with common modes: N^-1 = D^-1 - D^-1 U M U^T D^-1
+        (Woodbury), M = (I + Lambda U^T D^-1 U)^-1 Lambda. First pass:
+        z = sum_k U_k D_k^-1 F t_k; second pass: F^-1 D_k^-1 (F t_k - U_k M z)
+        for each chunk, recomputing its FFT, so that one chunk at a time is in
+        memory. Always in float64."""
+        m = self._nfft[chunks[0]]
+
+        def spectrum(k):
+            pol, c2, s2 = self._pol_arrays(k)
+            t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
+            n = t.size
+            if m > n:
+                t = np.concatenate([t, np.zeros(m - n)])
+            return ducc0.fft.r2c(t, nthreads=self.nthreads), n, (pol, c2, s2)
+
+        z = np.zeros((U.shape[1], m // 2 + 1), complex)
+        for j, k in enumerate(chunks):
+            f, _, _ = spectrum(k)
+            f *= self.weights[k]
+            z += U[j][:, None] * f
+        y = np.einsum("fab,bf->af", M, z)
+        for j, k in enumerate(chunks):
+            f, n, (pol, c2, s2) = spectrum(k)
+            f -= U[j] @ y
+            f *= self.weights[k]
+            t = ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[:n]
+            _backproject(self.ip[k], t, c2, s2, pol, self._edges, buf, self._locbuf)
 
     def _precond_flat(self, r):
         sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))

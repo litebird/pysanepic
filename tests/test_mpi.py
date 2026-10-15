@@ -126,6 +126,33 @@ def test_estimate_noise_mpi():
             assert np.allclose(mine[k].psd, ref[k].psd, rtol=1e-12) and np.allclose(mine[k].freqs_hz, ref[k].freqs_hz)
 
 
+
+def test_detector_groups_mpi():
+    """DetectorGroups on different ranks (each group on one rank) = serial."""
+    import healpy as hp
+
+    from pysanepic import CommonMode, DetectorGroup, GLSParameters, OneOverFNoise, make_maps
+    from test_mapmaker import _group_data
+
+    comm = MPI.COMM_WORLD
+    nside, fs, chunk = 8, 10.0, 2000
+    rng = np.random.default_rng(19)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-3)
+    mode = OneOverFNoise(net_ukrts=20.0, fknee_hz=0.5, alpha=2.0, fmin_hz=1e-3)
+    groups = []
+    for _ in range(3):
+        coupling = rng.uniform(0.8, 1.2, 3)
+        dets = _group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
+        groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)]))
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=chunk / fs, tol=1e-20))
+    res = make_maps(groups[comm.rank :: comm.size], nside, comm=comm, **kw)
+    if comm.rank == 0:
+        ref = make_maps(groups, nside, **kw)
+        seen = ref.maps != hp.UNSEEN
+        assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
@@ -133,5 +160,6 @@ if __name__ == "__main__":
     test_mpi_count_check()
     test_flags_mpi()
     test_estimate_noise_mpi()
+    test_detector_groups_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

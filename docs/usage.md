@@ -184,3 +184,27 @@ stays in the residual. Both are small when the samples far outnumber the
 pixels and the sky is smooth on the scale of the pixels; the second map is
 unbiased in any case, at most slightly less optimal.
 
+## Correlated noise
+
+Detectors observed at the same times may share noise, e.g. a common mode of
+a wafer. A {class}`~pysanepic.DetectorGroup` gathers their `DetectorData` with
+one or more {class}`~pysanepic.CommonMode`: detector $i$ sees
+$U_{ir}\,c_r(t)$ besides its own noise, with $c_r$ a mode of spectrum
+`noise`. In Fourier space $N(f) = D(f) + U\,\Lambda(f)\,U^T$, with $D$ the
+own noise of the detectors (their `noise`) and $\Lambda$ the spectra of the
+modes.
+
+```python
+from pysanepic import CommonMode, DetectorGroup, OneOverFNoise, make_maps
+
+mode = OneOverFNoise(net_ukrts=20.0, fknee_hz=1.0, alpha=2.0, fmin_hz=1e-3)
+group = DetectorGroup(detectors=wafer, modes=[CommonMode(coupling=[1.0, 0.9, ...], noise=mode)])
+result = make_maps([group, *other_detectors], nside)
+```
+
+The detectors of a group must have the same number of samples and sampling
+rate, and a group must be on one MPI process; its chunks are not split at
+gaps (`split_gap_s`), flagged samples are handled by `flag_method`.
+$N^{-1}$ is applied with the Woodbury identity, one detector at a time
+(see [correlated noise](algorithm.md#correlated-noise)).
+

@@ -4,6 +4,10 @@
 
 Changes on `main` that are not in a release yet.
 
+- Correlated noise: `DetectorGroup(detectors, modes=[CommonMode(coupling,
+  noise)])` for detectors observed at the same times that share common
+  modes, $N = D + U \Lambda U^T$ per frequency, applied with the Woodbury
+  identity one detector at a time. `GLS` has a `common_modes` argument.
 - `estimate_noise(data, result)`: the noise spectrum of each detector from the
   residual of a first map, as a `TabulatedNoise` (binned periodogram) or, with
   `fit="toast"`/`"keshner"`, a fitted `OneOverFNoise`. `DetectorData.name`
