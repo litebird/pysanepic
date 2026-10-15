@@ -9,6 +9,13 @@ Changes on `main` that are not in a release yet.
   default `"toast"`, and `DetectorData.noise_psd=(freqs_hz, psd)`, a tabulated
   one-sided PSD in K²/Hz that replaces the model. `one_over_f_weights` has a
   `model` argument and `psd_weights` computes the weights of a tabulated PSD.
+- Flagged samples: `DetectorData.flags` (boolean, `True` = excluded). Their TOD
+  is not used (it may be NaN) and they are not hits. `GLSParameters.flag_method`
+  chooses `"marginalize"` (default: one unknown per sample, the exact GLS
+  without them) or `"offset"` (one offset per run, samples set to 0), and runs
+  longer than `GLSParameters.split_gap_s` (default 300 s) split the chunk and
+  are dropped, so that long gaps do not slow down the PCG. In `GLS`, negative
+  pixels mark flagged samples, fitted by unknowns local to each process.
 
 ## 0.2.1
 

@@ -92,6 +92,7 @@ lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
 | `net_ukrts`, `fknee_hz`, `alpha`, `fmin_hz` | 1/f noise parameters, see below |
 | `noise_model` | `"toast"` (default) or `"keshner"`: shape of the 1/f spectrum, see below |
 | `noise_psd` | `(freqs_hz, psd)`: a tabulated one-sided PSD [K²/Hz] that replaces the model, or `None` |
+| `flags` | Boolean array like `tod`, `True` for samples to exclude, or `None`; see [flagged samples](parameters.md#flagged-samples) |
 
 A detector observed in several stretches of time (e.g. one per day, as the
 observations of litebird_sim) is passed as several `DetectorData`. The

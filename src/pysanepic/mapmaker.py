@@ -121,6 +121,11 @@ class DetectorData:
       replaces the model (net_ukrts, fknee_hz, alpha, fmin_hz are not used);
 
     with sigma = net_ukrts * sqrt(sampling_rate_hz) * 1e-6, i.e. TOD in K.
+
+    flags: boolean array like `tod`, True for samples to exclude (glitches,
+    gaps, ...), or None. Flagged samples do not enter the maps and their TOD is
+    not used (it may be NaN): each one is fitted by an unknown of its own,
+    which is the exact GLS solution without them.
     """
 
     tod: np.ndarray
@@ -135,8 +140,12 @@ class DetectorData:
     hwp_angle: np.ndarray | None = None
     noise_model: str = "toast"
     noise_psd: tuple | None = None
+    flags: np.ndarray | None = None
 
     def __post_init__(self):
+        if self.flags is not None:
+            if not (isinstance(self.flags, np.ndarray) and self.flags.dtype == bool and self.flags.shape == (len(self.tod),)):
+                raise ValueError("DetectorData.flags must be a boolean array with one value per sample (True = flagged)")
         if self.noise_model not in ("toast", "keshner"):
             raise ValueError(f"DetectorData.noise_model must be 'toast' or 'keshner', not {self.noise_model!r}")
         if self.noise_psd is not None:
@@ -204,6 +213,15 @@ class GLSParameters:
     tol, maxiter : PCG stops when norm(r)^2 / norm(b)^2 < tol or after maxiter iterations.
     angle_dtype : storage of twice the polarization angle: np.float32 (4 bytes
         per sample, angle error ~1e-7 rad) or np.float64 (exact).
+    flag_method : how runs of flagged samples (DetectorData.flags) shorter than
+        split_gap_s are handled: "marginalize" (one unknown per sample, the
+        exact GLS without them; ~70 bytes per flagged sample) or "offset" (one
+        unknown per run, its samples set to 0: no bias, nearly optimal, no
+        memory).
+    split_gap_s : runs of flagged samples at least this long [s] split the
+        chunk, and their samples are dropped: the noise correlations across
+        the gap are neglected, but long gaps do not slow down the PCG. inf:
+        never; 0: every run.
     """
 
     chunk_s: float = 3600.0
@@ -215,6 +233,8 @@ class GLSParameters:
     tol: float = 1e-12
     maxiter: int = 2000
     angle_dtype: type = np.float32
+    flag_method: str = "marginalize"
+    split_gap_s: float = 300.0
 
 
 @numba.njit(parallel=True, cache=True)
@@ -284,6 +304,32 @@ def _chunk_bounds(n, ns):
     return zip(starts, np.append(starts[1:], n))
 
 
+def _flag_runs(f):
+    """(start, stop) of the runs of True in a boolean array."""
+    edges = np.flatnonzero(np.diff(np.concatenate([[False], f, [False]]).astype(np.int8)))
+    return edges[0::2], edges[1::2]
+
+
+def _split_at_gaps(a, b, flags, min_len):
+    """Pieces of the chunk [a, b) between runs of flagged samples of at least
+    min_len samples, which are dropped."""
+    if flags is None or not np.isfinite(min_len):
+        return [(a, b)]
+    starts, stops = _flag_runs(flags[a:b])
+    long = stops - starts >= max(min_len, 1)
+    cuts = [a] + [x for s0, s1 in zip(starts[long], stops[long]) for x in (a + s0, a + s1)] + [b]
+    return [(lo, hi) for lo, hi in zip(cuts[0::2], cuts[1::2]) if hi > lo]
+
+
+def _flag_labels(f, method):
+    """Negative labels of the flagged samples of a chunk for GLS: one unknown
+    per sample ("marginalize") or per run ("offset")."""
+    if method == "marginalize":
+        return -1 - np.arange(int(f.sum()), dtype=np.int32)
+    starts, stops = _flag_runs(f)
+    return np.repeat(-1 - np.arange(starts.size, dtype=np.int32), stops - starts)
+
+
 def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=None, verbose=False):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
 
@@ -307,6 +353,8 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         per node).
     """
     params = GLSParameters() if params is None else params
+    if params.flag_method not in ("marginalize", "offset"):
+        raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize' or 'offset'")
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
@@ -319,7 +367,9 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         fs = d.sampling_rate_hz
         sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
         m = int(round(params.pad_s * fs))
-        for a, b in _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs)))):
+        chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
+        gap = params.split_gap_s * fs
+        for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, d.flags, gap)):
             n = b - a + 2 * m
             if d.noise_psd is not None:
                 key = (n, fs, d.noise_psd[0].tobytes(), d.noise_psd[1].tobytes())  # by value: ids get reused
@@ -343,14 +393,21 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                     g = np.zeros(n, dtype)
                     g[m : n - m] = d.pol_efficiency
                     gamma_c.append(g)
+            p = pix[a:b].astype(np.int32)
+            tod = d.tod[a:b]  # a view: the TOD is not copied
+            flagged = None if d.flags is None else d.flags[a:b]
+            if flagged is not None and flagged.any():
+                p[flagged] = _flag_labels(flagged, params.flag_method)  # unknowns not in the maps (see GLS)
+                if m:  # the padding is built from the chunk: not from flagged samples
+                    tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
             if m == 0:
-                pix_c.append(pix[a:b].astype(np.int32))
-                tod_c.append(d.tod[a:b])  # a view: the TOD is not copied
+                pix_c.append(p)
+                tod_c.append(tod)
             else:
                 left = npix + 2 * (n_virtual * size + rank)
                 n_virtual += 1
-                pix_c.append(np.concatenate([np.full(m, left), pix[a:b], np.full(m, left + 1)]).astype(np.int32))
-                tod_c.append(_pad(d.tod[a:b], m, params.pad_fill))
+                pix_c.append(np.concatenate([np.full(m, left, np.int32), p, np.full(m, left + 1, np.int32)]))
+                tod_c.append(_pad(tod, m, params.pad_fill))
         del pix, angle
 
     gls = GLS(
@@ -363,6 +420,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         comm=comm,
         nthreads=nthreads,
         angle_dtype=dtype,
+        overwrite_pix=True,  # pix_c holds copies made here
     )
     del pix_c, a2_c, gamma_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)

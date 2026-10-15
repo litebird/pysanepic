@@ -144,10 +144,15 @@ def _filter(t, w, nthreads):
 
 
 @numba.njit(parallel=True, cache=True)
-def _project(ip, m, c2, s2, pol, out):
-    """out[i] = I[p] + c2[i] Q[p] + s2[i] U[p], p = ip[i]; m is (npix, ncomp)."""
+def _project(ip, m, c2, s2, pol, loc, out):
+    """out[i] = I[p] + c2[i] Q[p] + s2[i] U[p], p = ip[i]; m is (nobs, ncomp).
+    Labels p >= nobs are flagged samples: out[i] = loc[p - nobs]."""
+    nobs = m.shape[0]
     for i in numba.prange(ip.size):
         p = ip[i]
+        if p >= nobs:
+            out[i] = loc[p - nobs]
+            continue
         v = m[p, 0]
         if pol:
             v += m[p, 1] * c2[i] + m[p, 2] * s2[i]
@@ -155,16 +160,21 @@ def _project(ip, m, c2, s2, pol, out):
 
 
 @numba.njit(parallel=True, cache=True)
-def _backproject(ip, t, c2, s2, pol, edges, buf):
-    """buf += P^T t, buf (npix, ncomp). Thread th owns the pixels
+def _backproject(ip, t, c2, s2, pol, edges, buf, locbuf):
+    """buf += P^T t, buf (nobs, ncomp). Thread th owns the pixels
     [edges[th], edges[th + 1]): it reads all the pixel indices of the chunk but
     adds only the samples of its pixels, so the threads share one map without
-    races and without private copies."""
+    races and without private copies. Flagged samples (labels p >= nobs) go to
+    locbuf[p - nobs], written by thread 0."""
+    nobs = buf.shape[0]
     for th in numba.prange(edges.size - 1):
         lo, hi = edges[th], edges[th + 1]
         for i in range(ip.size):
             p = ip[i]
-            if lo <= p < hi:
+            if p >= nobs:
+                if th == 0:
+                    locbuf[p - nobs] += t[i]
+            elif lo <= p < hi:
                 buf[p, 0] += t[i]
                 if pol:
                     buf[p, 1] += t[i] * c2[i]
@@ -207,6 +217,8 @@ def _coverage(ip, c2, s2, pol, out):
     # ponytail: serial, one pass over the data at setup; parallelize if it shows up
     for i in range(ip.size):
         p = ip[i]
+        if p >= out.shape[0]:  # flagged sample
+            continue
         out[p, 0] += 1.0
         if pol:
             c, s = c2[i], s2[i]
@@ -237,12 +249,14 @@ def _pixel_order(ip, npix):
 
 
 @numba.njit(parallel=True, cache=True)
-def _block_circulant(ip, c, c2, s2, pol, out):
+def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
     """Exact per-pixel blocks of P^T C P, C circulant per chunk.
 
     For each pixel, sums c[(t - t') mod ns] w_t w_t'^T over all sample pairs
     that fall in it, with w = (1, c2, s2), and adds them to out (nobs, 6) with the
-    entries II, IQ, IU, QQ, QU, UU (only II if pol is False).
+    entries II, IQ, IU, QQ, QU, UU (only II if pol is False). Labels are
+    < nlabels; those >= nobs (unknowns of flagged samples, intensity only) add
+    their II block to locout[label - nobs].
     Cost is sum over pixels of hits^2 per chunk; the pixels of a chunk are
     processed in parallel (each one writes its own row of out).
     """
@@ -250,7 +264,7 @@ def _block_circulant(ip, c, c2, s2, pol, out):
     # SANEPIC N_[0] shortcut if deep pixels with long chunks become a bottleneck
     nchunk, ns = ip.shape
     for k in range(nchunk):
-        order = _pixel_order(ip[k], out.shape[0])
+        order = _pixel_order(ip[k], nlabels)
         sorted_ip = ip[k][order]
         starts = np.flatnonzero(np.diff(sorted_ip)) + 1
         bounds = np.empty(starts.size + 2, np.int64)
@@ -261,10 +275,11 @@ def _block_circulant(ip, c, c2, s2, pol, out):
             start, stop = bounds[r], bounds[r + 1]
             p = sorted_ip[start]
             n = stop - start
+            local = p >= out.shape[0]  # an unknown of flagged samples: no Q/U
             # Contiguous run of samples with no polarization sensitivity (e.g. the
             # padding of a chunk): sum over lags in O(n) instead of O(n^2)
             unpol = True
-            if pol:
+            if pol and not local:
                 for a in range(start, stop):
                     if c2[k, order[a]] != 0.0 or s2[k, order[a]] != 0.0:
                         unpol = False
@@ -273,7 +288,17 @@ def _block_circulant(ip, c, c2, s2, pol, out):
                 acc = 0.0
                 for lag in range(-(n - 1), n):
                     acc += (n - abs(lag)) * c[k, lag % ns]
-                out[p, 0] += acc
+                if local:
+                    locout[p - out.shape[0]] += acc
+                else:
+                    out[p, 0] += acc
+                continue
+            if local:
+                acc = 0.0
+                for a in range(start, stop):
+                    for b in range(start, stop):
+                        acc += c[k, (order[a] - order[b]) % ns]
+                locout[p - out.shape[0]] += acc
                 continue
             b0 = b1 = b2 = b3 = b4 = b5 = 0.0
             for a in range(start, stop):
@@ -302,9 +327,15 @@ class GLS:
     Parameters
     ----------
     pix : int array (nchunk, ns), or list of 1D chunks / 2D blocks
-        Pixel index of each sample, 0 <= pix < 2^31 (e.g. HEALPix). Maps have
+        Pixel index of each sample, pix < 2^31 (e.g. HEALPix). Maps have
         max(pix) + 1 pixels; pixels without hits are not solved. Used without
-        copies if int32.
+        copies if int32 (chunks with flagged samples are copied, see
+        overwrite_pix). pix < 0 marks
+        flagged samples: they do not enter the maps and their TOD is not used
+        (taken as 0). Samples of a chunk with the same negative value share an
+        intensity unknown, local to this rank and discarded: one value per
+        sample is the exact GLS without them (marginalization), one per
+        contiguous run fits an offset to it.
     psi : float array(s) like `pix`, or None
         Polarization angle of each sample. None for intensity only.
     weights : float array (nchunk, ns//2+1), or list like `pix`
@@ -343,19 +374,36 @@ class GLS:
     angle_dtype : np.float32 (default) or np.float64
         Storage of 2a (and of a per-sample efficiency): float32 gives an angle
         error of ~1e-7 rad.
+    overwrite_pix : bool
+        Relabel the flagged samples in the int32 `pix` arrays in place instead
+        of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
         for p in _chunks(pix):
-            if p.size and (p.min() < 0 or p.max() >= 2**31):
-                raise ValueError("pixel indices must be in [0, 2^31)")
+            if p.size and p.max() >= 2**31:
+                raise ValueError("pixel indices must be < 2^31")
             self.ip.append(np.ascontiguousarray(p, dtype=np.int32))
         self.weights = _chunks(weights)
         nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
+        # flagged samples: labels nobs, nobs + 1, ... of unknowns local to this rank
+        self.nflag = 0
+        for k, p in enumerate(self.ip):
+            flagged = np.flatnonzero(p < 0)
+            if flagged.size:
+                labels, unknown = np.unique(p[flagged], return_inverse=True)
+                if not (overwrite_pix and p.flags.writeable):
+                    p = p.copy()
+                p[flagged] = self.nobs + self.nflag + unknown
+                self.ip[k] = p
+                self.nflag += labels.size
+        if self.nobs + self.nflag >= 2**31:
+            raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
+        self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self.pol = psi is not None or pol_angles is not None
         self.ncomp = 3 if self.pol else 1
         self._dummy = np.zeros(1, angle_dtype)
@@ -375,12 +423,14 @@ class GLS:
 
         # pixels [lo, hi) of this rank
         size, rank = (1, 0) if comm is None else (comm.size, comm.rank)
+        self._nsky = 0  # set below; PCG vectors: [this rank's pixels (ncomp, nloc), flagged samples]
         if size > 1:
             _check_mpi_count(self.nobs * 7)  # the largest array exchanged: the coverage
         bounds = np.arange(size + 1, dtype=np.int64) * self.nobs // size
         self._counts = np.diff(bounds)
         self.lo, self.hi = int(bounds[rank]), int(bounds[rank + 1])
         self.nloc = self.hi - self.lo
+        self._nsky = self.ncomp * self.nloc
 
         cov = np.zeros((self.nobs, 7))
         for k, ip in enumerate(self.ip):
@@ -410,14 +460,15 @@ class GLS:
                     c = ducc0.fft.c2r(np.asarray(w, dtype=complex), lastsize=ip.size, forward=False, inorm=2, nthreads=self.nthreads)
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
-                _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks)
+                _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks, self.nobs + self.nflag, self._locprec)
+        self._locprec = 1.0 / self._locprec
         blocks = self._scatter_sum(blocks, by_column=True)
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
         self._set_preconditioner(blocks, preconditioner)
         del blocks
-        self._full = self._buf = None  # full-size work maps, allocated by _apply
+        self._full = self._buf = self._locbuf = None  # work maps, allocated by _apply
 
     def _pol_rcond(self, cov):
         """Reciprocal condition number of the angle-coverage matrix of each pixel."""
@@ -504,37 +555,55 @@ class GLS:
             _cos_sin(self.angle2[k], self.gamma[k], c2, s2, _TRIG_COS, _TRIG_SIN)
         return True, c2, s2
 
-    def _apply(self, m=None, tod=None):
-        """P^T N^-1 P m (m: this rank's pixels, (ncomp, nloc)) or P^T N^-1 tod,
-        one chunk at a time; returns this rank's pixels (ncomp, nloc)."""
+    def _apply(self, v=None, tod=None):
+        """P^T N^-1 P v or P^T N^-1 tod, one chunk at a time. v and the result
+        are flat PCG vectors: this rank's pixels (ncomp, nloc) raveled, then the
+        unknowns of its flagged samples."""
         if self._buf is None:
             # the search direction for P, and the map for P^T
             self._full = np.empty((self.nobs, self.ncomp))
             self._buf = np.empty((self.nobs, self.ncomp))
-        if m is not None:
-            self._gather(m.T, out=self._full)  # the whole map, for P
+            self._locbuf = np.empty(self.nflag)
+        loc = self._locbuf[:0]
+        if v is not None:
+            self._gather(v[: self._nsky].reshape(self.ncomp, self.nloc).T, out=self._full)  # the whole map, for P
+            loc = v[self._nsky :]
         buf = self._buf
         buf[:] = 0.0
+        self._locbuf[:] = 0.0
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
                 pol, c2, s2 = self._pol_arrays(k)
-                if m is None:
+                if v is None:
                     t = np.asarray(tod[k], dtype=float)
+                    if self.nflag:  # the TOD of flagged samples is not used (it may be NaN)
+                        t = np.where(ip >= self.nobs, 0.0, t)
                 else:
                     t = np.empty(ip.size)
-                    _project(ip, self._full, c2, s2, pol, t)
-                _backproject(ip, _filter(t, self.weights[k], self.nthreads), c2, s2, pol, self._edges, buf)
-        return self._scatter_sum(buf).T * self.mask
+                    _project(ip, self._full, c2, s2, pol, loc, t)
+                _backproject(ip, _filter(t, self.weights[k], self.nthreads), c2, s2, pol, self._edges, buf, self._locbuf)
+        return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf])
+
+    def _precond_flat(self, r):
+        sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
+        return np.concatenate([sky.ravel(), r[self._nsky :] * self._locprec])
+
+    def _no_flags(self):
+        if self.nflag:
+            raise ValueError("apply_A and rhs work on the pixels only: with flagged samples use solve()")
 
     def apply_A(self, m):
         """P^T N^-1 P m for this rank's pixels of a map, (ncomp, nloc) (without
-        MPI, the whole map); returns the same pixels. Collective with MPI."""
-        return self._apply(m=m)
+        MPI, the whole map); returns the same pixels. Collective with MPI. Not
+        available with flagged samples."""
+        self._no_flags()
+        return self._apply(np.ravel(m)).reshape(self.ncomp, self.nloc)
 
     def rhs(self, tod):
         """P^T N^-1 d on this rank's pixels (ncomp, nloc), for timelines laid out
-        like `pix`. Collective with MPI."""
-        return self._apply(tod=_chunks(tod))
+        like `pix`. Collective with MPI. Not available with flagged samples."""
+        self._no_flags()
+        return self._apply(tod=_chunks(tod)).reshape(self.ncomp, self.nloc)
 
     def solve(self, tod, x0=None, tol=1e-15, maxiter=2000, recompute_every=10, verbose=False):
         """Run PCG on `tod` (same chunk layout as `pix`).
@@ -543,25 +612,27 @@ class GLS:
         x0: optional starting map (ncomp, nobs). Returns (map (ncomp, nobs) on
         every rank, info dict).
         """
-        b = self.rhs(tod)
+        b = self._apply(tod=_chunks(tod))
         bb = self._dot(b, b)
-        x = np.zeros_like(b) if x0 is None else x0[:, self.lo : self.hi] * self.mask
-        r = b - self.apply_A(x)
-        z = self._apply_precond(r)
+        x = np.zeros_like(b)
+        if x0 is not None:
+            x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
+        r = b - self._apply(x)
+        z = self._precond_flat(r)
         d = z.copy()
         delta = self._dot(r, z)
         history = [self._dot(r, r) / bb]
 
         it = 0
         while it < maxiter and (it == 0 or history[-1] > tol):
-            q = self.apply_A(d)
+            q = self._apply(d)
             alpha = delta / self._dot(d, q)
             x += alpha * d
             if it % recompute_every == 0:
-                r = b - self.apply_A(x)  # true residual, avoids drift
+                r = b - self._apply(x)  # true residual, avoids drift
             else:
                 r -= alpha * q
-            z = self._apply_precond(r)
+            z = self._precond_flat(r)
             delta_new = self._dot(r, z)
             d = z + (delta_new / delta) * d
             delta = delta_new
@@ -572,10 +643,10 @@ class GLS:
 
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history)}
         del b, r, z, d  # q does not exist if maxiter == 0
-        self._full = self._buf = None  # free the work maps before gathering the result
+        self._full = self._buf = self._locbuf = None  # free the work maps before gathering the result
         # full mask now, while all ranks are here, so that to_healpix is not collective
         self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
-        return self._gather(x.T).T, info
+        return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
 
     def to_healpix(self, m, nside, fill=np.nan):
         """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2); labels
