@@ -17,6 +17,7 @@ so new options need no change on the litebird_sim side.
 | `angle_dtype` | `np.float32` | Storage of 2a: float32 (angle error ~1e-7 rad) or `np.float64` (exact, 4 more bytes per sample) |
 | `flag_method` | `"marginalize"` | Flagged samples (`DetectorData.flags`) in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact) or `"offset"` (one offset per run, samples set to 0) |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run |
+| `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
 
 The sections below explain how to choose them.
 
@@ -120,4 +121,16 @@ the same test all the methods gave the same map errors (see the
 [flags notebook](notebooks/flags)). Splitting every run (`split_gap_s=0`) makes
 many short chunks of any length; their FFTs run on fast lengths (see
 [noise model](algorithm.md#noise-model)), so this costs no extra time either.
+
+## FFT precision
+
+The FFTs that apply $N^{-1}$ take most of the time of an iteration (~60% in
+the one-year benchmark). With `fft_dtype=np.float32` those applied to the PCG
+search directions run in single precision: on G100 they are ~45% faster
+(relative error ~3e-7), while the right-hand side and the true residual
+(recomputed every 10 iterations and at convergence) stay in float64, so the
+solution is still controlled in double precision. On 14 days of 8 detectors
+the iterations were the same and the GLS took 21% less time at `tol=1e-8`
+(15% at 1e-12); the maps differed from the float64 ones by ~1e-6 of their
+rms, 10⁴ times less than the difference between `tol=1e-8` and 1e-12.
 
