@@ -117,6 +117,7 @@ correlated by the 1/f noise and converge slowly: on two days of 4 detectors
 ($f_\text{knee}$ = 50 mHz) a one-hour gap took the PCG from 25 to 71
 iterations, and splitting it (the default, 300 s) brought it back to 25. In
 the same test all the methods gave the same map errors (see the
-[flags notebook](notebooks/flags)). Splitting every run (`split_gap_s=0`) with
-many glitches makes many short chunks, which are slower.
+[flags notebook](notebooks/flags)). Splitting every run (`split_gap_s=0`) makes
+many short chunks of any length; their FFTs run on fast lengths (see
+[noise model](algorithm.md#noise-model)), so this costs no extra time either.
 
