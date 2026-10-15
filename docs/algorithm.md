@@ -42,7 +42,9 @@ Neglected:
   [padding](parameters.md#padding).
 
 The noise parameters or spectra are given by the user (or by litebird_sim,
-which uses those of the simulation); they are not estimated from the data.
+which uses those of the simulation), or estimated from the residual of a first
+map with {func}`~pysanepic.estimate_noise` (see
+[estimating the noise](usage.md#estimating-the-noise)).
 
 ## Preconditioner
 

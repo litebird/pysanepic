@@ -518,6 +518,78 @@ def test_noise_variance_monte_carlo():
     assert np.all(np.abs(ratio - 1) < 0.35) and abs(ratio.mean() - 1) < 0.06
 
 
+def _noise_data(rng, nside, sky, fs, chunk, nchunk, shape, sigma, names=True):
+    """Detectors with circulant noise of PSD 2 sigma^2 / fs * shape(f) per chunk,
+    each split in stretches of 4 chunks sharing a name."""
+    data = []
+    for j, pa in enumerate((0.0, np.pi / 4, np.pi / 8)):
+        n = nchunk * chunk
+        th, ph, psi = _scan(n, rng)
+        a = psi + pa
+        p = hp.ang2pix(nside, th, ph)
+        f = np.fft.rfftfreq(chunk, 1 / fs)
+        noise = np.concatenate([np.fft.irfft(np.fft.rfft(rng.normal(size=chunk)) * sigma * np.sqrt(shape(np.maximum(f, 1e-9))), n=chunk)
+                                for _ in range(nchunk)])
+        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a) + noise
+        for s0 in range(0, n, 4 * chunk):
+            sl = slice(s0, s0 + 4 * chunk)
+            data.append(DetectorData(tod=tod[sl], pointing=Pointing(theta=th[sl], phi=ph[sl], psi=psi[sl], coordinates="E"),
+                                     sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=50.0), pol_angle_rad=pa,
+                                     name=f"det{j}" if names else None))
+    return data
+
+
+def test_estimate_noise():
+    """With the true sky as map the residual is the noise: the binned periodogram
+    matches the PSD; the fit recovers NET, fknee and alpha; flagged (NaN)
+    samples are excluded; DetectorData are pooled by name, or keyed by position."""
+    from pysanepic import TabulatedNoise, estimate_noise
+    from pysanepic.mapmaker import MapResult
+
+    nside, fs, chunk, sigma = 16, 10.0, 4000, 50.0 * np.sqrt(10.0) * 1e-6
+    rng = np.random.default_rng(14)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    shape = lambda f: (f**1.5 + 0.1**1.5) / (f**1.5 + 1e-3**1.5)  # noqa: E731
+    data = _noise_data(rng, nside, sky, fs, chunk, 40, shape, sigma)
+    truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True, residuals=None)
+    flags = np.zeros(len(data[0].tod), bool)
+    flags[1000:1500] = True
+    data[0] = dataclasses.replace(data[0], tod=np.where(flags, np.nan, data[0].tod), flags=flags)
+    est = estimate_noise(data, truth, chunk_s=chunk / fs, nbins=30)
+    assert sorted(est) == ["det0", "det1", "det2"] and all(isinstance(e, TabulatedNoise) for e in est.values())
+    for e in est.values():
+        ratio = e.psd / (2 * sigma**2 / fs * shape(e.freqs_hz))
+        assert np.median(np.abs(ratio - 1)) < 0.08 and abs(np.mean(ratio[5:]) - 1) < 0.05
+    for model in ("toast", "keshner"):
+        fit = estimate_noise(data, truth, chunk_s=chunk / fs, nbins=30, fit=model)["det1"]
+        assert fit.model == model and abs(fit.net_ukrts / 50 - 1) < 0.03
+        if model == "toast":
+            assert abs(fit.fknee_hz / 0.1 - 1) < 0.25 and abs(fit.alpha / 1.5 - 1) < 0.15
+    anonymous = estimate_noise(_noise_data(rng, nside, sky, fs, chunk, 4, shape, sigma, names=False), truth, chunk_s=chunk / fs)
+    assert sorted(anonymous) == [0, 1, 2]
+
+
+def test_estimate_noise_iteration():
+    """make_maps -> estimate_noise -> make_maps runs, and the second maps are
+    as good as those with the true noise model."""
+    from pysanepic import estimate_noise
+
+    nside, fs, chunk, sigma = 16, 10.0, 4000, 50.0 * np.sqrt(10.0) * 1e-6
+    rng = np.random.default_rng(15)
+    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(8))  # smooth: no sub-pixel signal
+    shape = lambda f: (f**1.5 + 0.1**1.5) / (f**1.5 + 1e-3**1.5)  # noqa: E731
+    true = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.1, alpha=1.5, fmin_hz=1e-3)
+    data = [dataclasses.replace(d, noise=true) for d in _noise_data(rng, nside, sky, fs, chunk, 20, shape, sigma)]
+    params = GLSParameters(chunk_s=chunk / fs, tol=1e-10)
+    ref = make_maps(data, nside, coordinates="E", params=params)
+    white = make_maps([dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=50.0)) for d in data], nside, coordinates="E", params=params)
+    est = estimate_noise(data, white, chunk_s=chunk / fs)
+    r = make_maps([dataclasses.replace(d, noise=est[d.name]) for d in data], nside, coordinates="E", params=params)
+    seen = ref.maps[1] != hp.UNSEEN
+    err = lambda m: np.std((m - sky)[:, seen])  # noqa: E731
+    assert r.converged and err(r.maps) < 1.05 * err(ref.maps) < err(white.maps)
+
+
 if __name__ == "__main__":
     test_noiseless_recovers_sky()
     test_padding_noiseless()

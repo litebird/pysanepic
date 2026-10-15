@@ -94,6 +94,7 @@ lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
 | `sampling_rate_hz` | Sampling rate [Hz] |
 | `noise` | The noise model: a `OneOverFNoise` or a `TabulatedNoise`, see below |
 | `flags` | Boolean array like `tod`, `True` for samples to exclude, or `None`; see [flagged samples](parameters.md#flagged-samples) |
+| `name` | The detector, or `None`: {func}`~pysanepic.estimate_noise` averages the spectrum over the `DetectorData` with the same name |
 
 A detector observed in several stretches of time (e.g. one per day, as the
 observations of litebird_sim) is passed as several `DetectorData`. The
@@ -152,3 +153,34 @@ solved and Q, U are `healpy.UNSEEN`.
 
 The I monopole is poorly constrained with 1/f noise (it is almost degenerate with
 the offset of each chunk): compare maps after removing it.
+
+## Estimating the noise
+
+When the noise spectrum is not known, {func}`~pysanepic.estimate_noise`
+estimates it from the residual of a first map, $d - P\hat m$:
+
+```python
+import dataclasses
+from pysanepic import OneOverFNoise, estimate_noise, make_maps
+
+first = make_maps(data, nside)  # with a guess, e.g. white noise
+noise = estimate_noise(data, first, chunk_s=86400.0)  # {name: TabulatedNoise}
+maps = make_maps([dataclasses.replace(d, noise=noise[d.name]) for d in data], nside)
+```
+
+The residual of each `DetectorData` is cut in chunks of `chunk_s` seconds; the
+periodogram of each chunk (Hann window; flagged samples set to 0, with their
+fraction corrected) is averaged over all the `DetectorData` with the same
+`name`, also across MPI processes (`comm=`), in `nbins` logarithmic bins from
+`1/chunk_s` to $f_s/2$. The result is a `TabulatedNoise` per detector, or, with
+`fit="toast"` or `fit="keshner"`, a `OneOverFNoise` fitted to it ($f_\text{min}$
+is not constrained below `1/chunk_s`).
+
+The residual differs from the noise in two ways: the map absorbs part of the
+noise, mostly at the harmonics of the scan (on a very repetitive test scan
+with 1.4% as many unknowns as samples, up to 30% of the power between the spin
+frequency and the pixel-crossing frequency), and signal finer than the pixels
+stays in the residual. Both are small when the samples far outnumber the
+pixels and the sky is smooth on the scale of the pixels; the second map is
+unbiased in any case, at most slightly less optimal.
+
