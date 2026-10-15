@@ -111,7 +111,7 @@ class OneOverFNoise:
     - `model="keshner"`: P(f) = sigma^2 ((f^2 + fknee^2) / (f^2 +
       fmin^2))^(alpha/2), litebird_sim's noise with engine="ducc".
 
-    fknee_hz = 0 is white noise. With fmin_hz = 0 the mean of each chunk is not
+    fknee_hz = 0 or alpha = 0 is white noise. With fmin_hz = 0 the mean of each chunk is not
     used. One object can be shared by all the stretches of time of a detector.
     """
 
@@ -124,8 +124,8 @@ class OneOverFNoise:
     def __post_init__(self):
         if self.model not in ("toast", "keshner"):
             raise ValueError(f"OneOverFNoise.model must be 'toast' or 'keshner', not {self.model!r}")
-        if not (self.net_ukrts > 0 and self.fknee_hz >= 0 and self.fmin_hz >= 0 and self.alpha > 0):
-            raise ValueError("OneOverFNoise: net_ukrts and alpha must be > 0, fknee_hz and fmin_hz >= 0")
+        if not (self.net_ukrts > 0 and self.fknee_hz >= 0 and self.fmin_hz >= 0 and self.alpha >= 0):
+            raise ValueError("OneOverFNoise: net_ukrts must be > 0, fknee_hz, fmin_hz and alpha >= 0")
 
     def weights(self, ns, fs):
         """Inverse PSD on the rfft grid of a chunk of ns samples at fs [Hz]."""

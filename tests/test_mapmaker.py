@@ -243,6 +243,8 @@ def test_noise_classes_in_make_maps():
         OneOverFNoise(net_ukrts=net, model="pink")
     with pytest.raises(ValueError, match="net_ukrts"):
         OneOverFNoise(net_ukrts=0.0)
+    for model in ("toast", "keshner"):  # alpha = 0 (litebird_sim's default with fknee = 0): white
+        assert np.allclose(OneOverFNoise(net_ukrts=net, fknee_hz=0.05, alpha=0.0, model=model).weights(64, fs), 1 / (net * np.sqrt(fs) * 1e-6) ** 2)
     with pytest.raises(ValueError, match="frequencies"):
         TabulatedNoise(freqs_hz=[0.0, 1.0], psd=[1.0, 1.0])
     with pytest.raises(TypeError, match="noise"):
