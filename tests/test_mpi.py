@@ -104,11 +104,34 @@ def test_flags_mpi():
         assert np.allclose(m, ms, rtol=1e-9, atol=1e-12 * np.abs(ms).max())
 
 
+
+def test_estimate_noise_mpi():
+    """The spectrum of a detector whose DetectorData are spread over the ranks
+    is the same as in serial."""
+    from pysanepic import estimate_noise
+    from pysanepic.mapmaker import MapResult
+    from test_mapmaker import _noise_data
+
+    comm = MPI.COMM_WORLD
+    nside, fs, chunk = 8, 10.0, 2000
+    rng = np.random.default_rng(16)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _noise_data(rng, nside, sky, fs, chunk, 8, lambda f: 1 + (0.1 / f) ** 1.5, 1e-4)
+    truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True, residuals=None)
+    mine = estimate_noise(data[comm.rank :: comm.size], truth, chunk_s=chunk / fs, comm=comm)
+    if comm.rank == 0:
+        ref = estimate_noise(data, truth, chunk_s=chunk / fs)
+        assert sorted(mine) == sorted(ref)
+        for k in ref:
+            assert np.allclose(mine[k].psd, ref[k].psd, rtol=1e-12) and np.allclose(mine[k].freqs_hz, ref[k].freqs_hz)
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
     test_more_ranks_than_pixels()
     test_mpi_count_check()
     test_flags_mpi()
+    test_estimate_noise_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

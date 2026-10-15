@@ -4,6 +4,10 @@
 
 Changes on `main` that are not in a release yet.
 
+- `estimate_noise(data, result)`: the noise spectrum of each detector from the
+  residual of a first map, as a `TabulatedNoise` (binned periodogram) or, with
+  `fit="toast"`/`"keshner"`, a fitted `OneOverFNoise`. `DetectorData.name`
+  groups the `DetectorData` of a detector (also across MPI processes).
 - The FFT work buffers of $N^{-1}$ are allocated once and reused (−9% on the
   FFTs on G100).
 - `GLSParameters.fft_dtype` (and `GLS(fft_dtype=...)`): `np.float32` runs the

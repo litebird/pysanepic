@@ -172,6 +172,9 @@ class DetectorData:
     :class:`TabulatedNoise` (any object with a `weights(ns, fs)` method giving
     the inverse PSD on the rfft grid of a chunk), with the TOD in K.
 
+    name: the detector, optional: estimate_noise averages the spectrum over
+    all the DetectorData with the same name (e.g. the days of a detector).
+
     flags: boolean array like `tod`, True for samples to exclude (glitches,
     gaps, ...), or None. Flagged samples do not enter the maps and their TOD is
     not used (it may be NaN): each one is fitted by an unknown of its own,
@@ -186,6 +189,7 @@ class DetectorData:
     pol_efficiency: float = 1.0
     hwp_angle: np.ndarray | None = None
     flags: np.ndarray | None = None
+    name: str | None = None
 
     def __post_init__(self):
         if self.flags is not None:
@@ -477,3 +481,111 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         converged=info["converged"],
         residuals=info["residuals"],
     )
+
+
+def _model_tod(d, maps, nside, coordinates, nthreads):
+    """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0)."""
+    pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
+    m = np.where(maps == hp.UNSEEN, 0.0, maps)
+    tod = m[0, pix]
+    if m.shape[0] == 3:
+        tod = tod + d.pol_efficiency * (m[1, pix] * np.cos(2 * angle) + m[2, pix] * np.sin(2 * angle))
+    return tod
+
+
+def _fit_one_over_f(f, psd, fs, model):
+    """Least-squares fit of log P(f) with OneOverFNoise(model): parameters log
+    sigma^2, log fknee, alpha, log fmin; a few Levenberg-Marquardt steps."""
+    y = np.log(psd)
+
+    def logp(q):
+        s2, fk, alpha, fm = np.exp(q[0]), np.exp(q[1]), q[2], np.exp(q[3])
+        if model == "toast":
+            shape = (f**alpha + fk**alpha) / (f**alpha + fm**alpha)
+        else:
+            shape = ((f**2 + fk**2) / (f**2 + fm**2)) ** (alpha / 2)
+        return np.log(2 * s2 / fs * shape)
+
+    white = np.median(psd[f > f[-1] / 4])
+    q = np.array([np.log(white * fs / 2), np.log(max(f[np.argmin(np.abs(psd - 2 * white))], f[0])), 1.0, np.log(f[0])])
+    lam = 1e-2
+    for _ in range(200):
+        r = y - logp(q)
+        J = np.empty((f.size, 4))
+        for j in range(4):
+            dq = np.zeros(4)
+            dq[j] = 1e-6
+            J[:, j] = (logp(q + dq) - logp(q - dq)) / 2e-6
+        # damped least squares; lstsq, as fmin may be unconstrained (below the lowest bin)
+        damp = np.sqrt(lam * np.maximum(np.diag(J.T @ J), 1e-12))
+        step = np.linalg.lstsq(np.vstack([J, np.diag(damp)]), np.concatenate([r, np.zeros(4)]), rcond=None)[0]
+        if np.sum((y - logp(q + step)) ** 2) < np.sum(r**2):
+            q, lam = q + step, lam / 3
+            if np.abs(step).max() < 1e-8:
+                break
+        else:
+            lam *= 10
+    sigma = np.sqrt(np.exp(q[0]))
+    return OneOverFNoise(net_ukrts=sigma / np.sqrt(fs) * 1e6, fknee_hz=float(np.exp(q[1])),
+                         alpha=float(q[2]), fmin_hz=float(np.exp(q[3])), model=model)
+
+
+def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None, nthreads=None):
+    """Noise spectrum of each detector from the residual of a map.
+
+    The residual d - P m of each DetectorData, with m the maps of `result`
+    (a MapResult, e.g. a first make_maps), is cut in chunks of `chunk_s`
+    seconds; the periodogram of each chunk (Hann window, flagged samples set
+    to 0 and their fraction corrected) is averaged over all the chunks of the
+    DetectorData with the same `name` (on all MPI processes), in `nbins`
+    logarithmic bins from 1/chunk_s to fs/2.
+
+    Returns a dict {name: noise}: a TabulatedNoise with the binned one-sided
+    PSD [K^2/Hz], or with `fit="toast"` or `"keshner"` a OneOverFNoise fitted
+    to it. DetectorData without a name are keyed by their position in `data`.
+
+    The residual misses the part of the noise that the map absorbs (small
+    when there are many more samples than pixels; mostly at the harmonics of
+    the scan), so iterating make_maps / estimate_noise once is usually enough.
+    """
+    nthreads = resolve_nthreads(nthreads)
+    acc = {}  # name -> [fs, sum of P per bin, count per bin, sum of log f per bin]
+    for i, d in enumerate(data):
+        key = i if d.name is None else d.name
+        fs = d.sampling_rate_hz
+        res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads)
+        if d.flags is not None:
+            res[d.flags] = 0.0
+        edges = np.geomspace(1.0 / chunk_s, fs / 2, nbins + 1)
+        a_ = acc.setdefault(key, [fs, np.zeros(nbins), np.zeros(nbins), np.zeros(nbins)])
+        if a_[0] != fs:
+            raise ValueError(f"detector {key!r}: DetectorData with different sampling rates")
+        for a, b in _chunk_bounds(res.size, max(2, int(round(chunk_s * fs)))):
+            x = res[a:b]
+            good = 1.0 if d.flags is None else 1.0 - d.flags[a:b].mean()
+            if good < 0.5:
+                continue
+            win = np.hanning(x.size)
+            p = 2 * np.abs(ducc0.fft.r2c(x * win, nthreads=nthreads)) ** 2 / (fs * np.sum(win**2) * good)
+            f = np.fft.rfftfreq(x.size, 1 / fs)
+            k = np.searchsorted(edges, f[1:-1], side="right") - 1
+            ok = (k >= 0) & (k < nbins)
+            np.add.at(a_[1], k[ok], p[1:-1][ok])
+            np.add.at(a_[2], k[ok], 1)
+            np.add.at(a_[3], k[ok], np.log(f[1:-1][ok]))
+    if comm is not None:  # the DetectorData of a detector may be on several processes
+        merged = {}
+        for part in comm.allgather(acc):
+            for key, (fs, s, n, lf) in part.items():
+                m = merged.setdefault(key, [fs, np.zeros_like(s), np.zeros_like(n), np.zeros_like(lf)])
+                m[1] += s
+                m[2] += n
+                m[3] += lf
+        acc = merged
+    out = {}
+    for key, (fs, s, n, lf) in acc.items():
+        ok = n > 0
+        f, psd = np.exp(lf[ok] / n[ok]), s[ok] / n[ok]
+        out[key] = TabulatedNoise(freqs_hz=f, psd=psd) if fit is None else _fit_one_over_f(f, psd, fs, fit)
+    return out
+

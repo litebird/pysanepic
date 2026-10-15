@@ -17,6 +17,8 @@
 .. autoclass:: pysanepic.TabulatedNoise
    :members: weights
 
+.. autofunction:: pysanepic.estimate_noise
+
 .. autoclass:: pysanepic.GLSParameters
    :no-members:
 

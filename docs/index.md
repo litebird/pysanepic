@@ -55,6 +55,7 @@ notebooks/preconditioner
 notebooks/padding
 notebooks/memory
 notebooks/flags
+notebooks/noise_estimation
 ```
 
 ```{toctree}
