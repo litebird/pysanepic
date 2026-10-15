@@ -23,6 +23,12 @@ seconds, with a power spectrum $P(f)$: a 1/f model ("toast" or "keshner", see
 [conventions](usage.md#conventions)) or a tabulated spectrum.
 $N^{-1}$ is applied as a circulant filter, in Fourier space with ducc0:
 $N^{-1} t = \mathrm{irfft}(\mathrm{rfft}(t)/P(f))$, one chunk at a time.
+`make_maps` runs the FFT of each chunk on the smallest even length with small
+prime factors ({func}`~pysanepic.fast_fft_length`): a chunk of awkward
+length, e.g. split at a gap, is zero-extended and the result truncated, so
+the weight is the corresponding block of a slightly longer circulant (still
+positive definite: no bias). An FFT of 6480001 samples is 7 times slower than
+one of 6553600.
 With $f_\text{min} = 0$ the zero frequency has zero weight and the mean of each
 chunk is not used.
 

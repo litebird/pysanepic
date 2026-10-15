@@ -21,6 +21,12 @@ Changes on `main` that are not in a release yet.
   longer than `GLSParameters.split_gap_s` (default 300 s) split the chunk and
   are dropped, so that long gaps do not slow down the PCG. In `GLS`, negative
   pixels mark flagged samples, fitted by unknowns local to each process.
+- FFTs on fast lengths: `make_maps` applies $N^{-1}$ to each chunk with an FFT
+  of the smallest even length with small prime factors (`fast_fft_length`),
+  zero-extending the chunk. Chunks split at gaps, or observations of awkward
+  length, were up to 7 times slower; the maps of chunks that already had a
+  fast length (e.g. one day at 75 Hz) do not change. `GLS` has a
+  `fft_lengths` argument.
 
 ## 0.2.1
 

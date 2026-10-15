@@ -183,6 +183,39 @@ def test_contiguous_run_kernel():
     assert np.allclose(fast, brute)
 
 
+def test_fft_lengths():
+    """With an FFT longer than the chunk (zero-extended, result truncated), the
+    solution equals the dense GLS with weight W = the ns x ns block of the m x m
+    circulant N^-1, and fast_fft_length gives even 5-smooth-like lengths."""
+    from pysanepic import GLS, fast_fft_length, one_over_f_weights
+
+    assert fast_fft_length(6_480_000) == 6_480_000
+    assert fast_fft_length(6_480_001) == 6_553_600
+    assert all(fast_fft_length(n) >= n and fast_fft_length(n) % 2 == 0 for n in range(1, 300))
+    rng = np.random.default_rng(11)
+    npix, ns, m, nchunk = 6, 101, 128, 2
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = one_over_f_weights(m, 10.0, 1.0, 0.5, 1.0, 0.05)
+    g = GLS(pix, psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0, angle_dtype=np.float64, fft_lengths=m)
+    x, info = g.solve(tod, tol=1e-26, maxiter=500)
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % m
+    W = np.fft.irfft(w, n=m)[lag]  # ns x ns block of the m x m circulant
+    A, b = np.zeros((3 * npix, 3 * npix)), np.zeros(3 * npix)
+    for k in range(nchunk):
+        P = np.zeros((ns, 3 * npix))
+        P[np.arange(ns), pix[k]] = 1
+        P[np.arange(ns), npix + pix[k]] = np.cos(2 * psi[k])
+        P[np.arange(ns), 2 * npix + pix[k]] = np.sin(2 * psi[k])
+        A += P.T @ W @ P
+        b += P.T @ W @ tod[k]
+    ref = np.linalg.solve(A, b).reshape(3, npix)
+    assert np.abs(x - ref).max() < 1e-11 * np.abs(ref).max()
+    with pytest.raises(ValueError, match="FFT length"):
+        GLS(pix, psi, np.tile(w, (nchunk, 1)), fft_lengths=64)
+
+
 def test_pixel_order():
     """Counting sort == stable argsort, also with empty and unhit pixels."""
     from pysanepic.gls import _pixel_order

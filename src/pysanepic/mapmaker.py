@@ -16,7 +16,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from .gls import GLS, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
+from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 
 
 _COORDINATES = ("E", "G", "C")
@@ -397,7 +397,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
-    pix_c, a2_c, gamma_c, tod_c, w_c = [], [], [], [], []
+    pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c = [], [], [], [], [], []
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
     for d in data:  # one detector at a time: only its pointings are in memory
@@ -408,10 +408,12 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         gap = params.split_gap_s * fs
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, d.flags, gap)):
             n = b - a + 2 * m
-            key = (n, fs, d.noise)  # the dict keeps the noise objects alive: no reused ids
+            nfft = fast_fft_length(n)  # e.g. chunks split at gaps have any length
+            key = (nfft, fs, d.noise)  # the dict keeps the noise objects alive: no reused ids
             if key not in weights:
-                weights[key] = d.noise.weights(n, fs)
+                weights[key] = d.noise.weights(nfft, fs)
             w_c.append(weights[key])
+            nfft_c.append(nfft)
             # 2a computed in float64, then stored as `dtype`; the margins of a
             # padded chunk carry no polarization (gamma = 0: intensity-only
             # virtual pixels), so only padded chunks need gamma per sample
@@ -453,6 +455,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         nthreads=nthreads,
         angle_dtype=dtype,
         overwrite_pix=True,  # pix_c holds copies made here
+        fft_lengths=nfft_c,
     )
     del pix_c, a2_c, gamma_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)

@@ -32,6 +32,7 @@
 
 .. autofunction:: pysanepic.one_over_f_weights
 .. autofunction:: pysanepic.psd_weights
+.. autofunction:: pysanepic.fast_fft_length
 
 .. autofunction:: pysanepic.two_angle
 

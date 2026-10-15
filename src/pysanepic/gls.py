@@ -134,13 +134,26 @@ def _efficiency_chunks(eff, psi):
     return out
 
 
-def _filter(t, w, nthreads):
-    """irfft(rfft(t) * w); ducc0 parallelizes a single 1D FFT, scipy does not.
+def _filter(t, w, nthreads, m):
+    """irfft(rfft(t) * w) on an FFT of length m >= t.size, t zero-extended and the
+    result truncated; ducc0 parallelizes a single 1D FFT, scipy does not.
     Batching several chunks per call was 2.4x faster on an idle node but gave
     nothing on a full one (memory bandwidth bound), so chunks go one at a time."""
+    n = t.size
+    if m > n:
+        t = np.concatenate([t, np.zeros(m - n)])
     f = ducc0.fft.r2c(t, nthreads=nthreads)
     f *= w
-    return ducc0.fft.c2r(f, lastsize=t.size, forward=False, inorm=2, nthreads=nthreads)
+    return ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, nthreads=nthreads)[:n]
+
+
+def fast_fft_length(n):
+    """The smallest even length >= n with only small prime factors: an FFT of
+    6480001 samples (prime factor 6619) is 7 times slower than one of 6553600."""
+    m = ducc0.fft.good_size(n, True)
+    while m % 2:
+        m = ducc0.fft.good_size(m + 1, True)
+    return m
 
 
 @numba.njit(parallel=True, cache=True)
@@ -263,6 +276,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
     # ponytail: O(hits^2) per pixel per chunk; switch to a lag cutoff or the
     # SANEPIC N_[0] shortcut if deep pixels with long chunks become a bottleneck
     nchunk, ns = ip.shape
+    nc = c.shape[1]  # FFT length >= ns: c is the first row of an nc x nc circulant
     for k in range(nchunk):
         order = _pixel_order(ip[k], nlabels)
         sorted_ip = ip[k][order]
@@ -287,7 +301,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
             if unpol and order[stop - 1] - order[start] == n - 1:
                 acc = 0.0
                 for lag in range(-(n - 1), n):
-                    acc += (n - abs(lag)) * c[k, lag % ns]
+                    acc += (n - abs(lag)) * c[k, lag % nc]
                 if local:
                     locout[p - out.shape[0]] += acc
                 else:
@@ -297,7 +311,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
                 acc = 0.0
                 for a in range(start, stop):
                     for b in range(start, stop):
-                        acc += c[k, (order[a] - order[b]) % ns]
+                        acc += c[k, (order[a] - order[b]) % nc]
                 locout[p - out.shape[0]] += acc
                 continue
             b0 = b1 = b2 = b3 = b4 = b5 = 0.0
@@ -305,7 +319,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
                 ta = order[a]
                 for b in range(start, stop):
                     tb = order[b]
-                    cab = c[k, (ta - tb) % ns]
+                    cab = c[k, (ta - tb) % nc]
                     b0 += cab
                     if pol:
                         b1 += cab * c2[k, tb]
@@ -374,12 +388,18 @@ class GLS:
     angle_dtype : np.float32 (default) or np.float64
         Storage of 2a (and of a per-sample efficiency): float32 gives an angle
         error of ~1e-7 rad.
+    fft_lengths : int or list of int (one per chunk), or None
+        Length m >= ns of the FFT used to apply N^-1 to each chunk (the chunk is
+        zero-extended and the result truncated: the weight is the ns x ns block
+        of an m x m circulant, still symmetric positive definite, so the maps
+        stay unbiased); `weights` are then on the rfft grid of m. None: the
+        chunk length. See :func:`fast_fft_length`.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -388,6 +408,11 @@ class GLS:
                 raise ValueError("pixel indices must be < 2^31")
             self.ip.append(np.ascontiguousarray(p, dtype=np.int32))
         self.weights = _chunks(weights)
+        fl = [p.size for p in self.ip] if fft_lengths is None else np.broadcast_to(fft_lengths, (len(self.ip),)).tolist()
+        self._nfft = [int(m) for m in fl]
+        for p, w, m in zip(self.ip, self.weights, self._nfft):
+            if m < p.size or len(w) != m // 2 + 1:
+                raise ValueError(f"a chunk of {p.size} samples needs an FFT length >= {p.size} and weights of length m//2+1 (FFT length m = {m}, weights {len(w)})")
         nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
         # flagged samples: labels nobs, nobs + 1, ... of unknowns local to this rank
@@ -455,9 +480,9 @@ class GLS:
         last_w = c = None  # consecutive chunks often share their weights array
         with numba_threads(self.nthreads):
             for k, (ip, w) in enumerate(zip(self.ip, self.weights)):
-                if w is not last_w or c.size != ip.size:
+                if w is not last_w or c.size != self._nfft[k]:
                     # first row of the circulant N^-1 of the chunk
-                    c = ducc0.fft.c2r(np.asarray(w, dtype=complex), lastsize=ip.size, forward=False, inorm=2, nthreads=self.nthreads)
+                    c = ducc0.fft.c2r(np.asarray(w, dtype=complex), lastsize=self._nfft[k], forward=False, inorm=2, nthreads=self.nthreads)
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks, self.nobs + self.nflag, self._locprec)
@@ -581,7 +606,7 @@ class GLS:
                 else:
                     t = np.empty(ip.size)
                     _project(ip, self._full, c2, s2, pol, loc, t)
-                _backproject(ip, _filter(t, self.weights[k], self.nthreads), c2, s2, pol, self._edges, buf, self._locbuf)
+                _backproject(ip, _filter(t, self.weights[k], self.nthreads, self._nfft[k]), c2, s2, pol, self._edges, buf, self._locbuf)
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf])
 
     def _precond_flat(self, r):
