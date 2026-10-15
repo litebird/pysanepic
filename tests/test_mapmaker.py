@@ -216,6 +216,25 @@ def test_fft_lengths():
         GLS(pix, psi, np.tile(w, (nchunk, 1)), fft_lengths=64)
 
 
+def test_fft_float32():
+    """fft_dtype=np.float32: the PCG still reaches tol 1e-12 (the true residual
+    is checked in float64) and the maps match the float64 ones."""
+    nside, n, fs = 16, 120_000, 10.0
+    rng = np.random.default_rng(13)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _four_detectors(n, fs, rng, sky, nside)
+    for d in data:
+        d.tod[:] += rng.normal(0, 1e-5, n)  # some noise, so that the solution is not trivial
+    params = GLSParameters(chunk_s=1200.0, tol=1e-12)
+    r64 = make_maps(data, nside, coordinates="E", params=params)
+    r32 = make_maps(data, nside, coordinates="E", params=dataclasses.replace(params, fft_dtype=np.float32))
+    assert r32.converged and r32.residuals[-1] <= 1e-12
+    seen = r64.maps[1] != hp.UNSEEN
+    assert np.abs(r32.maps[:, seen] - r64.maps[:, seen]).max() < 1e-5 * np.abs(r64.maps[:, seen]).max()
+    with pytest.raises(ValueError, match="fft_dtype"):
+        make_maps(data, nside, coordinates="E", params=dataclasses.replace(params, fft_dtype=np.float16))
+
+
 def test_pixel_order():
     """Counting sort == stable argsort, also with empty and unhit pixels."""
     from pysanepic.gls import _pixel_order

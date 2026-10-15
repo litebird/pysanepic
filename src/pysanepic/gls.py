@@ -134,19 +134,6 @@ def _efficiency_chunks(eff, psi):
     return out
 
 
-def _filter(t, w, nthreads, m):
-    """irfft(rfft(t) * w) on an FFT of length m >= t.size, t zero-extended and the
-    result truncated; ducc0 parallelizes a single 1D FFT, scipy does not.
-    Batching several chunks per call was 2.4x faster on an idle node but gave
-    nothing on a full one (memory bandwidth bound), so chunks go one at a time."""
-    n = t.size
-    if m > n:
-        t = np.concatenate([t, np.zeros(m - n)])
-    f = ducc0.fft.r2c(t, nthreads=nthreads)
-    f *= w
-    return ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, nthreads=nthreads)[:n]
-
-
 def fast_fft_length(n):
     """The smallest even length >= n with only small prime factors: an FFT of
     6480001 samples (prime factor 6619) is 7 times slower than one of 6553600."""
@@ -394,12 +381,18 @@ class GLS:
         of an m x m circulant, still symmetric positive definite, so the maps
         stay unbiased); `weights` are then on the rfft grid of m. None: the
         chunk length. See :func:`fast_fft_length`.
+    fft_dtype : np.float64 (default) or np.float32
+        Precision of the FFTs applying N^-1 to the search directions; float32
+        is ~45% faster on G100 (relative error ~3e-7). The right-hand side and
+        the true residual, recomputed every `recompute_every` iterations and
+        at convergence, always use float64, so the solution is still
+        controlled in double precision.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -408,6 +401,11 @@ class GLS:
                 raise ValueError("pixel indices must be < 2^31")
             self.ip.append(np.ascontiguousarray(p, dtype=np.int32))
         self.weights = _chunks(weights)
+        if fft_dtype not in (np.float32, np.float64):
+            raise ValueError("fft_dtype must be np.float32 or np.float64")
+        self._single = fft_dtype == np.float32
+        self._w32 = {}  # weights in float32, by id of the (shared) float64 arrays
+        self._fftbuf = {}  # FFT work buffers, reused over chunks and iterations
         fl = [p.size for p in self.ip] if fft_lengths is None else np.broadcast_to(fft_lengths, (len(self.ip),)).tolist()
         self._nfft = [int(m) for m in fl]
         for p, w, m in zip(self.ip, self.weights, self._nfft):
@@ -580,10 +578,38 @@ class GLS:
             _cos_sin(self.angle2[k], self.gamma[k], c2, s2, _TRIG_COS, _TRIG_SIN)
         return True, c2, s2
 
-    def _apply(self, v=None, tod=None):
+    def _filter(self, t, k, single):
+        """N^-1 t for chunk k: irfft(rfft(t) * w) on an FFT of length m >= t.size
+        (t zero-extended, the result truncated), in float32 if `single`. The
+        work buffers are allocated once (for the longest FFT) and reused: the
+        result is overwritten by the next call. ducc0 parallelizes a single 1D
+        FFT; batching chunks gave nothing on a full node (memory bound)."""
+        m, n, w = self._nfft[k], t.size, self.weights[k]
+        real, cplx = (np.float32, np.complex64) if single else (np.float64, np.complex128)
+        if real not in self._fftbuf:
+            mmax = max(self._nfft)
+            self._fftbuf[real] = (np.empty(mmax, real), np.empty(mmax // 2 + 1, cplx), np.empty(mmax, real))
+        tin, f, out = (b[:size] for b, size in zip(self._fftbuf[real], (m, m // 2 + 1, m)))
+        if m == n and not single and t.flags.c_contiguous:
+            tin = t
+        else:
+            tin[:n] = t
+            tin[n:] = 0.0
+        ducc0.fft.r2c(tin, out=f, nthreads=self.nthreads)
+        if single:
+            if id(w) not in self._w32:
+                self._w32[id(w)] = np.asarray(w, dtype=np.float32)
+            w = self._w32[id(w)]
+        f *= w
+        ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, out=out, nthreads=self.nthreads)
+        return out[:n]
+
+    def _apply(self, v=None, tod=None, exact=False):
         """P^T N^-1 P v or P^T N^-1 tod, one chunk at a time. v and the result
         are flat PCG vectors: this rank's pixels (ncomp, nloc) raveled, then the
-        unknowns of its flagged samples."""
+        unknowns of its flagged samples. FFTs in float32 only for P^T N^-1 P v
+        with fft_dtype=np.float32 and not `exact`."""
+        single = self._single and v is not None and not exact
         if self._buf is None:
             # the search direction for P, and the map for P^T
             self._full = np.empty((self.nobs, self.ncomp))
@@ -606,7 +632,7 @@ class GLS:
                 else:
                     t = np.empty(ip.size)
                     _project(ip, self._full, c2, s2, pol, loc, t)
-                _backproject(ip, _filter(t, self.weights[k], self.nthreads, self._nfft[k]), c2, s2, pol, self._edges, buf, self._locbuf)
+                _backproject(ip, self._filter(t, k, single), c2, s2, pol, self._edges, buf, self._locbuf)
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf])
 
     def _precond_flat(self, r):
@@ -642,19 +668,21 @@ class GLS:
         x = np.zeros_like(b)
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
-        r = b - self._apply(x)
+        r = b - self._apply(x, exact=True)
         z = self._precond_flat(r)
         d = z.copy()
         delta = self._dot(r, z)
         history = [self._dot(r, r) / bb]
+        true_residual = True  # r was computed as b - A x in float64
 
         it = 0
         while it < maxiter and (it == 0 or history[-1] > tol):
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
             x += alpha * d
-            if it % recompute_every == 0:
-                r = b - self._apply(x)  # true residual, avoids drift
+            true_residual = it % recompute_every == 0
+            if true_residual:
+                r = b - self._apply(x, exact=True)  # true residual, avoids drift
             else:
                 r -= alpha * q
             z = self._precond_flat(r)
@@ -663,12 +691,21 @@ class GLS:
             delta = delta_new
             history.append(self._dot(r, r) / bb)
             it += 1
+            if self._single and history[-1] <= tol and not true_residual:
+                # converged in single precision: check the true residual, and
+                # restart from it if it is not below tol
+                r = b - self._apply(x, exact=True)
+                history[-1] = self._dot(r, r) / bb
+                z = self._precond_flat(r)
+                d = z.copy()
+                delta = self._dot(r, z)
             if verbose and (self.comm is None or self.comm.rank == 0):
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
 
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history)}
         del b, r, z, d  # q does not exist if maxiter == 0
         self._full = self._buf = self._locbuf = None  # free the work maps before gathering the result
+        self._fftbuf = {}
         # full mask now, while all ranks are here, so that to_healpix is not collective
         self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
         return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
