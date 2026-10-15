@@ -4,7 +4,7 @@ import healpy as hp
 import numba
 import numpy as np
 
-from pysanepic import DetectorData, GLSParameters, Pointing, make_maps, resolve_nthreads
+from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, make_maps, resolve_nthreads
 from pysanepic.gls import numba_threads
 from test_mapmaker import _scan
 
@@ -37,7 +37,7 @@ def test_same_result_any_thread_count():
         data.append(
             DetectorData(
                 tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,
-                net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4, pol_angle_rad=pol_angle,
+                noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4), pol_angle_rad=pol_angle,
             )
         )
     # coordinates="G" exercises the numba rotation kernel and ducc0 with threads
