@@ -15,6 +15,8 @@ so new options need no change on the litebird_sim side.
 | `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of $P^T N^{-1} P$ per pixel; `"jacobi"`: original SANEPIC |
 | `tol`, `maxiter` | 1e-12, 2000 | The PCG stops when $\lvert r\rvert^2/\lvert b\rvert^2 <$ `tol` or after `maxiter` iterations |
 | `angle_dtype` | `np.float32` | Storage of 2a: float32 (angle error ~1e-7 rad) or `np.float64` (exact, 4 more bytes per sample) |
+| `flag_method` | `"marginalize"` | Flagged samples (`DetectorData.flags`) in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact) or `"offset"` (one offset per run, samples set to 0) |
+| `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run |
 
 The sections below explain how to choose them.
 
@@ -95,3 +97,26 @@ Twice the polarization angle, 2a, is computed in float64, reduced to
 irrelevant for any application; γ cos 2a and γ sin 2a are recomputed for each
 chunk when it is used. `angle_dtype=np.float64` stores 2a exactly at the cost
 of 4 more bytes per sample.
+
+## Flagged samples
+
+`DetectorData.flags` marks samples that must not enter the maps (glitches,
+gaps, manoeuvres, ...). Their TOD is never used, so it may be NaN, and they
+are not hits. They cannot simply be removed, because $N^{-1}$ is applied with
+FFTs on contiguous chunks; there are three ways to handle them:
+
+| | unknowns | result | memory | PCG |
+|---|---|---|---|---|
+| `flag_method="marginalize"` | one per flagged sample | exact GLS without them | ~70 bytes per flagged sample | slowed down by long gaps |
+| `flag_method="offset"` | one per run of flagged samples, set to 0 | no bias, nearly optimal | negligible | not slowed down |
+| splitting (`split_gap_s`) | none: the run is dropped and the chunk split | noise correlations across the gap neglected | less | not slowed down |
+
+Runs at least `split_gap_s` long are split, the shorter ones are handled by
+`flag_method`. Inside a long gap the unknowns of `"marginalize"` are strongly
+correlated by the 1/f noise and converge slowly: on two days of 4 detectors
+($f_\text{knee}$ = 50 mHz) a one-hour gap took the PCG from 25 to 71
+iterations, and splitting it (the default, 300 s) brought it back to 25. In
+the same test all the methods gave the same map errors (see the
+[flags notebook](notebooks/flags)). Splitting every run (`split_gap_s=0`) with
+many glitches makes many short chunks, which are slower.
+

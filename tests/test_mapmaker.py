@@ -7,6 +7,8 @@ rotation kernel is checked against an independent implementation.
 Run with: pytest tests/  (or: python tests/test_mapmaker.py)
 """
 
+import dataclasses
+
 import healpy as hp
 import numpy as np
 import pytest
@@ -174,7 +176,7 @@ def test_contiguous_run_kernel():
     c = rng.normal(size=(1, ns))
     c = c + c[:, (-np.arange(ns)) % ns]  # symmetric, like a circulant correlation
     fast = np.zeros((3, 6))
-    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, fast)
+    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, fast, 3, np.zeros(0))
     fast = fast[:, 0]
     t = np.arange(ns)
     brute = [c[0, (t[ip[0] == q][:, None] - t[ip[0] == q][None, :]) % ns].sum() for q in range(3)]
@@ -250,6 +252,80 @@ def test_noise_psd_in_make_maps():
         for kw in ({}, {"noise_psd": white})
     ]
     assert np.allclose(maps[0], maps[1], rtol=1e-8, atol=0)
+
+
+def test_flags_exact_gls():
+    """Flagged samples (pix < 0): the GLS solution equals the dense GLS on the
+    unflagged samples only, with their exact covariance N_uu."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(7)
+    npix, ns, nchunk, fs = 6, 128, 2, 10.0
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = one_over_f_weights(ns, fs, 1.0, 0.5, 1.0, 0.05)  # DC weight > 0: N invertible
+    flags = rng.random((nchunk, ns)) < 0.1
+    flags[0, 40:60] = True  # a gap
+    one_each = -1 - np.arange(ns)  # a distinct negative label per sample: one unknown each
+    g = GLS(np.where(flags, one_each, pix), psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0, angle_dtype=np.float64)
+    assert g.nflag == flags.sum()
+    m, info = g.solve(np.where(flags, np.nan, tod), tol=1e-26, maxiter=500)
+    assert info["converged"]
+
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+    cov = np.linalg.inv(np.fft.irfft(w, n=ns)[lag])  # N of a chunk
+    A, b = np.zeros((3 * npix, 3 * npix)), np.zeros(3 * npix)
+    for k in range(nchunk):
+        u = ~flags[k]
+        P = np.zeros((ns, 3 * npix))
+        P[np.arange(ns), pix[k]] = 1
+        P[np.arange(ns), npix + pix[k]] = np.cos(2 * psi[k])
+        P[np.arange(ns), 2 * npix + pix[k]] = np.sin(2 * psi[k])
+        Ninv = np.linalg.inv(cov[np.ix_(u, u)])
+        A += P[u].T @ Ninv @ P[u]
+        b += P[u].T @ Ninv @ tod[k][u]
+    ref = np.linalg.solve(A, b).reshape(3, npix)
+    assert np.abs(m - ref).max() < 1e-11 * np.abs(ref).max()
+    with pytest.raises(ValueError, match="flagged"):
+        g.rhs(tod)
+
+
+def test_flags_in_make_maps():
+    """Glitches and a gap, flagged: noiseless maps recover the sky whatever the
+    flagged TOD (NaN or huge), flagged samples are not hits; flags are checked."""
+    nside, n, fs = 16, 120_000, 10.0
+    rng = np.random.default_rng(3)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _four_detectors(n, fs, rng, sky, nside)
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
+    ref = make_maps(data, nside, coordinates="E", params=params)
+    out = {}
+    for bad in (np.nan, 1e3):
+        flagged = []
+        for d in data:
+            f = np.random.default_rng(1).random(n) < 0.02
+            f[5000:6000] = True
+            flagged.append(f)
+            # pad_s > 0 too: the padding must not use the flagged samples
+        # the gap (100 s) is split with split_gap_s=60
+        configs = [dict(pad_s=pad, flag_method=method, split_gap_s=split)
+                   for pad in (0.0, 120.0) for method in ("marginalize", "offset") for split in (np.inf, 60.0)]
+        res = [
+            make_maps([dataclasses.replace(d, tod=np.where(f, bad, d.tod), flags=f) for d, f in zip(data, flagged)],
+                      nside, coordinates="E", params=dataclasses.replace(params, **cfg))
+            for cfg in configs
+        ]
+        out[bad] = res
+    seen = ref.maps[1] != hp.UNSEEN
+    for res in out.values():
+        for r in res:
+            assert np.abs(r.maps[:, seen] - sky[:, seen]).max() < 1e-8 * np.abs(sky).max()
+    assert ref.hit_map.sum() - out[1e3][0].hit_map.sum() == sum(f.sum() for f in flagged)
+    with pytest.raises(ValueError, match="flags"):
+        dataclasses.replace(data[0], flags=np.zeros(n, int))
+    with pytest.raises(ValueError, match="flag_method"):
+        make_maps(data, nside, params=GLSParameters(flag_method="drop"))
 
 
 if __name__ == "__main__":

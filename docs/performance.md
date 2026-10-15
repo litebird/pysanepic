@@ -64,6 +64,9 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
   On a laptop (nside 1024, 4 processes × 2 threads, little data),
   distributing the PCG state took the peak per process from 324 to 142
   bytes per pixel, before the private maps of the threads were removed.
+- Flagged samples with `flag_method="marginalize"`: ~70 bytes per flagged
+  sample, on the process that holds it (its share of the PCG vectors);
+  negligible with `"offset"` or when the run is split (`split_gap_s`).
 - Pixel indices are int32, enough up to nside 8192. With MPI, the maps
   exchanged are limited by the int32 counts of MPI to nside 4096.
 

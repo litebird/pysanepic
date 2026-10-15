@@ -54,6 +54,7 @@ notebooks/lbs_example
 notebooks/preconditioner
 notebooks/padding
 notebooks/memory
+notebooks/flags
 ```
 
 ```{toctree}

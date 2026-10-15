@@ -75,6 +75,20 @@ filled with zeros or with an extrapolation of the data. Each margin is
 assigned to its own *virtual pixel*, an intensity offset solved together with
 the maps and then discarded, so the padding does not enter the maps.
 
+## Flagged samples
+
+Flagged samples point to *local unknowns*: intensity-only values that are
+not pixels of the map and belong to the process holding the samples, so they
+take no part in the reduce-scatter and allgather of the PCG; their TOD is set
+to 0. With one unknown per sample (`flag_method="marginalize"`) the solution
+is the exact GLS without the flagged samples: each of them is fitted freely,
+which is the same as removing it from the data while keeping the noise
+correlations of the others. With one unknown per run (`"offset"`) the zeros
+are exactly described by the offset, so there is no bias. The preconditioner
+of a local unknown is its diagonal element of $P^T N^{-1} P$. Long runs can
+instead split the chunk (`split_gap_s`), see
+[flagged samples](parameters.md#flagged-samples).
+
 ## Differences from the C++ SANEPIC
 
 - 3×3 block preconditioner (the C++ code has the Jacobi one, also available);
@@ -83,6 +97,8 @@ the maps and then discarded, so the padding does not enter the maps.
 - noise weights computed from (NET, $f_\text{knee}$, α, $f_\text{min}$),
   or from a tabulated spectrum given as arrays rather than read from files;
 - zero padding (`pad_fill="zeros"`) besides SANEPIC's extrapolation;
+- flagged samples (the C++ code reads the options `-G`, `-g` and `-M` but does
+  not use them);
 - MPI without a master process: each process handles its own data, and the
   PCG state is distributed over the processes by pixel (see
   [MPI](performance.md#mpi-and-threads)); threads within each process;
@@ -90,8 +106,6 @@ the maps and then discarded, so the padding does not enter the maps.
 
 ## Limitations
 
-- No flags: all samples of a `DetectorData` are used. Split the data around
-  gaps into several `DetectorData`.
 - No correlations between chunks or between detectors (see above).
 - No data splits (half-mission, detector subsets) in one call: run
   `make_maps` once per split.

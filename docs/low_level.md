@@ -11,7 +11,10 @@ length, or a list of 1D chunks and/or 2D blocks. `weights` has one row of
 length `ns//2 + 1` per chunk, the inverse noise power spectrum on the rfft
 grid, for example from {func}`~pysanepic.one_over_f_weights` or, for a
 tabulated spectrum, {func}`~pysanepic.psd_weights`; chunks may share the same
-array.
+array. Negative pixels mark flagged samples: samples of a chunk with the same
+negative value share an unknown that is not in the maps (one value per sample
+for the exact GLS without them); `apply_A` and `rhs` are then not available,
+use `solve`.
 
 ```python
 import numpy as np

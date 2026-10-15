@@ -86,10 +86,29 @@ def test_mpi_count_check():
         _check_mpi_count(12 * 8192**2 * 7)
 
 
+def test_flags_mpi():
+    """Flagged samples spread over the ranks: same maps as serial."""
+    comm = MPI.COMM_WORLD
+    rng = np.random.default_rng(2)
+    ns, nchunk, npix = 512, 3 * comm.size, 40
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.01), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    flags = rng.random((nchunk, ns)) < 0.05
+    pix[flags] = (-1 - np.arange(ns))[None].repeat(nchunk, 0)[flags]  # one unknown per sample
+    mine = slice(comm.rank, None, comm.size)
+    m, _ = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0).solve(tod[mine], tol=1e-24)
+    if comm.rank == 0:
+        ms, _ = GLS(pix, psi, w, min_pol_rcond=0.0).solve(tod, tol=1e-24)
+        assert np.allclose(m, ms, rtol=1e-9, atol=1e-12 * np.abs(ms).max())
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
     test_more_ranks_than_pixels()
     test_mpi_count_check()
+    test_flags_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")
