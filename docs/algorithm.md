@@ -36,7 +36,6 @@ Neglected:
 
 - correlations between different chunks, including two `DetectorData` of the
   same detector;
-- correlations between detectors (common-mode noise);
 - the non-periodicity of the noise within a chunk: an FFT joins the end of a
   chunk to its start. `pad_s` moves this junction outside the data, see
   [padding](parameters.md#padding).
@@ -45,6 +44,26 @@ The noise parameters or spectra are given by the user (or by litebird_sim,
 which uses those of the simulation), or estimated from the residual of a first
 map with {func}`~pysanepic.estimate_noise` (see
 [estimating the noise](usage.md#estimating-the-noise)).
+
+## Correlated noise
+
+For the chunks of a {class}`~pysanepic.DetectorGroup`, observed at the same
+times, $N(f) = D(f) + U\,\Lambda(f)\,U^T$ per frequency, with $D$ the own
+noise of the detectors, $U$ the couplings (detectors × modes) and $\Lambda$
+the spectra of the $r$ modes. With the Woodbury identity
+
+$$N^{-1} = D^{-1} - D^{-1} U M U^T D^{-1}, \qquad
+M = (I + \Lambda\, U^T D^{-1} U)^{-1}\,\Lambda,$$
+
+$N^{-1}$ costs $O(n_\text{det}\, r + r^3)$ per frequency besides the FFTs. It is
+applied in two passes over the detectors of the group: the first accumulates
+$z = \sum_i U_i D_i^{-1} \tilde t_i$ ($r$ spectra), the second computes
+$D_i^{-1}(\tilde t_i - U_i M z)$ for each detector, recomputing its FFT, so
+that only one detector is in memory at a time (1.5 times the FFTs of
+uncorrelated noise). The preconditioner uses $D$ only, so the PCG needs more
+iterations when the modes are strong. Q/U signal in pixels where Q/U are not
+solved (too few angles) is not modelled, and with correlated noise it leaks
+into other pixels.
 
 ## Preconditioner
 
@@ -114,7 +133,8 @@ instead split the chunk (`split_gap_s`), see
 
 ## Limitations
 
-- No correlations between chunks or between detectors (see above).
+- No correlations between chunks of time; correlations between detectors only
+  through common modes of a `DetectorGroup` (see above).
 - No data splits (half-mission, detector subsets) in one call: run
   `make_maps` once per split.
 - Every process still holds two full-size maps, the search direction for $P$

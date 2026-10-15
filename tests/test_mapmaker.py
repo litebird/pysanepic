@@ -235,6 +235,120 @@ def test_fft_float32():
         make_maps(data, nside, coordinates="E", params=dataclasses.replace(params, fft_dtype=np.float16))
 
 
+def test_common_modes_exact_gls():
+    """Chunks with common modes (N = D + U Lambda U^T per frequency, one or two
+    modes), plus an independent chunk and flagged samples: the GLS solution
+    equals the dense GLS with the full covariance of the group."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(17)
+    npix, ns, fs = 6, 96, 10.0
+    f = np.fft.rfftfreq(ns, 1 / fs)
+    for r in (1, 2):
+        pix = rng.integers(0, npix, (4, ns))  # chunks 0-2: a group observed together; 3: alone
+        psi = rng.uniform(0, np.pi, (4, ns))
+        tod = rng.normal(size=(4, ns))
+        w = np.array([one_over_f_weights(ns, fs, s, 0.5, 1.0, 0.05) for s in (1.0, 1.3, 0.8, 1.1)])
+        U = rng.uniform(0.5, 1.5, (3, r))
+        lam = np.array([3.0 / (1 + (f / (0.2 * (i + 1))) ** 2) for i in range(r)])  # red modes
+        flags = np.zeros((4, ns), bool)
+        flags[1, 30:36] = flags[3, 70] = True
+        labels = np.where(flags, -1 - np.arange(ns), pix)
+        g = GLS(labels, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, common_modes=[([0, 1, 2], U, lam)])
+        x, info = g.solve(np.where(flags, np.nan, tod), tol=1e-26, maxiter=1000)
+        assert info["converged"]
+
+        lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+        circ = lambda spec: np.fft.irfft(spec, n=ns)[lag]  # noqa: E731
+        Ng = np.block([[circ((i == j) / w[i] + (U[i] * U[j]) @ lam) for j in range(3)] for i in range(3)])
+        Ps, _ = _dense_gls(pix, psi, np.eye(ns), npix)
+        A, b = np.zeros((3 * npix, 3 * npix)), np.zeros(3 * npix)
+        for rows, N in ((list(range(3)), Ng), ([3], circ(1 / w[3]))):
+            P = np.vstack([Ps[k] for k in rows])
+            d = np.concatenate([tod[k] for k in rows])
+            keep = ~np.concatenate([flags[k] for k in rows])
+            Ninv = np.linalg.inv(N[np.ix_(keep, keep)])  # exact GLS without the flagged samples
+            A += P[keep].T @ Ninv @ P[keep]
+            b += P[keep].T @ Ninv @ d[keep]
+        ref = np.linalg.solve(A, b).reshape(3, npix)
+        assert np.abs(x - ref).max() < 1e-9 * np.abs(ref).max(), r
+    with pytest.raises(ValueError, match="common mode"):  # chunks of different lengths
+        GLS([pix[0, :50], pix[1, :48]], [psi[0, :50], psi[1, :48]],
+            [one_over_f_weights(50, fs, 1.0, 0.5, 1.0), one_over_f_weights(48, fs, 1.0, 0.5, 1.0)],
+            common_modes=[([0, 1], np.ones((2, 1)), np.ones((1, 26)))])
+
+
+def _group_data(rng, nside, sky, fs, chunk, nchunk, own, mode, coupling):
+    """Detectors observed at the same times (different pointings), each with
+    its own noise plus coupling[i] times a common mode."""
+    def draw(noise):
+        w = noise.weights(chunk, fs)
+        return np.concatenate([np.fft.irfft(np.fft.rfft(rng.normal(size=chunk)) / np.sqrt(w), n=chunk) for _ in range(nchunk)])
+
+    n = chunk * nchunk
+    c = draw(mode)
+    dets = []
+    for i, pa in enumerate(np.linspace(0, np.pi, len(coupling), endpoint=False)):
+        th, ph, psi = _scan(n, rng)
+        a = psi + pa
+        p = hp.ang2pix(nside, th, ph)
+        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a) + draw(own) + coupling[i] * c
+        dets.append(DetectorData(tod=tod, pointing=Pointing(theta=th, phi=ph, psi=psi, coordinates="E"),
+                                 sampling_rate_hz=fs, noise=own, pol_angle_rad=pa, name=f"d{i}"))
+    return dets
+
+
+def test_detector_group():
+    """make_maps with a DetectorGroup: noiseless data give back the sky; with a
+    red common mode the maps are much better than with the mode on the
+    diagonal; invalid groups are rejected."""
+    from pysanepic import CommonMode, DetectorGroup, TabulatedNoise
+
+    nside, fs, chunk = 16, 10.0, 6000
+    rng = np.random.default_rng(18)
+    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(6))
+    own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.02, alpha=1.0, fmin_hz=1e-4)
+    mode = OneOverFNoise(net_ukrts=20.0, fknee_hz=1.0, alpha=2.0, fmin_hz=1e-3)
+    coupling = np.array([1.0, 0.9, 1.1, 1.05])
+    dets = _group_data(rng, nside, sky, fs, chunk, 6, own, mode, coupling)
+    group = DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)])
+    params = GLSParameters(chunk_s=chunk / fs, tol=1e-10)
+
+    # noiseless: the sky back. Q/U are set to 0 where they are not solved (too
+    # few angles): that signal would leak into the other pixels through the
+    # correlated noise
+    p8 = dataclasses.replace(params, tol=1e-24, angle_dtype=np.float64)
+    solved = make_maps([group], nside, coordinates="E", params=dataclasses.replace(p8, maxiter=0)).maps[1] != hp.UNSEEN
+    sky0 = np.where(solved, sky, [[1.0], [0.0], [0.0]] * sky)
+    noiseless = DetectorGroup(detectors=[dataclasses.replace(d, tod=_signal(d, sky0, nside)) for d in dets], modes=group.modes)
+    r = make_maps([noiseless], nside, coordinates="E", params=p8)
+    seen = r.hit_map > 0
+    d = np.where(r.maps == hp.UNSEEN, 0.0, r.maps)[:, seen] - sky0[:, seen]
+    d[0] -= d[0].mean()  # the I monopole is degenerate with the offsets of 1/f noise
+    assert np.abs(d).max() < 1e-6 * np.abs(sky).max()
+
+    f = np.geomspace(fs / chunk, fs / 2, 200)
+    psd = lambda nz: 2 * (nz.net_ukrts * np.sqrt(fs) * 1e-6) ** 2 / fs * (f**nz.alpha + nz.fknee_hz**nz.alpha) / (f**nz.alpha + nz.fmin_hz**nz.alpha)  # noqa: E731
+    diag = [dataclasses.replace(d, noise=TabulatedNoise(freqs_hz=f, psd=psd(own) + c**2 * psd(mode))) for d, c in zip(dets, coupling)]
+    err = {}
+    for name, data in (("diag", diag), ("group", [group])):
+        r = make_maps(data, nside, coordinates="E", params=params)
+        assert r.converged
+        err[name] = np.std((r.maps - sky)[:, r.maps[1] != hp.UNSEEN])
+    assert err["group"] < 0.6 * err["diag"]
+    with pytest.raises(ValueError, match="coupling"):
+        DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling[:3], noise=mode)])
+    with pytest.raises(ValueError, match="same samples"):
+        DetectorGroup(detectors=[dets[0], dataclasses.replace(dets[1], sampling_rate_hz=5.0)], modes=[])
+
+
+def _signal(d, sky, nside):
+    """Noiseless TOD of a DetectorData (no HWP, Ecliptic pointing in the sky frame)."""
+    p = hp.ang2pix(nside, d.pointing.theta, d.pointing.phi)
+    a = d.pointing.psi + d.pol_angle_rad
+    return sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a)
+
+
 def test_pixel_order():
     """Counting sort == stable argsort, also with empty and unhit pixels."""
     from pysanepic.gls import _pixel_order

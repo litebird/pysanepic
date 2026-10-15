@@ -56,6 +56,7 @@ notebooks/padding
 notebooks/memory
 notebooks/flags
 notebooks/noise_estimation
+notebooks/correlated_noise
 ```
 
 ```{toctree}
