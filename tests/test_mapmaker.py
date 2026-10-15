@@ -291,8 +291,9 @@ def test_noise_classes_in_make_maps():
         for noise in (OneOverFNoise(net_ukrts=net), white)
     ]
     assert np.allclose(maps[0], maps[1], rtol=1e-8, atol=0)
-    keshner = OneOverFNoise(net_ukrts=net, fknee_hz=0.05, alpha=1.3, fmin_hz=1e-3, model="keshner")
-    assert np.allclose(keshner.weights(4096, fs), one_over_f_weights(4096, fs, sigma, 0.05, 1.3, 1e-3, "keshner"))
+    for model in ("toast", "keshner"):  # each model gives its own weights (toast is the default)
+        noise = OneOverFNoise(net_ukrts=net, fknee_hz=0.05, alpha=1.3, fmin_hz=1e-3, **({} if model == "toast" else {"model": model}))
+        assert np.allclose(noise.weights(4096, fs), one_over_f_weights(4096, fs, sigma, 0.05, 1.3, 1e-3, model))
 
 
 def test_flags_exact_gls():
@@ -367,6 +368,135 @@ def test_flags_in_make_maps():
         dataclasses.replace(data[0], flags=np.zeros(n, int))
     with pytest.raises(ValueError, match="flag_method"):
         make_maps(data, nside, params=GLSParameters(flag_method="drop"))
+
+
+def _dense_gls(pix, psi, cinv, npix, pol=True):
+    """Dense P (per chunk) and A = sum P^T Cinv P for small problems."""
+    ncomp = 3 if pol else 1
+    Ps = []
+    for k in range(pix.shape[0]):
+        ns = pix.shape[1]
+        P = np.zeros((ns, ncomp * npix))
+        P[np.arange(ns), pix[k]] = 1
+        if pol:
+            P[np.arange(ns), npix + pix[k]] = np.cos(2 * psi[k])
+            P[np.arange(ns), 2 * npix + pix[k]] = np.sin(2 * psi[k])
+        Ps.append(P)
+    return Ps, sum(P.T @ cinv @ P for P in Ps)
+
+
+def test_intensity_only():
+    """pol=False: (1, npix) maps, the intensity of an unpolarized sky recovered
+    with make_maps, and GLS without angles."""
+    from pysanepic import GLS, one_over_f_weights
+
+    nside, n, fs = 16, 120_000, 10.0
+    rng = np.random.default_rng(8)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky[1:] = 0
+    data = _four_detectors(n, fs, rng, sky, nside)
+    r = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, pol=False, tol=1e-24))
+    seen = r.maps[0] != hp.UNSEEN
+    assert r.maps.shape == (1, 12 * nside**2)
+    assert np.abs(r.maps[0, seen] - sky[0, seen]).max() < 1e-10 * np.abs(sky[0]).max()
+
+    pix = rng.integers(0, 5, (2, 64))
+    tod = rng.normal(size=(2, 64))
+    w = one_over_f_weights(64, 10.0, 1.0, 0.5, 1.0, 0.05)
+    m, _ = GLS(pix, None, np.tile(w, (2, 1))).solve(tod, tol=1e-26)
+    lag = (np.arange(64)[:, None] - np.arange(64)[None, :]) % 64
+    Ps, A = _dense_gls(pix, None, np.fft.irfft(w, n=64)[lag], 5, pol=False)
+    b = sum(P.T @ np.fft.irfft(w, n=64)[lag] @ t for P, t in zip(Ps, tod))
+    assert m.shape == (1, 5) and np.allclose(m[0], np.linalg.solve(A, b), rtol=1e-10)
+
+
+def test_low_level_api():
+    """GLS.apply_A and GLS.rhs equal P^T N^-1 P m and P^T N^-1 d; solve from
+    x0 = the solution stops at once."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(9)
+    npix, ns, nchunk = 6, 128, 3
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05)
+    g = GLS(pix, psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0, angle_dtype=np.float64)
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+    cinv = np.fft.irfft(w, n=ns)[lag]
+    Ps, A = _dense_gls(pix, psi, cinv, npix)
+    m = rng.normal(size=(3, npix))
+    assert np.allclose(g.apply_A(m).ravel(), A @ m.ravel(), rtol=1e-11, atol=0)
+    b = sum(P.T @ cinv @ t for P, t in zip(Ps, tod))
+    assert np.allclose(g.rhs(tod).ravel(), b, rtol=1e-11, atol=0)
+    ref = np.linalg.solve(A, b).reshape(3, npix)
+    x, info = g.solve(tod, x0=ref, tol=1e-20)
+    assert info["iterations"] <= 1 and np.abs(x - ref).max() < 1e-12 * np.abs(ref).max()
+
+
+def test_relative_detector_weights():
+    """White noise, detectors with very different NET: the GLS map is exactly
+    the binned map weighted by 1/sigma^2 (relative weights are right)."""
+    nside, n, fs = 8, 30_000, 10.0
+    rng = np.random.default_rng(10)
+    data, rows = [], []
+    for net, pol_angle in [(30.0, 0.0), (300.0, np.pi / 4), (60.0, np.pi / 8), (150.0, 3 * np.pi / 8)]:
+        theta, phi, psi = _scan(n, rng)
+        sigma = net * np.sqrt(fs) * 1e-6
+        tod = rng.normal(0, sigma, n)
+        data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="G"),
+                                 sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=net), pol_angle_rad=pol_angle))
+        rows.append((hp.ang2pix(nside, theta, phi), psi + pol_angle, tod, 1 / sigma**2))
+    # default min_pol_rcond: nearly degenerate Q/U pixels would amplify roundoff
+    params = GLSParameters(chunk_s=1000.0, tol=1e-26, angle_dtype=np.float64)
+    r = make_maps(data, nside, coordinates="G", params=params)
+
+    def binned(weighted):
+        npix = 12 * nside**2
+        M, v = np.zeros((npix, 3, 3)), np.zeros((npix, 3))
+        for p, a, t, wt in rows:
+            wt = wt if weighted else 1.0
+            u = np.stack([np.ones_like(a), np.cos(2 * a), np.sin(2 * a)], axis=1)
+            np.add.at(M, p, wt * u[:, :, None] * u[:, None, :])
+            np.add.at(v, p, wt * u * t[:, None])
+        return M, v
+
+    M, v = binned(True)
+    seen = r.maps[1] != hp.UNSEEN
+    ref = np.linalg.solve(M[seen], v[seen][..., None])[..., 0].T
+    assert np.abs(r.maps[:, seen] - ref).max() < 1e-9 * np.abs(ref).max()
+    M1, v1 = binned(False)  # equal weights: clearly different, so the test is sensitive
+    flat = np.linalg.solve(M1[seen], v1[seen][..., None])[..., 0].T
+    assert np.abs(flat - ref).max() > 0.1 * np.abs(ref).max()
+
+
+def test_noise_variance_monte_carlo():
+    """1/f noise drawn from the toast PSD written here: the scatter of the GLS
+    maps over realizations matches diag((P^T N^-1 P)^-1), with N from the same
+    PSD (so the weights of OneOverFNoise are checked against the noise)."""
+    from pysanepic import GLS
+
+    rng = np.random.default_rng(12)
+    npix, ns, nchunk, fs, net, fk, alpha, fmin = 5, 256, 4, 10.0, 50.0, 0.3, 1.5, 0.02
+    sigma = net * np.sqrt(fs) * 1e-6
+    f = np.fft.rfftfreq(ns, 1 / fs)
+    psd = sigma**2 * (f**alpha + fk**alpha) / (f**alpha + fmin**alpha)  # per-sample units
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = OneOverFNoise(net_ukrts=net, fknee_hz=fk, alpha=alpha, fmin_hz=fmin).weights(ns, fs)
+    g = GLS(pix, psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0, angle_dtype=np.float64)
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+    N = np.fft.irfft(psd, n=ns)[lag]  # circulant covariance with eigenvalues psd
+    _, A = _dense_gls(pix, psi, np.linalg.inv(N), npix)
+    expected = np.diag(np.linalg.inv(A)).reshape(3, npix)
+    nreal = 300
+    maps = np.empty((nreal, 3, npix))
+    for i in range(nreal):
+        noise = np.fft.irfft(np.fft.rfft(rng.normal(size=(nchunk, ns)), axis=1) * np.sqrt(psd), n=ns, axis=1)
+        maps[i], _ = g.solve(noise, tol=1e-20)
+    ratio = maps.var(axis=0) / expected
+    # each ratio has a relative error ~ sqrt(2 / nreal) = 8%
+    assert np.all(np.abs(ratio - 1) < 0.35) and abs(ratio.mean() - 1) < 0.06
 
 
 if __name__ == "__main__":
