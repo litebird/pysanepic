@@ -30,7 +30,10 @@ pointings of only one detector at a time):
 
 ```python
 import numpy as np
-from pysanepic import DetectorData, GLSParameters, Pointing, make_maps
+from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, make_maps
+
+
+noise = OneOverFNoise(net_ukrts=40.0, fknee_hz=0.02, alpha=1.0, fmin_hz=1e-5)
 
 
 def data():
@@ -43,7 +46,7 @@ def data():
             hwp_angle=None,  # rad, per sample; None without HWP
             pol_angle_rad=float(f["pol_angle"]),
             sampling_rate_hz=19.0,
-            net_ukrts=40.0, fknee_hz=0.02, alpha=1.0, fmin_hz=1e-5,
+            noise=noise,  # one object can serve all the time spans of a detector
         )
 
 
@@ -89,9 +92,7 @@ lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
 | `pol_angle_rad` | Polarization angle of the detector [rad] |
 | `pol_efficiency` | Polarization efficiency γ (default 1) |
 | `sampling_rate_hz` | Sampling rate [Hz] |
-| `net_ukrts`, `fknee_hz`, `alpha`, `fmin_hz` | 1/f noise parameters, see below |
-| `noise_model` | `"toast"` (default) or `"keshner"`: shape of the 1/f spectrum, see below |
-| `noise_psd` | `(freqs_hz, psd)`: a tabulated one-sided PSD [K²/Hz] that replaces the model, or `None` |
+| `noise` | The noise model: a `OneOverFNoise` or a `TabulatedNoise`, see below |
 | `flags` | Boolean array like `tod`, `True` for samples to exclude, or `None`; see [flagged samples](parameters.md#flagged-samples) |
 
 A detector observed in several stretches of time (e.g. one per day, as the
@@ -105,16 +106,17 @@ The conventions are the same as litebird_sim:
 - signal model: $d = I + \gamma\,(Q \cos 2a + U \sin 2a)$, with polarization
   angle $a = \psi + \text{pol\_angle}$ without HWP and
   $a = \psi + 2\,\text{hwp\_angle} - \text{pol\_angle}$ with an ideal HWP;
-- noise power spectrum, with $\sigma = \text{NET}\sqrt{f_s}$ the white-noise
-  rms per sample, as litebird_sim's `add_noise`:
-  - `noise_model="toast"`:
+- noise power spectrum (`DetectorData.noise`), with
+  $\sigma = \text{NET}\sqrt{f_s}$ the white-noise rms per sample, as
+  litebird_sim's `add_noise`:
+  - `OneOverFNoise(net_ukrts=..., fknee_hz=..., alpha=..., fmin_hz=..., model="toast")`:
     $P(f) = \sigma^2 \dfrac{f^\alpha + f_\text{knee}^\alpha}{f^\alpha + f_\text{min}^\alpha}$;
-  - `noise_model="keshner"`:
+  - `OneOverFNoise(..., model="keshner")`:
     $P(f) = \sigma^2 \left(\dfrac{f^2 + f_\text{knee}^2}{f^2 + f_\text{min}^2}\right)^{\alpha/2}$,
     the spectrum of litebird_sim's `engine="ducc"` (ducc0's `OofaNoise`);
-  - `noise_psd=(freqs_hz, psd)`: any one-sided PSD in K²/Hz (white noise is
-    $2\sigma^2/f_s$), interpolated linearly in log f – log P and held constant
-    outside the table, e.g. a spectrum estimated from the data;
+  - `TabulatedNoise(freqs_hz=..., psd=...)`: any one-sided PSD in K²/Hz (white
+    noise is $2\sigma^2/f_s$), interpolated linearly in log f – log P and held
+    constant outside the table, e.g. a measured or estimated spectrum;
 - pointings are rotated to the output `coordinates` by pysanepic, including the
   correction of ψ.
 

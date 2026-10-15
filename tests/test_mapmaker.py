@@ -13,7 +13,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, GLSParameters, Pointing, make_maps
+from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, make_maps, one_over_f_weights
 
 
 def _scan(n, rng):
@@ -48,7 +48,7 @@ def test_noiseless_recovers_sky():
         data.append(
             DetectorData(
                 tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), hwp_angle=hwp,
-                sampling_rate_hz=fs, net_ukrts=40.0, pol_angle_rad=pol_angle, pol_efficiency=gamma,
+                sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0), pol_angle_rad=pol_angle, pol_efficiency=gamma,
             )
         )
 
@@ -77,7 +77,7 @@ def _four_detectors(n, fs, rng, sky, nside, noise=False):
         data.append(
             DetectorData(
                 tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,
-                net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4, pol_angle_rad=pol_angle,
+                noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4), pol_angle_rad=pol_angle,
             )
         )
     return data
@@ -158,9 +158,9 @@ def test_pointing_checks():
             Pointing(**kw)
     p = Pointing(pix=np.zeros(n, int), nside=16, **ok)
     with pytest.raises(ValueError, match="11 samples"):
-        DetectorData(tod=np.zeros(11), pointing=p, sampling_rate_hz=1.0, net_ukrts=1.0)
+        DetectorData(tod=np.zeros(11), pointing=p, sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0))
     with pytest.raises(TypeError):
-        DetectorData(tod=np.zeros(n), pointing=None, sampling_rate_hz=1.0, net_ukrts=1.0)
+        DetectorData(tod=np.zeros(n), pointing=None, sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0))
 
 
 def test_contiguous_run_kernel():
@@ -231,27 +231,33 @@ def test_noise_models():
     assert np.allclose(psd_weights(ns, fs, ft, pt)[1:], keshner[1:], rtol=1e-4)
 
 
-def test_noise_psd_in_make_maps():
-    """DetectorData checks noise_model and noise_psd; a white tabulated PSD gives
-    the same map as the white NET model."""
+def test_noise_classes_in_make_maps():
+    """OneOverFNoise and TabulatedNoise check their values; DetectorData needs
+    one of them; a white tabulated PSD gives the same map as the NET model."""
     nside, n, fs, net = 8, 40_000, 10.0, 50.0
     rng = np.random.default_rng(5)
     theta, phi, psi = _scan(n, rng)
     ptg = Pointing(theta=theta, phi=phi, psi=psi, coordinates="G")
     tod = rng.normal(0, net * np.sqrt(fs) * 1e-6, n)
-    with pytest.raises(ValueError, match="noise_model"):
-        DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, net_ukrts=net, noise_model="pink")
-    with pytest.raises(ValueError, match="noise_psd"):
-        DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, net_ukrts=net, noise_psd=([0.0, 1.0], [1.0, 1.0]))
+    with pytest.raises(ValueError, match="model"):
+        OneOverFNoise(net_ukrts=net, model="pink")
+    with pytest.raises(ValueError, match="net_ukrts"):
+        OneOverFNoise(net_ukrts=0.0)
+    with pytest.raises(ValueError, match="frequencies"):
+        TabulatedNoise(freqs_hz=[0.0, 1.0], psd=[1.0, 1.0])
+    with pytest.raises(TypeError, match="noise"):
+        DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, noise=net)
     sigma = net * np.sqrt(fs) * 1e-6
-    white = np.array([1e-3, 5.0]), np.full(2, 2 * sigma**2 / fs)
+    white = TabulatedNoise(freqs_hz=[1e-3, 5.0], psd=np.full(2, 2 * sigma**2 / fs))
     params = GLSParameters(chunk_s=1000.0, tol=1e-14)
     maps = [
-        make_maps([DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, net_ukrts=net, **kw)],
+        make_maps([DetectorData(tod=tod, pointing=ptg, sampling_rate_hz=fs, noise=noise)],
                   nside, coordinates="G", params=params).maps
-        for kw in ({}, {"noise_psd": white})
+        for noise in (OneOverFNoise(net_ukrts=net), white)
     ]
     assert np.allclose(maps[0], maps[1], rtol=1e-8, atol=0)
+    keshner = OneOverFNoise(net_ukrts=net, fknee_hz=0.05, alpha=1.3, fmin_hz=1e-3, model="keshner")
+    assert np.allclose(keshner.weights(4096, fs), one_over_f_weights(4096, fs, sigma, 0.05, 1.3, 1e-3, "keshner"))
 
 
 def test_flags_exact_gls():

@@ -102,6 +102,63 @@ class Pointing:
 
 
 @dataclass(frozen=True, kw_only=True)
+class OneOverFNoise:
+    """1/f noise model of a detector, with sigma = net_ukrts * sqrt(fs) * 1e-6
+    the white-noise rms per sample [K] at sampling rate fs:
+
+    - `model="toast"` (default): P(f) = sigma^2 (f^alpha + fknee^alpha) /
+      (f^alpha + fmin^alpha);
+    - `model="keshner"`: P(f) = sigma^2 ((f^2 + fknee^2) / (f^2 +
+      fmin^2))^(alpha/2), litebird_sim's noise with engine="ducc".
+
+    fknee_hz = 0 is white noise. With fmin_hz = 0 the mean of each chunk is not
+    used. One object can be shared by all the stretches of time of a detector.
+    """
+
+    net_ukrts: float
+    fknee_hz: float = 0.0
+    alpha: float = 1.0
+    fmin_hz: float = 0.0
+    model: str = "toast"
+
+    def __post_init__(self):
+        if self.model not in ("toast", "keshner"):
+            raise ValueError(f"OneOverFNoise.model must be 'toast' or 'keshner', not {self.model!r}")
+        if not (self.net_ukrts > 0 and self.fknee_hz >= 0 and self.fmin_hz >= 0 and self.alpha > 0):
+            raise ValueError("OneOverFNoise: net_ukrts and alpha must be > 0, fknee_hz and fmin_hz >= 0")
+
+    def weights(self, ns, fs):
+        """Inverse PSD on the rfft grid of a chunk of ns samples at fs [Hz]."""
+        sigma = self.net_ukrts * np.sqrt(fs) * 1e-6
+        return one_over_f_weights(ns, fs, sigma, self.fknee_hz, self.alpha, self.fmin_hz, self.model)
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class TabulatedNoise:
+    """Noise of a detector given by a tabulated one-sided PSD `psd` [K^2/Hz] at
+    `freqs_hz` (increasing, > 0), interpolated linearly in log f - log P and
+    held constant outside the table: e.g. a measured or estimated spectrum.
+    White noise of rms sigma per sample at sampling rate fs is 2 sigma^2 / fs.
+    """
+
+    freqs_hz: np.ndarray
+    psd: np.ndarray
+
+    def __post_init__(self):
+        f, p = np.asarray(self.freqs_hz, dtype=float), np.asarray(self.psd, dtype=float)
+        if f.ndim != 1 or f.shape != p.shape or f.size < 2:
+            raise ValueError("TabulatedNoise: freqs_hz and psd must be 1D arrays of the same length >= 2")
+        if not (np.all(np.isfinite(f)) and np.all(np.isfinite(p)) and f[0] > 0 and np.all(np.diff(f) > 0) and np.all(p > 0)):
+            raise ValueError("TabulatedNoise: frequencies must be > 0 and increasing, the PSD finite and > 0")
+        object.__setattr__(self, "freqs_hz", f)
+        object.__setattr__(self, "psd", p)
+
+    def weights(self, ns, fs):
+        """Inverse PSD on the rfft grid of a chunk of ns samples at fs [Hz]."""
+        return psd_weights(ns, fs, self.freqs_hz, self.psd)
+
+
+@dataclass(frozen=True, kw_only=True)
 class DetectorData:
     """One detector over one contiguous stretch of time.
 
@@ -111,16 +168,9 @@ class DetectorData:
     The TOD model is d = I + pol_efficiency (Q cos 2a + U sin 2a) + noise, with
     `a` that angle.
 
-    Noise, one of:
-
-    - `noise_model="toast"` (default): P(f) = sigma^2 (f^alpha + fknee^alpha) /
-      (f^alpha + fmin^alpha);
-    - `noise_model="keshner"`: P(f) = sigma^2 ((f^2 + fknee^2) / (f^2 +
-      fmin^2))^(alpha/2), litebird_sim's noise with engine="ducc";
-    - `noise_psd=(freqs_hz, psd)`: a tabulated one-sided PSD in K^2/Hz, which
-      replaces the model (net_ukrts, fknee_hz, alpha, fmin_hz are not used);
-
-    with sigma = net_ukrts * sqrt(sampling_rate_hz) * 1e-6, i.e. TOD in K.
+    noise: the noise model, a :class:`OneOverFNoise` or a
+    :class:`TabulatedNoise` (any object with a `weights(ns, fs)` method giving
+    the inverse PSD on the rfft grid of a chunk), with the TOD in K.
 
     flags: boolean array like `tod`, True for samples to exclude (glitches,
     gaps, ...), or None. Flagged samples do not enter the maps and their TOD is
@@ -131,30 +181,18 @@ class DetectorData:
     tod: np.ndarray
     pointing: Pointing
     sampling_rate_hz: float
-    net_ukrts: float
-    fknee_hz: float = 0.0
-    alpha: float = 1.0
-    fmin_hz: float = 0.0
+    noise: OneOverFNoise | TabulatedNoise
     pol_angle_rad: float = 0.0
     pol_efficiency: float = 1.0
     hwp_angle: np.ndarray | None = None
-    noise_model: str = "toast"
-    noise_psd: tuple | None = None
     flags: np.ndarray | None = None
 
     def __post_init__(self):
         if self.flags is not None:
             if not (isinstance(self.flags, np.ndarray) and self.flags.dtype == bool and self.flags.shape == (len(self.tod),)):
                 raise ValueError("DetectorData.flags must be a boolean array with one value per sample (True = flagged)")
-        if self.noise_model not in ("toast", "keshner"):
-            raise ValueError(f"DetectorData.noise_model must be 'toast' or 'keshner', not {self.noise_model!r}")
-        if self.noise_psd is not None:
-            f, p = (np.asarray(x, dtype=float) for x in self.noise_psd)
-            if f.ndim != 1 or f.shape != p.shape or f.size < 2:
-                raise ValueError("DetectorData.noise_psd must be (freqs_hz, psd), two 1D arrays of the same length >= 2")
-            if not (np.all(np.isfinite(f)) and np.all(np.isfinite(p)) and f[0] > 0 and np.all(np.diff(f) > 0) and np.all(p > 0)):
-                raise ValueError("DetectorData.noise_psd: frequencies must be > 0 and increasing, the PSD finite and > 0")
-            object.__setattr__(self, "noise_psd", (f, p))
+        if not callable(getattr(self.noise, "weights", None)):
+            raise TypeError("DetectorData.noise must be a OneOverFNoise or a TabulatedNoise")
         if not isinstance(self.pointing, Pointing):
             raise TypeError("DetectorData.pointing must be a pysanepic.Pointing")
         if len(self.tod) != len(self.pointing):
@@ -365,20 +403,14 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     for d in data:  # one detector at a time: only its pointings are in memory
         pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
         fs = d.sampling_rate_hz
-        sigma = d.net_ukrts * np.sqrt(fs) * 1e-6
         m = int(round(params.pad_s * fs))
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
         gap = params.split_gap_s * fs
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, d.flags, gap)):
             n = b - a + 2 * m
-            if d.noise_psd is not None:
-                key = (n, fs, d.noise_psd[0].tobytes(), d.noise_psd[1].tobytes())  # by value: ids get reused
-                if key not in weights:
-                    weights[key] = psd_weights(n, fs, *d.noise_psd)
-            else:
-                key = (n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz, d.noise_model)
-                if key not in weights:
-                    weights[key] = one_over_f_weights(n, fs, sigma, d.fknee_hz, d.alpha, d.fmin_hz, d.noise_model)
+            key = (n, fs, d.noise)  # the dict keeps the noise objects alive: no reused ids
+            if key not in weights:
+                weights[key] = d.noise.weights(n, fs)
             w_c.append(weights[key])
             # 2a computed in float64, then stored as `dtype`; the margins of a
             # padded chunk carry no polarization (gamma = 0: intensity-only

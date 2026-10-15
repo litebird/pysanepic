@@ -11,6 +11,12 @@
 .. autoclass:: pysanepic.Pointing
    :members: pixels_and_psi
 
+.. autoclass:: pysanepic.OneOverFNoise
+   :members: weights
+
+.. autoclass:: pysanepic.TabulatedNoise
+   :members: weights
+
 .. autoclass:: pysanepic.GLSParameters
    :no-members:
 

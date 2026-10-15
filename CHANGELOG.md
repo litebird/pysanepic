@@ -4,10 +4,15 @@
 
 Changes on `main` that are not in a release yet.
 
-- Noise spectrum chosen by the user: `DetectorData.noise_model="keshner"`
-  (the spectrum of litebird_sim's noise with `engine="ducc"`) besides the
-  default `"toast"`, and `DetectorData.noise_psd=(freqs_hz, psd)`, a tabulated
-  one-sided PSD in K²/Hz that replaces the model. `one_over_f_weights` has a
+- **Breaking change**: the noise of a detector is an object,
+  `DetectorData(noise=...)`, instead of the fields `net_ukrts`, `fknee_hz`,
+  `alpha`, `fmin_hz`: `OneOverFNoise(net_ukrts, fknee_hz, alpha, fmin_hz,
+  model)` or `TabulatedNoise(freqs_hz, psd)`. Each checks its values and gives
+  the inverse PSD of a chunk with `weights(ns, fs)`; one object can serve all
+  the time spans of a detector.
+- `OneOverFNoise.model="keshner"` (the spectrum of litebird_sim's noise with
+  `engine="ducc"`) besides the default `"toast"`; `TabulatedNoise`, a
+  tabulated one-sided PSD in K²/Hz. For `GLS`, `one_over_f_weights` has a
   `model` argument and `psd_weights` computes the weights of a tabulated PSD.
 - Flagged samples: `DetectorData.flags` (boolean, `True` = excluded). Their TOD
   is not used (it may be NaN) and they are not hits. `GLSParameters.flag_method`
