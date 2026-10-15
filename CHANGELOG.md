@@ -4,6 +4,8 @@
 
 Changes on `main` that are not in a release yet.
 
+## 0.3.0 (2026-10-15)
+
 - **Breaking change**: the noise of a detector is an object,
   `DetectorData(noise=...)`, instead of the fields `net_ukrts`, `fknee_hz`,
   `alpha`, `fmin_hz`: `OneOverFNoise(net_ukrts, fknee_hz, alpha, fmin_hz,
