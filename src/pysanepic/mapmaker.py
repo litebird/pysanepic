@@ -613,7 +613,74 @@ def _fit_one_over_f(f, psd, fs, model):
                          alpha=float(q[2]), fmin_hz=float(np.exp(q[3])), model=model)
 
 
-def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None, nthreads=None):
+def _group_cross_spectra(g, result, chunk_s, nbins, nthreads, acc):
+    """Add the binned cross-periodograms of the residuals of the detectors of
+    DetectorGroup `g` to acc[names] = [fs, R (nbins, n, n), modes, sum of log f]."""
+    dets = g.detectors
+    if any(d.name is None for d in dets):
+        raise ValueError("estimate_noise: the detectors of a DetectorGroup need a name")
+    key, n, fs = tuple(d.name for d in dets), len(dets), dets[0].sampling_rate_hz
+    res = np.array([np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads) for d in dets])
+    good = np.ones(res.shape, bool)
+    for i, d in enumerate(dets):
+        if d.flags is not None:
+            good[i] = ~d.flags
+    res[~good] = 0.0
+    edges = np.geomspace(1.0 / chunk_s, fs / 2, nbins + 1)
+    a_ = acc.setdefault(key, [fs, np.zeros((nbins, n, n)), np.zeros(nbins), np.zeros(nbins)])
+    if a_[0] != fs:
+        raise ValueError(f"group {key!r}: different sampling rates")
+    for a, b in _chunk_bounds(res.shape[1], max(2, int(round(chunk_s * fs)))):
+        if good[:, a:b].mean(axis=1).min() < 0.5:
+            continue
+        win = np.hanning(b - a)
+        gw = good[:, a:b] * win
+        norm = 2.0 / (fs * (gw @ gw.T))  # flagged samples: normalized by the overlap of each pair
+        X = np.array([ducc0.fft.r2c(x * win, nthreads=nthreads) for x in res[:, a:b]])[:, 1:-1]
+        f = np.fft.rfftfreq(b - a, 1 / fs)[1:-1]
+        lo, hi = np.searchsorted(f, edges[:-1]), np.searchsorted(f, edges[1:])
+        for k in np.flatnonzero(hi > lo):
+            x = X[:, lo[k] : hi[k]]
+            a_[1][k] += norm * (x @ x.conj().T).real
+            a_[2][k] += hi[k] - lo[k]
+            a_[3][k] += np.log(f[lo[k] : hi[k]]).sum()
+
+
+def _fit_common_modes(R, w, r, maxiter=2000, tol=1e-10):
+    """EM fit of R_b = A diag(P_b) A^T + diag(N_b) to the averaged
+    cross-spectra R (nb, n, n), w (nb) modes per bin (the spectral matching
+    of SMICA, as in sanePS of the IAS SANEPIC). Returns A (n, r), each column
+    with rms 1, P (nb, r), N (nb, n)."""
+    nb, n, _ = R.shape
+    d = np.einsum("bii->bi", R)
+    _, V = np.linalg.eigh(np.einsum("b,bij->ij", w, R / d.mean(1)[:, None, None]))
+    A = V[:, ::-1][:, :r] * np.sqrt(n)
+    A *= np.where(A.sum(0) < 0, -1.0, 1.0)
+    P = np.tile(0.5 * d.mean(1)[:, None] / r, (1, r))
+    N = 0.5 * d
+    last = None
+    for _ in range(maxiter):
+        # E step: moments of the modes given the data, per bin
+        C = np.linalg.inv(np.einsum("ia,bi,ic->bac", A, 1 / N, A) + np.eye(r) / P[:, :, None])
+        W = np.einsum("bac,ic,bi->bai", C, A, 1 / N)
+        Rxs = np.einsum("bij,baj->bia", R, W)
+        Rss = np.einsum("bai,bij,bcj->bac", W, R, W) + C
+        # M step: A row by row (the own noise depends on the bin), then P and N
+        for i in range(n):
+            A[i] = np.linalg.solve(np.einsum("b,bac->ac", w / N[:, i], Rss), np.einsum("b,ba->a", w / N[:, i], Rxs[:, i]))
+        P = np.einsum("baa->ba", Rss)
+        AR = np.einsum("ia,bja->bij", A, Rxs)
+        N = np.maximum(np.einsum("bii->bi", R - AR - AR.transpose(0, 2, 1) + np.einsum("ia,bac,jc->bij", A, Rss, A)), 1e-6 * d)
+        SR = np.linalg.solve(np.einsum("ia,ba,ja->bij", A, P, A) + N[:, :, None] * np.eye(n), R)
+        crit = np.sum(w * (np.einsum("bii->b", SR) - np.linalg.slogdet(SR)[1] - n))
+        if last is not None and abs(last - crit) <= tol * abs(crit):
+            break
+        last = crit
+    s = np.sqrt(np.mean(A**2, axis=0))
+    return A / s, P * s**2, N
+
+
+def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None, nthreads=None, n_modes=1):
     """Noise spectrum of each detector from the residual of a map.
 
     The residual d - P m of each DetectorData, with m the maps of `result`
@@ -623,9 +690,19 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
     DetectorData with the same `name` (on all MPI processes), in `nbins`
     logarithmic bins from 1/chunk_s to fs/2.
 
+    For a DetectorGroup the cross-spectra of its detectors are averaged in the
+    same way over all the groups with the same detectors (e.g. the days of a
+    wafer), and fitted with `n_modes` common modes plus the own noise of each
+    detector, R(f) = A P(f) A^T + diag N(f), by expectation-maximization (as
+    sanePS of the IAS SANEPIC). The modes of the group in `data` are not used.
+
     Returns a dict {name: noise}: a TabulatedNoise with the binned one-sided
     PSD [K^2/Hz], or with `fit="toast"` or `"keshner"` a OneOverFNoise fitted
     to it. DetectorData without a name are keyed by their position in `data`.
+    For the detectors of a group the noise is their own noise, and the key
+    tuple(names) gives the list of the `n_modes` CommonMode (couplings with
+    rms 1), so that ``DetectorGroup(detectors=[replace(d, noise=est[d.name])
+    ...], modes=est[names])`` uses the estimate.
 
     The residual misses the part of the noise that the map absorbs (small
     when there are many more samples than pixels; mostly at the harmonics of
@@ -633,7 +710,11 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
     """
     nthreads = resolve_nthreads(nthreads)
     acc = {}  # name -> [fs, sum of P per bin, count per bin, sum of log f per bin]
+    gacc = {}  # names of a group -> [fs, sum of the cross-spectra per bin, count, sum of log f]
     for i, d in enumerate(data):
+        if isinstance(d, DetectorGroup):
+            _group_cross_spectra(d, result, chunk_s, nbins, nthreads, gacc)
+            continue
         key = i if d.name is None else d.name
         fs = d.sampling_rate_hz
         res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads)
@@ -656,19 +737,35 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
             np.add.at(a_[1], k[ok], p[1:-1][ok])
             np.add.at(a_[2], k[ok], 1)
             np.add.at(a_[3], k[ok], np.log(f[1:-1][ok]))
-    if comm is not None:  # the DetectorData of a detector may be on several processes
-        merged = {}
-        for part in comm.allgather(acc):
-            for key, (fs, s, n, lf) in part.items():
-                m = merged.setdefault(key, [fs, np.zeros_like(s), np.zeros_like(n), np.zeros_like(lf)])
-                m[1] += s
-                m[2] += n
-                m[3] += lf
-        acc = merged
+    if comm is not None:  # the DetectorData of a detector (or the groups of a wafer) may be on several processes
+        merged, gmerged = {}, {}
+        for part, gpart in comm.allgather((acc, gacc)):
+            for src, dst in ((part, merged), (gpart, gmerged)):
+                for key, (fs, s, n, lf) in src.items():
+                    m = dst.setdefault(key, [fs, np.zeros_like(s), np.zeros_like(n), np.zeros_like(lf)])
+                    m[1] += s
+                    m[2] += n
+                    m[3] += lf
+        acc, gacc = merged, gmerged
+    grouped = {name for key in gacc for name in key}
+    if grouped & set(acc) or len(grouped) != sum(len(key) for key in gacc):
+        raise ValueError("estimate_noise: a detector is in different groups, or both alone and in a group")
+
+    def noise(f, psd, fs):
+        return TabulatedNoise(freqs_hz=f, psd=psd) if fit is None else _fit_one_over_f(f, psd, fs, fit)
+
     out = {}
     for key, (fs, s, n, lf) in acc.items():
         ok = n > 0
-        f, psd = np.exp(lf[ok] / n[ok]), s[ok] / n[ok]
-        out[key] = TabulatedNoise(freqs_hz=f, psd=psd) if fit is None else _fit_one_over_f(f, psd, fs, fit)
+        out[key] = noise(np.exp(lf[ok] / n[ok]), s[ok] / n[ok], fs)
+    for key, (fs, R, n, lf) in gacc.items():
+        if (len(key) - n_modes) ** 2 < len(key) + n_modes:
+            raise ValueError(f"estimate_noise: {n_modes} common modes cannot be estimated from {len(key)} detectors")
+        ok = n > 0
+        f = np.exp(lf[ok] / n[ok])
+        A, P, N = _fit_common_modes(R[ok] / n[ok][:, None, None], n[ok], n_modes)
+        for i, name in enumerate(key):
+            out[name] = noise(f, N[:, i], fs)
+        out[key] = [CommonMode(coupling=A[:, k], noise=noise(f, P[:, k], fs)) for k in range(n_modes)]
     return out
 

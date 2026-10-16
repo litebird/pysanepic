@@ -184,6 +184,34 @@ stays in the residual. Both are small when the samples far outnumber the
 pixels and the sky is smooth on the scale of the pixels; the second map is
 unbiased in any case, at most slightly less optimal.
 
+### Common modes
+
+For a {class}`~pysanepic.DetectorGroup` the cross-spectra of its detectors are
+averaged over all the groups with the same detectors (e.g. the days of a
+wafer, also across MPI processes) and fitted with `n_modes` common modes
+(default 1) plus the own noise of each detector,
+$R(f) = A\,P(f)\,A^T + \mathrm{diag}\,N(f)$, by expectation-maximization, the
+spectral matching of `sanePS` in the IAS version of SANEPIC. The modes given
+in the group are not used. The result has the own noise of each detector
+under its name, and the list of `CommonMode` (couplings with rms 1) under the
+tuple of the names:
+
+```python
+first = make_maps(groups, nside)  # e.g. ignoring the correlation
+est = estimate_noise(groups, first, chunk_s=86400.0)
+names = tuple(d.name for d in groups[0].detectors)
+estimated = [DetectorGroup(detectors=[dataclasses.replace(d, noise=est[d.name]) for d in g.detectors],
+                           modes=est[names]) for g in groups]
+maps = make_maps(estimated, nside, params=GLSParameters(coarse_nside=1))
+```
+
+On G100 (16 days, 8 detectors of a wafer, nside 512, half of the noise
+variance in a common mode) the couplings are found within 0.1% and the
+spectra within 5% above 1 mHz; the I map with the estimated mode differs from
+that with the true one by 1% of its noise. The detectors of a group need a
+name; with $n$ detectors at most the $r$ modes with $(n-r)^2 \ge n + r$ can be
+estimated (1 mode from 3 detectors).
+
 ## Correlated noise
 
 Detectors observed at the same times may share noise, e.g. a common mode of

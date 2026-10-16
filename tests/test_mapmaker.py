@@ -307,6 +307,61 @@ def test_coarse_preconditioner():
             make_maps(group, nside, coordinates="E", params=dataclasses.replace(params, coarse_nside=bad))
 
 
+def test_estimate_common_modes():
+    """estimate_noise on DetectorGroups (the same detectors on several groups of
+    days, one with flagged samples) finds the couplings and spectra of the
+    common mode and the own noise, and the maps with the estimate are as good
+    as with the true model; invalid inputs are rejected."""
+    from pysanepic import CommonMode, DetectorGroup, estimate_noise
+
+    nside, fs, chunk = 16, 10.0, 36000
+    rng = np.random.default_rng(22)
+    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(6))
+    own = OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4)
+    mode = OneOverFNoise(net_ukrts=30.0, fknee_hz=0.2, alpha=1.5, fmin_hz=1e-4)
+    coupling = rng.uniform(0.6, 0.9, 6)
+    groups = []
+    for _ in range(2):  # e.g. two days of a wafer
+        dets = _group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
+        groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)]))
+    flags = np.zeros(len(dets[0].tod), bool)
+    flags[5000:9000] = True
+    groups[1].detectors[2] = dataclasses.replace(groups[1].detectors[2], flags=flags)
+    params = GLSParameters(chunk_s=chunk / fs, tol=1e-10, coarse_nside=1)
+    first = make_maps([d for g in groups for d in g.detectors], nside, coordinates="E", params=params)
+    est = estimate_noise(groups, first, chunk_s=chunk / fs, nbins=30)
+    names = tuple(d.name for d in dets)
+    (cm,) = est[names]
+    scale = np.sqrt(np.mean(coupling**2))
+    assert np.allclose(cm.coupling * scale, coupling, rtol=0.03), cm.coupling * scale / coupling
+    f = cm.noise.freqs_hz
+    k = np.round(f * chunk / fs).astype(int)
+    ratio_mode = mode.weights(chunk, fs)[k] / (cm.noise.weights(chunk, fs)[k] * scale**2)
+    ratio_own = own.weights(chunk, fs)[k] / est[names[0]].weights(chunk, fs)[k]
+    # few modes per bin at low frequencies, and the map absorbs part of the
+    # noise at the scan harmonics: exact only at high frequencies
+    high = f > 0.2
+    assert np.all(np.abs(ratio_mode[high] - 1) < 0.1) and np.all(np.abs(ratio_own[high] - 1) < 0.1)
+    assert abs(np.median(ratio_mode[f > 1e-3]) - 1) < 0.2 and abs(np.median(ratio_own[f > 1e-3]) - 1) < 0.2
+
+    def rms_err(gs):
+        r = make_maps(gs, nside, coordinates="E", params=params)
+        seen = r.maps[1] != hp.UNSEEN
+        return np.std((r.maps - sky)[0, seen])
+
+    estimated = [DetectorGroup(detectors=[dataclasses.replace(d, noise=est[d.name]) for d in g.detectors], modes=est[names]) for g in groups]
+    true_err, est_err = rms_err(groups), rms_err(estimated)
+    ignored = np.std((first.maps - sky)[0, first.maps[1] != hp.UNSEEN])
+    assert est_err < 1.02 * true_err < 0.9 * ignored, (est_err, true_err, ignored)
+
+    with pytest.raises(ValueError, match="need a name"):
+        estimate_noise([DetectorGroup(detectors=[dataclasses.replace(d, name=None) for d in dets], modes=[])], first)
+    with pytest.raises(ValueError, match="cannot be estimated"):
+        estimate_noise([DetectorGroup(detectors=dets[:2], modes=[])], first, nbins=10)
+    with pytest.raises(ValueError, match="both alone"):
+        estimate_noise([groups[0], dets[0]], first, nbins=10)
+
+
 def _group_data(rng, nside, sky, fs, chunk, nchunk, own, mode, coupling):
     """Detectors observed at the same times (different pointings), each with
     its own noise plus coupling[i] times a common mode."""
