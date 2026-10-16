@@ -278,6 +278,35 @@ def test_common_modes_exact_gls():
             common_modes=[([0, 1], np.ones((2, 1)), np.ones((1, 26)))])
 
 
+def test_coarse_preconditioner():
+    """The two-level preconditioner (coarse_nside) gives the same maps in
+    fewer iterations with a common mode, also with padding (virtual pixels)
+    and flagged samples; invalid values are rejected."""
+    from pysanepic import CommonMode, DetectorGroup
+
+    nside, fs, chunk = 16, 10.0, 6000
+    rng = np.random.default_rng(21)
+    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(6))
+    own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4)
+    coupling = np.full(4, np.sqrt(0.5))
+    dets = _group_data(rng, nside, sky, fs, chunk, 6, own, own, coupling)
+    flags = np.zeros(len(dets[0].tod), bool)
+    flags[1000:1010] = True
+    dets[1] = dataclasses.replace(dets[1], flags=flags)
+    group = [DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=own)])]
+    params = GLSParameters(chunk_s=chunk / fs, tol=1e-14, pad_s=60.0, split_gap_s=np.inf)
+    ref = make_maps(group, nside, coordinates="E", params=params)
+    for nc in (1, 2):
+        r = make_maps(group, nside, coordinates="E", params=dataclasses.replace(params, coarse_nside=nc))
+        assert r.converged and r.iterations < ref.iterations - 5, (nc, r.iterations, ref.iterations)
+        seen = ref.maps != hp.UNSEEN
+        assert np.array_equal(seen, r.maps != hp.UNSEEN)
+        assert np.abs(r.maps[seen] - ref.maps[seen]).max() < 1e-5 * np.abs(ref.maps[seen]).max()
+    for bad in (3, 32, -1):
+        with pytest.raises(ValueError, match="coarse_nside"):
+            make_maps(group, nside, coordinates="E", params=dataclasses.replace(params, coarse_nside=bad))
+
+
 def _group_data(rng, nside, sky, fs, chunk, nchunk, own, mode, coupling):
     """Detectors observed at the same times (different pointings), each with
     its own noise plus coupling[i] times a common mode."""

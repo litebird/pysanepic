@@ -4,6 +4,12 @@
 
 Changes on `main` that are not in a release yet.
 
+- Two-level preconditioner, `GLSParameters.coarse_nside` (and `GLS(coarse=...)`):
+  the PCG also solves exactly for the I map at a coarse resolution, which
+  takes care of the slow large-scale modes. With a common mode `coarse_nside=1`
+  halves the iterations (46 → 21) and the GLS time drops by 33% on G100. The
+  default stays 0 (off): without common modes the setup costs more than the
+  iterations it saves.
 - Correlated noise: `DetectorGroup(detectors, modes=[CommonMode(coupling,
   noise)])` for detectors observed at the same times that share common
   modes, $N = D + U \Lambda U^T$ per frequency, applied with the Woodbury

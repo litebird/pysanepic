@@ -18,6 +18,7 @@ so new options need no change on the litebird_sim side.
 | `flag_method` | `"marginalize"` | Flagged samples (`DetectorData.flags`) in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact) or `"offset"` (one offset per run, samples set to 0) |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
+| `coarse_nside` | 0 | Two-level preconditioner: also solve exactly for the I map at this resolution (a power of 2); 1 with common modes, see [Preconditioner](#preconditioner). 0: off |
 
 The sections below explain how to choose them.
 
@@ -90,6 +91,25 @@ uniform coverage of polarization angles. With a good coverage (Q-type and
 U-type detectors) they converge equally fast; with a single pair of detectors
 the block preconditioner needs less than half the iterations. Both converge to
 the same map.
+
+`coarse_nside` adds a coarse correction for the large-scale modes of I (see
+[two-level preconditioner](algorithm.md#two-level-preconditioner)): its setup
+costs about one iteration per coarse pixel, 12 at `coarse_nside=1`. On G100
+(16 days, 8 detectors of a wafer, nside 512, half of the noise variance in a
+common mode):
+
+| GLS | `coarse_nside` | iterations | setup | total time |
+|---|---|---|---|---|
+| common mode modelled | 0 | 46 | – | 285 s |
+| | 1 | 21 | 54 s | 191 s |
+| | 2 | 22 | 247 s | 403 s |
+| | 4 | 22 | 969 s | 1124 s |
+| correlation ignored | 0 | 20 | – | 79 s |
+| | 1 | 13 | 31 s | 91 s |
+
+With common modes `coarse_nside=1` is the best choice (−33% time); higher
+resolutions only add setup. Without them the iterations saved do not pay for
+the setup, so the default is 0. The maps are the same within the tolerance.
 
 ## Angle precision
 
