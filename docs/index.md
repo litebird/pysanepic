@@ -57,6 +57,7 @@ notebooks/memory
 notebooks/flags
 notebooks/noise_estimation
 notebooks/correlated_noise
+notebooks/common_mode_estimation
 ```
 
 ```{toctree}

@@ -155,6 +155,31 @@ def test_detector_groups_mpi():
             assert abs(res.iterations - ref.iterations) <= 1
 
 
+def test_estimate_common_modes_mpi():
+    """Groups of the same detectors on different ranks: same estimate as serial."""
+    from pysanepic import CommonMode, DetectorGroup, GLSParameters, OneOverFNoise, estimate_noise, make_maps
+    from test_mapmaker import _group_data
+
+    comm = MPI.COMM_WORLD
+    nside, fs, chunk = 8, 10.0, 4000
+    rng = np.random.default_rng(23)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-3)
+    mode = OneOverFNoise(net_ukrts=30.0, fknee_hz=0.2, alpha=1.5, fmin_hz=1e-3)
+    coupling = rng.uniform(0.6, 0.9, 4)
+    groups = [DetectorGroup(detectors=_group_data(rng, nside, sky, fs, chunk, 2, own, mode, coupling), modes=[CommonMode(coupling=coupling, noise=mode)])
+              for _ in range(3)]
+    kw = dict(chunk_s=chunk / fs, nbins=12)
+    first = make_maps(groups, nside, coordinates="E", params=GLSParameters(chunk_s=chunk / fs, tol=1e-10))
+    est = estimate_noise(groups[comm.rank :: comm.size], first, comm=comm, **kw)
+    if comm.rank == 0:
+        ref = estimate_noise(groups, first, **kw)
+        names = tuple(d.name for d in groups[0].detectors)
+        assert np.allclose(est[names][0].coupling, ref[names][0].coupling, rtol=1e-8)
+        assert np.allclose(est[names][0].noise.psd, ref[names][0].noise.psd, rtol=1e-8)
+        assert all(np.allclose(est[n].psd, ref[n].psd, rtol=1e-8) for n in names)
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
@@ -163,5 +188,6 @@ if __name__ == "__main__":
     test_flags_mpi()
     test_estimate_noise_mpi()
     test_detector_groups_mpi()
+    test_estimate_common_modes_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

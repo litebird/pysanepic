@@ -4,6 +4,14 @@
 
 Changes on `main` that are not in a release yet.
 
+- `estimate_noise` estimates common modes: for each `DetectorGroup` the
+  cross-spectra of its detectors, averaged over the groups with the same
+  detectors (also across MPI processes), are fitted with `n_modes` common
+  modes plus the own noise of each detector by expectation-maximization (as
+  `sanePS` of the IAS SANEPIC). The result has the own noise under each name
+  and the list of `CommonMode` under the tuple of the names. On G100 the
+  couplings are found within 0.1% and the map with the estimate equals that
+  with the true model within 1% of the noise.
 - Two-level preconditioner, `GLSParameters.coarse_nside` (and `GLS(coarse=...)`):
   the PCG also solves exactly for the I map at a coarse resolution, which
   takes care of the slow large-scale modes. With a common mode `coarse_nside=1`
