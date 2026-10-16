@@ -4,6 +4,8 @@
 
 Changes on `main` that are not in a release yet.
 
+## 0.4.0 (2026-10-17)
+
 - `estimate_noise` estimates common modes: for each `DetectorGroup` the
   cross-spectra of its detectors, averaged over the groups with the same
   detectors (also across MPI processes), are fitted with `n_modes` common
