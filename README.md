@@ -11,6 +11,8 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
   intensity and polarization. An ideal HWP is supported too.
 - Pure Python with numba and ducc0; runs with MPI (mpi4py) and threads.
 - Supports polarization efficiency and any coordinate system.
+- Noise correlated between detectors (common modes of a wafer), with a
+  two-level preconditioner for the large scales (`GLSParameters.coarse_nside`).
 - Independent of any simulation pipeline: data are passed as plain arrays.
 - Validated against the original C++ code, which is kept in `cpp/`.
 

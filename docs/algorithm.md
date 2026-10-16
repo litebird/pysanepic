@@ -60,8 +60,9 @@ applied in two passes over the detectors of the group: the first accumulates
 $z = \sum_i U_i D_i^{-1} \tilde t_i$ ($r$ spectra), the second computes
 $D_i^{-1}(\tilde t_i - U_i M z)$ for each detector, recomputing its FFT, so
 that only one detector is in memory at a time (1.5 times the FFTs of
-uncorrelated noise). The preconditioner uses $D$ only, so the PCG needs more
-iterations when the modes are strong. Q/U signal in pixels where Q/U are not
+uncorrelated noise). The block preconditioner uses $D$ only, so the PCG needs
+more iterations when the modes are strong, unless the two-level preconditioner
+is used (see [below](#two-level-preconditioner)). Q/U signal in pixels where Q/U are not
 solved (too few angles) is not modelled, and with correlated noise it leaks
 into other pixels.
 
@@ -80,6 +81,23 @@ computed at setup over all pairs of samples of a chunk falling in the same
 pixel. For white noise it is the inverse covariance of the binned map.
 SANEPIC's `"jacobi"` preconditioner keeps the exact I diagonal and uses
 $2/\text{diag}_I$ for Q and U.
+
+## Two-level preconditioner
+
+A preconditioner local to each pixel cannot fix the slowest modes of the
+PCG, the large-scale modes of I: with common modes between detectors there are
+a dozen eigenvalues of the preconditioned system much smaller than the others,
+and the iterations double. With `coarse_nside` the preconditioner becomes
+
+$$M_2 = M + Z\,E^{-1} Z^T, \qquad E = Z^T P^T N^{-1} P\, Z,$$
+
+with $Z$ the indicators (in I) of the pixels of a coarse HEALPix map: the
+coarse I map is solved exactly at every iteration. $E$ is computed at setup,
+one product by $P^T N^{-1} P$ per coarse pixel, about one PCG iteration each;
+afterwards $M_2$ costs two sums over the coarse pixels. This is the additive
+two-level preconditioner of Grigori, Stompor & Szydlarski (2012), with a
+coarse space of piecewise-constant maps instead of eigenvectors. The C++
+SANEPIC uses the Jacobi preconditioner only.
 
 ## Iterations
 

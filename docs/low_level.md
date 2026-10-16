@@ -50,6 +50,8 @@ of `GLS`:
 - `psi=None` for intensity only;
 - `comm` and `nthreads`, as in `make_maps`;
 - `preconditioner`, `min_pol_rcond`, `min_pol_hits`, `angle_dtype`.
+- `coarse`: a function giving the coarse pixel of each pixel label (−1: none)
+  for the two-level preconditioner; make_maps builds it from `coarse_nside`.
 
 `GLS.apply_A` ($P^T N^{-1} P$ on a map) and `GLS.rhs` ($P^T N^{-1} d$) are
 public, e.g. to use another solver. With MPI they work on the pixels owned by

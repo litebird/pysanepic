@@ -304,6 +304,13 @@ class GLSParameters:
         chunk, and their samples are dropped: the noise correlations across
         the gap are neglected, but long gaps do not slow down the PCG. inf:
         never; 0: every run.
+    coarse_nside : two-level preconditioner: the PCG also solves exactly for
+        the I map at this HEALPix resolution (power of 2, <= nside), which
+        takes care of the slow large-scale modes. The setup costs about one
+        PCG iteration per coarse pixel (12 at coarse_nside=1). With common
+        modes 1 halves the iterations (46 -> 21 on G100, -33% time); without
+        them it saves fewer iterations than its setup costs. 0 (default):
+        off.
     """
 
     chunk_s: float = 3600.0
@@ -318,6 +325,7 @@ class GLSParameters:
     flag_method: str = "marginalize"
     split_gap_s: float = 300.0
     fft_dtype: type = np.float64
+    coarse_nside: int = 0
 
 
 @numba.njit(parallel=True, cache=True)
@@ -413,6 +421,19 @@ def _flag_labels(f, method):
     return np.repeat(-1 - np.arange(starts.size, dtype=np.int32), stops - starts)
 
 
+def _coarse_pixels(nside, coarse_nside):
+    """Pixel labels (RING, nside; virtual pixels beyond) -> coarse pixel (NESTED, coarse_nside), or -1."""
+    shift = 2 * (int(nside).bit_length() - int(coarse_nside).bit_length())
+
+    def coarse(labels):
+        out = np.full(labels.size, -1, np.int64)
+        real = labels < 12 * nside * nside
+        out[real] = hp.ring2nest(nside, labels[real]) >> shift
+        return out
+
+    return coarse
+
+
 def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=None, verbose=False):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
 
@@ -438,6 +459,9 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     params = GLSParameters() if params is None else params
     if params.flag_method not in ("marginalize", "offset"):
         raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize' or 'offset'")
+    nc = params.coarse_nside
+    if nc < 0 or (nc and (nc & (nc - 1) or nc > nside)):
+        raise ValueError(f"coarse_nside must be 0 or a power of 2 <= nside, not {nc}")
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
@@ -523,6 +547,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         fft_lengths=nfft_c,
         fft_dtype=params.fft_dtype,
         common_modes=common_modes,
+        coarse=_coarse_pixels(nside, nc) if nc else None,
     )
     del pix_c, a2_c, gamma_c
     m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)

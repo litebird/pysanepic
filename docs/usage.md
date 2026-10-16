@@ -206,5 +206,7 @@ The detectors of a group must have the same number of samples and sampling
 rate, and a group must be on one MPI process; its chunks are not split at
 gaps (`split_gap_s`), flagged samples are handled by `flag_method`.
 $N^{-1}$ is applied with the Woodbury identity, one detector at a time
-(see [correlated noise](algorithm.md#correlated-noise)).
+(see [correlated noise](algorithm.md#correlated-noise)). Common modes slow
+down the PCG; `GLSParameters(coarse_nside=1)` brings the iterations back to
+those of uncorrelated noise (see [preconditioner](parameters.md#preconditioner)).
 

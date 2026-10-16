@@ -396,13 +396,22 @@ class GLS:
         m//2+1), the spectra of r common modes in the units of 1 / weights.
         N^-1 is applied with the Woodbury identity in two passes over the
         chunks (one chunk in memory at a time), in float64; the
-        preconditioner uses D only.
+        preconditioner uses D only (see `coarse`).
+    coarse : callable or None
+        Two-level preconditioner: `coarse(labels)` gives the index of the
+        coarse pixel of each pixel label of this rank (-1: none, e.g. virtual
+        pixels). The preconditioner becomes M + Z E^-1 Z^T, with Z the
+        indicators of the coarse pixels in I and E = Z^T P^T N^-1 P Z,
+        computed at setup with one product by P^T N^-1 P per coarse pixel
+        (the cost of ~1 PCG iteration each): it takes care of the slow
+        large-scale modes of I, e.g. those of common modes. make_maps builds
+        it from GLSParameters.coarse_nside.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -519,6 +528,37 @@ class GLS:
         self._set_preconditioner(blocks, preconditioner)
         del blocks
         self._full = self._buf = self._locbuf = None  # work maps, allocated by _apply
+        self._einv = None
+        if coarse is not None:
+            self._set_coarse(coarse)
+
+    def _set_coarse(self, coarse):
+        """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
+        parent = np.asarray(coarse(np.arange(self.lo, self.hi)), dtype=np.int64)
+        parent[~self.mask[0]] = -1
+        nz = int(parent.max(initial=-1)) + 1
+        if self.comm is not None:
+            nz = max(self.comm.allgather(nz))
+        self._cidx = np.flatnonzero(parent >= 0)  # I entries of the PCG vectors
+        self._cpar = parent[self._cidx]
+        count = self._csum(np.ones(self._cidx.size), nz)
+        used = np.flatnonzero(count > 0)
+        E = np.zeros((nz, nz))
+        x = np.zeros(self._nsky + self.nflag)
+        for q in used:  # the same coarse pixels on every rank: _apply is collective
+            x[self._cidx] = self._cpar == q
+            E[:, q] = np.bincount(self._cpar, self._apply(x)[self._cidx], minlength=nz)
+        if self.comm is not None:
+            E = self.comm.allreduce(E)
+        E = E[np.ix_(used, used)]
+        self._einv = np.zeros((nz, nz))
+        self._einv[np.ix_(used, used)] = np.linalg.inv(0.5 * (E + E.T))
+        self._nz = nz
+
+    def _csum(self, v, nz):
+        """Z^T v: sums of v (on the I entries of this rank) per coarse pixel, over ranks."""
+        c = np.bincount(self._cpar, v, minlength=nz)
+        return c if self.comm is None else self.comm.allreduce(c)
 
     def _pol_rcond(self, cov):
         """Reciprocal condition number of the angle-coverage matrix of each pixel."""
@@ -703,7 +743,10 @@ class GLS:
 
     def _precond_flat(self, r):
         sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
-        return np.concatenate([sky.ravel(), r[self._nsky :] * self._locprec])
+        z = np.concatenate([sky.ravel(), r[self._nsky :] * self._locprec])
+        if self._einv is not None:
+            z[self._cidx] += (self._einv @ self._csum(r[self._cidx], self._nz))[self._cpar]
+        return z
 
     def _no_flags(self):
         if self.nflag:

@@ -145,12 +145,14 @@ def test_detector_groups_mpi():
         coupling = rng.uniform(0.8, 1.2, 3)
         dets = _group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
         groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)]))
-    kw = dict(coordinates="E", params=GLSParameters(chunk_s=chunk / fs, tol=1e-20))
-    res = make_maps(groups[comm.rank :: comm.size], nside, comm=comm, **kw)
-    if comm.rank == 0:
-        ref = make_maps(groups, nside, **kw)
-        seen = ref.maps != hp.UNSEEN
-        assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
+    for nc in (0, 2):  # also with the two-level preconditioner
+        kw = dict(coordinates="E", params=GLSParameters(chunk_s=chunk / fs, tol=1e-20, coarse_nside=nc))
+        res = make_maps(groups[comm.rank :: comm.size], nside, comm=comm, **kw)
+        if comm.rank == 0:
+            ref = make_maps(groups, nside, **kw)
+            seen = ref.maps != hp.UNSEEN
+            assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
+            assert abs(res.iterations - ref.iterations) <= 1
 
 
 if __name__ == "__main__":
