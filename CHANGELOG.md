@@ -23,7 +23,9 @@ Changes on `main` that are not in a release yet.
   $\partial F/\partial\nu$ as template the amplitudes are the shifts of the
   bands. In the notebook (dust with a varying spectral index, bands shifted
   by ±1.5 GHz) the shifts are recovered within the noise and the Q/U error
-  drops from 3.8 to 1.3 µK.
+  drops from 3.8 to 1.3 µK. New notebooks `sky_model` and `validation` (the
+  same noise with and without gain variation and bandpass mismatch, each
+  ignored or fitted).
 - `CalibrationParameters.mask` is 1 for pixels used, 0 for pixels left out
   (the usual convention), and can be `{"gain": ..., "bandpass": ...}`.
 - `GLS(shared_templates=..., shared_groups=...)`: template amplitudes shared by
