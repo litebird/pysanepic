@@ -95,6 +95,7 @@ lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
 | `noise` | The noise model: a `OneOverFNoise` or a `TabulatedNoise`, see below |
 | `flags` | Boolean array like `tod`, `True` for samples to exclude, or `None`; see [flagged samples](parameters.md#flagged-samples) |
 | `name` | The detector, or `None`: {func}`~pysanepic.estimate_noise` averages the spectrum over the `DetectorData` with the same name |
+| `dipole` | The dipole signal in the TOD [K], like `tod`, or `None`; needed for [calibration](#calibration) |
 
 A detector observed in several stretches of time (e.g. one per day, as the
 observations of litebird_sim) is passed as several `DetectorData`. The
@@ -145,6 +146,7 @@ The conventions are the same as litebird_sim:
 | `converged` | Whether the PCG reached `tol` within `maxiter` iterations |
 | `iterations` | Number of PCG iterations |
 | `residuals` | $\lvert r\rvert^2/\lvert b\rvert^2$ at each iteration |
+| `gains` | With [calibration](#calibration), one array of gains per `DetectorData` of this process; `None` otherwise |
 
 Pixels without hits are `healpy.UNSEEN` in all components. In pixels where Q
 and U cannot be separated (too few hits, or a poor coverage of polarization
@@ -238,3 +240,32 @@ $N^{-1}$ is applied with the Woodbury identity, one detector at a time
 down the PCG; `GLSParameters(coarse_nside=1)` brings the iterations back to
 those of uncorrelated noise (see [preconditioner](parameters.md#preconditioner)).
 
+## Calibration
+
+With `calibration=`{class}`~pysanepic.CalibrationParameters`, `make_maps`
+fits one gain per detector and period together with the maps, using the
+dipole as calibrator. Each `DetectorData` needs `dipole`, the dipole signal
+of each sample (in K, the solar plus the orbital dipole), which is
+subtracted from the calibrated data.
+
+```python
+from pysanepic import CalibrationParameters, make_maps
+
+cal = CalibrationParameters(gain_period_s=1200.0, mask=galactic_mask, n_iter=3)  # 0 on the Galactic plane
+result = make_maps(data, nside, params=params, calibration=cal)
+result.gains  # one array per DetectorData: gain of each 20-minute period
+```
+
+| Field | Meaning |
+|---|---|
+| `gain_period_s` | One gain per detector and period of this duration [s], from the first sample of each `DetectorData`; `inf`: one per `DetectorData` |
+| `n_iter` | Calibration iterations, each a full GLS solve (default 3) |
+| `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the calibration (e.g. the Galactic plane), as the usual masks; then one more solve makes the maps with all the samples |
+| `sky` | I/Q/U maps for the template instead of the map of the previous iteration |
+
+The absolute calibration comes from the orbital dipole: a gain common to all
+periods would otherwise just rescale the map. Signal that the map cannot
+model, such as the Galaxy below the pixel size, biases the gains through the
+1/f weights: mask it. See [calibration](algorithm.md#calibration) and the
+[notebook](notebooks/calibration), where the gain period and the mask
+are tested.

@@ -406,12 +406,23 @@ class GLS:
         (the cost of ~1 PCG iteration each): it takes care of the slow
         large-scale modes of I, e.g. those of common modes. make_maps builds
         it from GLSParameters.coarse_nside.
+    templates : list of (k, values, labels), or None
+        Templates fitted together with the map: the TOD of chunk k is modeled
+        as P m + values * a[labels], with `values` and `labels` (int, -1: no
+        template) laid out like the chunk and a the template amplitudes, local
+        to this rank like the unknowns of flagged samples (labels 0, 1, ... of
+        this rank; several templates may share an amplitude, e.g. one gain per
+        detector and period). Not applied to flagged samples, nor to samples in
+        pixels whose Q/U are not solved (their polarized signal is not
+        modelled and would bias the amplitudes). solve() returns
+        the amplitudes in info["amplitudes"]; their preconditioner is the exact
+        diagonal of T^T N^-1 T (own noise only, as for the pixels).
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -462,6 +473,15 @@ class GLS:
                 self.nflag += labels.size
         if self.nobs + self.nflag >= 2**31:
             raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
+        # templates: amplitudes after the unknowns of flagged samples
+        self._tmpl = [[] for _ in self.ip]
+        self.namp = 0
+        for k, values, labels in templates or []:
+            labels = np.asarray(labels, dtype=np.int64)
+            used = (labels >= 0) & (self.ip[k] < self.nobs)
+            # ponytail: values kept in float64 (one TOD per template); float32 if memory matters
+            self._tmpl[k].append((np.where(used, values, 0.0), np.where(used, labels, 0)))
+            self.namp = max(self.namp, int(labels.max(initial=-1)) + 1)
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self.pol = psi is not None or pol_angles is not None
         self.ncomp = 3 if self.pol else 1
@@ -509,6 +529,12 @@ class GLS:
             if min_pol_rcond > 0:
                 self.mask[1:] &= self._pol_rcond(cov) >= min_pol_rcond
         del cov
+        if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)):  # collective: all ranks
+            solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
+            for k, tmpl in enumerate(self._tmpl):
+                bad = ~solved[np.minimum(self.ip[k], self.nobs - 1)] & (self.ip[k] < self.nobs)
+                for values, _ in tmpl:
+                    values[bad] = 0.0
 
         blocks = np.zeros((self.nobs, 6))
         last_w = c = None  # consecutive chunks often share their weights array
@@ -520,7 +546,7 @@ class GLS:
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks, self.nobs + self.nflag, self._locprec)
-        self._locprec = 1.0 / self._locprec
+        self._locprec = np.concatenate([1.0 / self._locprec, self._template_precond()])
         blocks = self._scatter_sum(blocks, by_column=True)
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
@@ -531,6 +557,24 @@ class GLS:
         self._einv = None
         if coarse is not None:
             self._set_coarse(coarse)
+
+    def _template_precond(self):
+        """Inverse diagonal of T^T N^-1 T (own noise of each chunk; 0 for unused
+        amplitudes)."""
+        # ponytail: one FFT per amplitude and chunk at setup (24 per daily chunk with
+        # hourly gains); c[0] * sum(values^2) if it shows up
+        diag = np.zeros(self.namp)
+        for k, tmpl in enumerate(self._tmpl):
+            for values, labels in tmpl:
+                for a in np.unique(labels[values != 0]):
+                    t = np.where(labels == a, values, 0.0)
+                    diag[a] += np.dot(t, self._filter(t, k, False))
+        return np.divide(1.0, diag, out=np.zeros_like(diag), where=diag > 0)
+
+    def _template_back(self, k, f):
+        """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf."""
+        for values, labels in self._tmpl[k]:
+            self._locbuf[self.nflag :] += np.bincount(labels, values * f, minlength=self.namp)
 
     def _set_coarse(self, coarse):
         """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
@@ -544,7 +588,7 @@ class GLS:
         count = self._csum(np.ones(self._cidx.size), nz)
         used = np.flatnonzero(count > 0)
         E = np.zeros((nz, nz))
-        x = np.zeros(self._nsky + self.nflag)
+        x = np.zeros(self._nsky + self.nflag + self.namp)
         for q in used:  # the same coarse pixels on every rank: _apply is collective
             x[self._cidx] = self._cpar == q
             E[:, q] = np.bincount(self._cpar, self._apply(x)[self._cidx], minlength=nz)
@@ -681,7 +725,7 @@ class GLS:
             # the search direction for P, and the map for P^T
             self._full = np.empty((self.nobs, self.ncomp))
             self._buf = np.empty((self.nobs, self.ncomp))
-            self._locbuf = np.empty(self.nflag)
+            self._locbuf = np.empty(self.nflag + self.namp)
         loc = self._locbuf[:0]
         if v is not None:
             self._gather(v[: self._nsky].reshape(self.ncomp, self.nloc).T, out=self._full)  # the whole map, for P
@@ -695,7 +739,9 @@ class GLS:
                     continue
                 pol, c2, s2 = self._pol_arrays(k)
                 t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
-                _backproject(ip, self._filter(t, k, single), c2, s2, pol, self._edges, buf, self._locbuf)
+                f = self._filter(t, k, single)
+                _backproject(ip, f, c2, s2, pol, self._edges, buf, self._locbuf)
+                self._template_back(k, f)
             for chunks, U, M in self._groups:
                 self._apply_group(chunks, U, M, v, tod, loc, buf)
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf])
@@ -710,6 +756,8 @@ class GLS:
             return t
         t = np.empty(ip.size)
         _project(ip, self._full, c2, s2, pol, loc, t)
+        for values, labels in self._tmpl[k]:
+            t += values * loc[self.nflag + labels]
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
@@ -740,6 +788,7 @@ class GLS:
             f *= self.weights[k]
             t = ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[:n]
             _backproject(self.ip[k], t, c2, s2, pol, self._edges, buf, self._locbuf)
+            self._template_back(k, t)
 
     def _precond_flat(self, r):
         sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
@@ -749,8 +798,8 @@ class GLS:
         return z
 
     def _no_flags(self):
-        if self.nflag:
-            raise ValueError("apply_A and rhs work on the pixels only: with flagged samples use solve()")
+        if self.nflag or self.namp:
+            raise ValueError("apply_A and rhs work on the pixels only: with flagged samples or templates use solve()")
 
     def apply_A(self, m):
         """P^T N^-1 P m for this rank's pixels of a map, (ncomp, nloc) (without
@@ -770,7 +819,9 @@ class GLS:
 
         Stops when norm(r)^2 / norm(b)^2 < tol (same criterion as SANEPIC).
         x0: optional starting map (ncomp, nobs). Returns (map (ncomp, nobs) on
-        every rank, info dict).
+        every rank, info dict) with "iterations", "converged", "residuals"
+        (norm(r)^2 / norm(b)^2 at each iteration) and "amplitudes" (the
+        template amplitudes of this rank, by label; empty without templates).
         """
         b = self._apply(tod=_chunks(tod))
         bb = self._dot(b, b)
@@ -811,7 +862,7 @@ class GLS:
             if verbose and (self.comm is None or self.comm.rank == 0):
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
 
-        info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history)}
+        info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history), "amplitudes": x[self._nsky + self.nflag :].copy()}
         del b, r, z, d  # q does not exist if maxiter == 0
         self._full = self._buf = self._locbuf = None  # free the work maps before gathering the result
         self._fftbuf = {}

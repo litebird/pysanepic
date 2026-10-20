@@ -61,6 +61,26 @@ def test_make_maps_mpi_padding():
         assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
 
 
+def test_calibration_mpi():
+    """Calibration with the detectors split across ranks gives the serial gains
+    (amplitudes local to each rank; default min_pol_rcond, which drops the
+    templates in pixels without Q/U, a collective step)."""
+    from pysanepic import CalibrationParameters, GLSParameters, make_maps
+    from test_mapmaker import _calibration_data
+
+    comm = MPI.COMM_WORLD
+    data, _, _ = _calibration_data(16, 60_000, 10.0, 12_000)
+    data = data[:3]  # with 4 ranks, one has no data (and no templates)
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
+              calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=2))
+    gains = comm.gather(make_maps(data[comm.rank :: comm.size], 16, comm=comm, **kw).gains)
+    if comm.rank == 0:
+        ref = make_maps(data, 16, **kw).gains
+        for r in range(comm.size):
+            for g, g0 in zip(gains[r], ref[r :: comm.size]):
+                assert np.abs(g - g0).max() < 1e-9
+
+
 def test_more_ranks_than_pixels():
     """With MPI some ranks may own no pixels at all: same result as serial."""
     comm = MPI.COMM_WORLD
@@ -189,5 +209,6 @@ if __name__ == "__main__":
     test_estimate_noise_mpi()
     test_detector_groups_mpi()
     test_estimate_common_modes_mpi()
+    test_calibration_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

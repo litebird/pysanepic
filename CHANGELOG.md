@@ -4,6 +4,19 @@
 
 Changes on `main` that are not in a release yet.
 
+- Gain calibration on the dipole: `make_maps(calibration=CalibrationParameters(
+  gain_period_s, n_iter, mask, sky))` fits one gain per detector and period
+  together with the maps, linearizing $d = g\,(P m + D) + n$ around the current
+  gains with the template $T = D + P m_\text{prev}$, and returns them in
+  `MapResult.gains`. `DetectorData.dipole` is the dipole signal $D$, the
+  orbital part of which sets the absolute calibration. `mask` leaves the
+  masked pixels out of the calibration (their samples are flagged) and makes
+  the final maps with all the samples: in the notebook, the Galaxy below the
+  pixel size biases the absolute calibration by 2% without it, 0.08% with it.
+- `GLS(templates=[(chunk, values, labels), ...])`: template amplitudes fitted
+  together with the map, local unknowns of each process, returned in
+  `info["amplitudes"]`.
+
 ## 0.4.0 (2026-10-17)
 
 - `estimate_noise` estimates common modes: for each `DetectorGroup` the

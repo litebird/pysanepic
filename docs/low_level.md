@@ -16,8 +16,11 @@ see {func}`~pysanepic.fast_fft_length`), and `weights` are on their rfft
 grid. Negative pixels mark flagged samples: samples of a chunk with the same
 negative value share an unknown that is not in the maps (one value per sample
 for the exact GLS without them); `apply_A` and `rhs` are then not available,
-use `solve`. `common_modes` correlates chunks observed at the same times (see
-{class}`~pysanepic.GLS`).
+use `solve`. `common_modes` correlates chunks observed at the same times, and
+`templates`, a list of `(chunk, values, labels)`, fits template amplitudes
+with the map (the TOD of the chunk gets `values * a[labels]`, labels -1: none;
+amplitudes local to each process, returned in `info["amplitudes"]`; see
+{class}`~pysanepic.GLS`). `apply_A` and `rhs` are not available with templates.
 
 ```python
 import numpy as np
