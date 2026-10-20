@@ -376,10 +376,11 @@ class CalibrationParameters:
         DetectorData.
     n_iter : calibration iterations (each one a full GLS solve). The first one
         uses T = D (or D + P sky).
-    mask : boolean HEALPix map (nside and coordinates of the output maps),
-        True for pixels left out of the calibration (e.g. the Galactic plane,
-        where signal below the pixel size or not in the model would bias the
-        gains through the 1/f weights): their samples are flagged in the
+    mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
+        for pixels used and 0 (False) for pixels left out of the calibration,
+        as the usual masks (combine them with a product). E.g. 0 on the
+        Galactic plane, where signal below the pixel size or not in the model
+        would bias the gains through the 1/f weights. Their samples are flagged in the
         n_iter iterations (with GLSParameters.flag_method; "offset" takes no
         memory; together with DetectorData.flags), then one more GLS solve
         makes the maps with all the samples and the final gains. None: all
@@ -591,7 +592,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, cal=No
             tmpl = d.dipole if sky is None else d.dipole + _project_maps(sky, pix, angle, d.pol_efficiency)
             labels = offsets[-1] + period
             if fit and calib.mask is not None:  # masked samples left out, as flagged samples
-                flags = calib.mask[pix] if flags is None else flags | calib.mask[pix]
+                out = np.asarray(calib.mask)[pix] == 0
+                flags = out if flags is None else flags | out
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
         gap = params.split_gap_s * fs if split else np.inf
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, flags, gap)):

@@ -251,7 +251,7 @@ subtracted from the calibrated data.
 ```python
 from pysanepic import CalibrationParameters, make_maps
 
-cal = CalibrationParameters(gain_period_s=1200.0, mask=galactic_band, n_iter=3)
+cal = CalibrationParameters(gain_period_s=1200.0, mask=galactic_mask, n_iter=3)  # 0 on the Galactic plane
 result = make_maps(data, nside, params=params, calibration=cal)
 result.gains  # one array per DetectorData: gain of each 20-minute period
 ```
@@ -260,7 +260,7 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 |---|---|
 | `gain_period_s` | One gain per detector and period of this duration [s], from the first sample of each `DetectorData`; `inf`: one per `DetectorData` |
 | `n_iter` | Calibration iterations, each a full GLS solve (default 3) |
-| `mask` | Boolean HEALPix map (output nside and coordinates), `True` for pixels left out of the calibration, e.g. the Galactic plane; then one more solve makes the maps with all the samples |
+| `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the calibration (e.g. the Galactic plane), as the usual masks; then one more solve makes the maps with all the samples |
 | `sky` | I/Q/U maps for the template instead of the map of the previous iteration |
 
 The absolute calibration comes from the orbital dipole: a gain common to all

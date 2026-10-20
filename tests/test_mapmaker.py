@@ -361,7 +361,7 @@ def test_calibration_noiseless():
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
     band = np.abs(hp.pix2vec(nside, np.arange(12 * nside**2))[2]) < 0.3
     for cal in (CalibrationParameters(gain_period_s=per / fs),
-                CalibrationParameters(gain_period_s=per / fs, mask=band),
+                CalibrationParameters(gain_period_s=per / fs, mask=~band),  # 1 = used: the band is left out
                 CalibrationParameters(gain_period_s=per / fs, sky=sky, n_iter=2)):
         r = make_maps(data, nside, coordinates="E", params=params, calibration=cal)
         assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
