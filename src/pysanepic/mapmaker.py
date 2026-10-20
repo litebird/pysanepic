@@ -615,6 +615,7 @@ class _Fit:
     mask_band: np.ndarray | None
     gains: list | None = None  # current gains, one array per DetectorData
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
+    x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
 
@@ -815,8 +816,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         shared_groups=fit.groups if fit is not None and fit.fit else None,
     )
     del pix_c, a2_c, gamma_c
-    m, info = gls.solve(tod_c, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
+    # warm start from the previous calibration iteration (if the pixels are the same)
+    x0 = None if fit is None or fit.x0 is None or fit.x0.shape != (gls.ncomp, gls.nobs) else fit.x0
+    m, info = gls.solve(tod_c, x0=x0, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
     if fit is not None:
+        fit.x0 = m
         if fit.fit:
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
             if cal is not None:

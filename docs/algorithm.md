@@ -143,8 +143,11 @@ template, piecewise in time: one amplitude per period). The template
 amplitudes are local unknowns like those of flagged samples, with $T$ as
 their column of the pointing matrix, so the PCG solves for map and
 $\delta g$ at once, without MPI communication for the gains; their
-preconditioner is the exact diagonal of $T^T N^{-1} T$ (one FFT per
-amplitude at setup). Then $g \leftarrow g\,(1 + \delta g)$, `n_iter` times.
+preconditioner is the exact diagonal of $T^T N^{-1} T$, computed at setup
+from the autocorrelation of each amplitude's template (an FFT of twice its
+span) and the first row of the circulant $N^{-1}$. Then
+$g \leftarrow g\,(1 + \delta g)$, `n_iter` times; each iteration starts the
+PCG from the maps of the previous one.
 
 Templates are not applied to samples in pixels whose Q/U are not solved: their
 polarized signal is not in the model and would bias the amplitudes. For the

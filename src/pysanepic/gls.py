@@ -181,6 +181,21 @@ def _backproject(ip, t, c2, s2, pol, edges, buf, locbuf):
                     buf[p, 2] += t[i] * s2[i]
 
 
+@numba.njit(parallel=True, cache=True)
+def _add_template(t, values, labels, amp):
+    """t += values * amp[labels] (values are 0 where the template is not applied)."""
+    for i in numba.prange(t.size):
+        t[i] += values[i] * amp[labels[i]]
+
+
+@numba.njit(cache=True)
+def _template_dot(values, labels, f, out):
+    """out[labels] += values * f: T^T f for one template of a chunk."""
+    # ponytail: serial (a scatter to few amplitudes); ~ms per day of data
+    for i in range(f.size):
+        out[labels[i]] += values[i] * f[i]
+
+
 # cos and sin on a grid of [-pi, pi), for _cos_sin
 _TRIG_N = 4096
 _TRIG_COS = np.cos(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
@@ -579,20 +594,36 @@ class GLS:
             labels = np.asarray(labels, dtype=np.int64)
             used = (labels >= 0) & (self.ip[k] < self.nobs)
             # ponytail: values kept in float64 (one TOD per template); float32 if memory matters
-            out[k].append((np.where(used, values, 0.0), np.where(used, labels, 0)))
+            out[k].append((np.where(used, values, 0.0), np.where(used, labels, 0).astype(np.int32)))
             n = max(n, int(labels.max(initial=-1)) + 1)
         return out, n
 
     def _template_diag(self, tmpls, n):
-        """Diagonal of T^T N^-1 T (own noise of each chunk) for this rank's chunks."""
-        # ponytail: one FFT per amplitude and chunk at setup (24 per daily chunk with
-        # hourly gains); c[0] * sum(values^2) if it shows up
+        """Diagonal of T^T N^-1 T (own noise of each chunk) for this rank's
+        chunks: for the samples v of an amplitude, spanning L samples,
+        v^T C v = c[0] R[0] + 2 sum_l c[l] R[l], with c the first row of the
+        circulant N^-1 of the chunk and R the autocorrelation of v, computed
+        with an FFT of length 2L: exact, and ~2 FFTs of the chunk in all
+        instead of one per amplitude."""
         diag = np.zeros(n)
+        kernels = {}  # first row of N^-1, by weights array and FFT length
         for k, tmpl in enumerate(tmpls):
+            if not tmpl:
+                continue
+            key = (id(self.weights[k]), self._nfft[k])
+            if key not in kernels:
+                kernels[key] = ducc0.fft.c2r(np.asarray(self.weights[k], dtype=complex), lastsize=self._nfft[k],
+                                             forward=False, inorm=2, nthreads=self.nthreads)
+            c = kernels[key]
             for values, labels in tmpl:
                 for a in np.unique(labels[values != 0]):
-                    t = np.where(labels == a, values, 0.0)
-                    diag[a] += np.dot(t, self._filter(t, k, False))
+                    idx = np.flatnonzero((labels == a) & (values != 0))
+                    i0, i1 = idx[0], idx[-1] + 1
+                    v = np.where(labels[i0:i1] == a, values[i0:i1], 0.0)
+                    m = fast_fft_length(2 * v.size)
+                    f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=self.nthreads)
+                    r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[: v.size]
+                    diag[a] += c[0] * r[0] + 2 * np.dot(c[1 : v.size], r[1:])
         return diag
 
     @staticmethod
@@ -608,9 +639,9 @@ class GLS:
     def _template_back(self, k, f):
         """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf and _shbuf."""
         for values, labels in self._tmpl[k]:
-            self._locbuf[self.nflag :] += np.bincount(labels, values * f, minlength=self.namp)
+            _template_dot(values, labels, f, self._locbuf[self.nflag :])
         for values, labels in self._shared[k]:
-            self._shbuf += np.bincount(labels, values * f, minlength=self.nshared)
+            _template_dot(values, labels, f, self._shbuf)
 
     def _set_coarse(self, coarse):
         """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
@@ -799,9 +830,9 @@ class GLS:
         t = np.empty(ip.size)
         _project(ip, self._full, c2, s2, pol, loc, t)
         for values, labels in self._tmpl[k]:
-            t += values * loc[self.nflag + labels]
+            _add_template(t, values, labels, loc[self.nflag : self.nflag + self.namp])
         for values, labels in self._shared[k]:
-            t += values * self._shv[labels]
+            _add_template(t, values, labels, self._shv)
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
