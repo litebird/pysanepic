@@ -389,8 +389,11 @@ class CalibrationParameters:
     gain_period_s : one gain per detector and period of this duration [s],
         counted from the first sample of each DetectorData; inf: one gain per
         DetectorData.
-    n_iter : calibration iterations (each one a full GLS solve). The first one
-        uses T = D + S.
+    n_iter : calibration iterations (each one a full GLS solve; the setup of
+        the GLS is built once and reused, and each solve starts from the
+        maps of the previous one). The first one uses T = D + S. 2 (default)
+        is enough when the noise dominates the second-order terms; increase
+        it for noiseless tests or large gain errors.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels used and 0 (False) for pixels left out of the fits, as the
         usual masks (combine them with a product); or a dict with "gain"
@@ -407,11 +410,16 @@ class CalibrationParameters:
         the fit through the maps and the 1/f weights: mask it for every fit
         (e.g. point sources not in the sky model). E.g. {"gain": galaxy *
         sources, "bandpass": sources}. None: all pixels.
+    cache_model : keep the TOD of the sky model and of the bandpass templates
+        of every detector in memory between the iterations (8 bytes per sample
+        each) instead of computing them again (with alm, an interpolation at
+        every sample in each iteration).
     """
 
     gain_period_s: float = 3600.0
-    n_iter: int = 3
+    n_iter: int = 2
     mask: np.ndarray | dict | None = None
+    cache_model: bool = False
 
 
 @numba.njit(parallel=True, cache=True)
@@ -591,11 +599,12 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     index = {(k, n): i for i, (k, n) in enumerate((k, n) for k in bands for n in names)}
     masks = _masks(None if calibration is None else calibration.mask, nside)
     fit = _Fit(calibration=calibration, sky=sky, bands=bands, index=index, amp=np.zeros(len(index)),
-               groups=[[index[k, n] for n in names] for k in bands], mask_gain=masks[0], mask_band=masks[1])
+               groups=[[index[k, n] for n in names] for k in bands], mask_gain=masks[0], mask_band=masks[1],
+               cache={} if calibration is not None and calibration.cache_model else None)
     for _ in range(1 if calibration is None else calibration.n_iter):
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
     if calibration is not None and calibration.mask is not None:  # masked samples may have been left out
-        fit.fit = False
+        fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
     res.bandpass = {k: {n: fit.amp[index[k, n]] for n in names} for k in bands} if bands else None
     return res
@@ -616,6 +625,8 @@ class _Fit:
     gains: list | None = None  # current gains, one array per DetectorData
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
+    gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
+    cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, bandpass TODs)
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
 
@@ -671,9 +682,10 @@ def _sample(x, d, pix, angle, coordinates, nthreads):
 
 def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=None):
     """make_maps with the current estimates in `fit` (a _Fit, or None), which
-    are updated; returns (MapResult, GLS)."""
-    # ponytail: each calibration iteration rebuilds the GLS (pointing, preconditioner,
-    # coarse setup); reuse it and only swap TOD and templates if the setup shows up
+    are updated; returns (MapResult, GLS). In the calibration iterations after
+    the first, the GLS of the first one is reused (same pixels, flags and
+    chunks): only the TOD and the templates are built."""
+    reuse = fit is not None and fit.fit and fit.gls is not None
     params = GLSParameters() if params is None else params
     if params.flag_method not in ("marginalize", "offset"):
         raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize' or 'offset'")
@@ -691,11 +703,13 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     templates, shared, model_c = [], [], []  # gain and bandpass templates (chunk, values, labels), sky model TOD
     gains, offsets = [], []  # gains of each DetectorData and their first label
     cal = None if fit is None else fit.calibration
+    nchunk = ndata = 0  # chunks and DetectorData so far
 
     def add(d, split=True):
         """Chunks of one DetectorData; returns their indices."""
-        nonlocal n_virtual
-        first = len(pix_c)
+        nonlocal n_virtual, nchunk, ndata
+        first = nchunk
+        ndata += 1
         pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
@@ -703,11 +717,17 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         if fit is not None:
             # d = g (P m + D + S + sum_k a_k B_k) + n, linearized around the current g, a:
             # d / g - D - S - sum a B = P m_res + T dg + sum B da + n, T = D + S + sum a B + P m_res_prev
-            sky_tod = _sample(fit.sky, d, pix, angle, coordinates, nthreads)
+            if fit.cache is not None and ndata in fit.cache:
+                sky_tod, cached = fit.cache[ndata]
+                btmpl = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
+            else:
+                sky_tod = _sample(fit.sky, d, pix, angle, coordinates, nthreads)
+                btmpl = {k: _sample(b, d, pix, angle, coordinates, nthreads) for k, b in fit.bands.items()}
+                if fit.cache is not None:
+                    fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in btmpl.items()}
             known = sky_tod.copy()
-            for k, b in fit.bands.items():
-                btmpl[k] = _sample(b, d, pix, angle, coordinates, nthreads)
-                known += fit.amp[fit.index[k, d.name]] * btmpl[k]
+            for k, t in btmpl.items():
+                known += fit.amp[fit.index[k, d.name]] * t
             if cal is not None:
                 per = int(round(cal.gain_period_s * fs)) if np.isfinite(cal.gain_period_s) else len(d.tod)
                 period = np.arange(len(d.tod)) // max(1, per)
@@ -733,6 +753,25 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
         gap = params.split_gap_s * fs if split else np.inf
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, flags, gap)):
+            k = nchunk
+            nchunk += 1
+            tod = tod_all[a:b]  # a view: the TOD is not copied
+            if fit is not None:
+                zero, none = np.zeros(m), np.full(m, -1)
+                if tmpl is not None:
+                    templates.append((k, np.concatenate([zero, tmpl[a:b], zero]), np.concatenate([none, labels[a:b], none])))
+                if fit.fit:
+                    for name, t in btmpl.items():
+                        lab = np.concatenate([none, np.full(b - a, fit.index[name, d.name]), none])
+                        shared.append((k, np.concatenate([zero, t[a:b], zero]), lab))
+                if fit.sky is not None:
+                    model_c.append(np.concatenate([zero, sky_tod[a:b], zero]))  # the bandpass terms are not put back
+            flagged = None if flags is None else flags[a:b]
+            if m and flagged is not None and flagged.any():  # the padding is built from the chunk: not from flagged samples
+                tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
+            tod_c.append(tod if m == 0 else _pad(tod, m, params.pad_fill))
+            if reuse:  # the GLS has pixels, angles and weights already
+                continue
             n = b - a + 2 * m
             nfft = fast_fft_length(n)  # e.g. chunks split at gaps have any length
             key = (nfft, fs, d.noise)  # the dict keeps the noise objects alive: no reused ids
@@ -754,33 +793,16 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     g[m : n - m] = d.pol_efficiency
                     gamma_c.append(g)
             p = pix[a:b].astype(np.int32)
-            tod = tod_all[a:b]  # a view: the TOD is not copied
-            if fit is not None:
-                zero, none = np.zeros(m), np.full(m, -1)
-                k = len(pix_c)
-                if tmpl is not None:
-                    templates.append((k, np.concatenate([zero, tmpl[a:b], zero]), np.concatenate([none, labels[a:b], none])))
-                if fit.fit:
-                    for name, t in btmpl.items():
-                        lab = np.concatenate([none, np.full(b - a, fit.index[name, d.name]), none])
-                        shared.append((k, np.concatenate([zero, t[a:b], zero]), lab))
-                if fit.sky is not None:
-                    model_c.append(np.concatenate([zero, sky_tod[a:b], zero]))  # the bandpass terms are not put back
-            flagged = None if flags is None else flags[a:b]
             if flagged is not None and flagged.any():
                 p[flagged] = _flag_labels(flagged, params.flag_method)  # unknowns not in the maps (see GLS)
-                if m:  # the padding is built from the chunk: not from flagged samples
-                    tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
             if m == 0:
                 pix_c.append(p)
-                tod_c.append(tod)
             else:
                 left = npix + 2 * (n_virtual * size + rank)
                 n_virtual += 1
                 pix_c.append(np.concatenate([np.full(m, left, np.int32), p, np.full(m, left + 1, np.int32)]))
-                tod_c.append(_pad(tod, m, params.pad_fill))
         del pix, angle
-        return list(range(first, len(pix_c)))
+        return list(range(first, nchunk))
 
     for d in data:  # one detector (or group) at a time: only its pointings are in memory
         if not isinstance(d, DetectorGroup):
@@ -789,6 +811,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         # a group: chunks at the same times, not split at gaps (that would break
         # the alignment); one common_modes entry per chunk of time
         idx = [add(x, split=False) for x in d.detectors]
+        if reuse:
+            continue
         fs = d.detectors[0].sampling_rate_hz
         U = np.array([mode.coupling for mode in d.modes], dtype=float).T  # (ndet, r)
         for chunks in zip(*idx):
@@ -796,25 +820,13 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             lam = np.array([1 / np.maximum(w, w.max() * 1e-12) for w in (mode.noise.weights(nfft, fs) for mode in d.modes)])
             common_modes.append((list(chunks), U, lam))
 
-    gls = GLS(
-        pix_c,
-        None,
-        w_c,
-        pol_angles=(a2_c, gamma_c) if params.pol else None,
-        preconditioner=params.preconditioner,
-        min_pol_rcond=params.min_pol_rcond,
-        comm=comm,
-        nthreads=nthreads,
-        angle_dtype=dtype,
-        overwrite_pix=True,  # pix_c holds copies made here
-        fft_lengths=nfft_c,
-        fft_dtype=params.fft_dtype,
-        common_modes=common_modes,
-        coarse=_coarse_pixels(nside, nc) if nc else None,
-        templates=templates,
-        shared_templates=shared,
-        shared_groups=fit.groups if fit is not None and fit.fit else None,
-    )
+    if reuse:
+        gls = fit.gls
+        gls.set_templates(templates, shared)
+    else:
+        gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit)
+        if fit is not None and fit.fit:
+            fit.gls = gls
     del pix_c, a2_c, gamma_c
     # warm start from the previous calibration iteration (if the pixels are the same)
     x0 = None if fit is None or fit.x0 is None or fit.x0.shape != (gls.ncomp, gls.nobs) else fit.x0
@@ -844,6 +856,29 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         residuals=info["residuals"],
         gains=None if fit is None else fit.gains,
     ), gls
+
+
+def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit):
+    nc = params.coarse_nside
+    return GLS(
+        pix_c,
+        None,
+        w_c,
+        pol_angles=(a2_c, gamma_c) if params.pol else None,
+        preconditioner=params.preconditioner,
+        min_pol_rcond=params.min_pol_rcond,
+        comm=comm,
+        nthreads=nthreads,
+        angle_dtype=params.angle_dtype,
+        overwrite_pix=True,  # pix_c holds copies made here
+        fft_lengths=nfft_c,
+        fft_dtype=params.fft_dtype,
+        common_modes=common_modes,
+        coarse=_coarse_pixels(nside, nc) if nc else None,
+        templates=templates,
+        shared_templates=shared,
+        shared_groups=fit.groups if fit is not None and fit.fit else None,
+    )
 
 
 def _model_tod(d, maps, nside, coordinates, nthreads):

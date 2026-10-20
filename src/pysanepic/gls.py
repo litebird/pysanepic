@@ -498,15 +498,8 @@ class GLS:
                 self.nflag += labels.size
         if self.nobs + self.nflag >= 2**31:
             raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
-        # templates: local amplitudes after the unknowns of flagged samples, then
-        # (on rank 0 only) the shared ones
-        self._tmpl, self.namp = self._parse_templates(templates)
-        self._shared, nsh = self._parse_templates(shared_templates)
-        self.nshared = nsh if comm is None else max(comm.allgather(nsh))
         self._root = comm is None or comm.rank == 0
-        self._nsh_loc = self.nshared if self._root else 0  # the shared amplitudes in this rank's PCG vectors
         self._shgroups = [np.asarray(g, dtype=np.int64) for g in shared_groups or []]
-        self._shv = np.zeros(self.nshared)  # the shared amplitudes for P, set by _apply
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self.pol = psi is not None or pol_angles is not None
         self.ncomp = 3 if self.pol else 1
@@ -554,12 +547,6 @@ class GLS:
             if min_pol_rcond > 0:
                 self.mask[1:] &= self._pol_rcond(cov) >= min_pol_rcond
         del cov
-        if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)) + self.nshared:  # collective
-            solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
-            for k, ip in enumerate(self.ip):
-                bad = ~solved[np.minimum(ip, self.nobs - 1)] & (ip < self.nobs)
-                for values, _ in self._tmpl[k] + self._shared[k]:
-                    values[bad] = 0.0
 
         blocks = np.zeros((self.nobs, 6))
         last_w = c = None  # consecutive chunks often share their weights array
@@ -571,10 +558,9 @@ class GLS:
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks, self.nobs + self.nflag, self._locprec)
-        diag = self._template_diag(self._shared, self.nshared)
-        diag = diag if comm is None else comm.allreduce(diag)
-        self._locprec = np.concatenate([1.0 / self._locprec, self._inverse(self._template_diag(self._tmpl, self.namp)),
-                                        self._inverse(diag)[: self._nsh_loc]])
+        self._flagprec = 1.0 / self._locprec
+        self._solved = None  # the full Q/U mask, for the templates
+        self.set_templates(templates, shared_templates)
         blocks = self._scatter_sum(blocks, by_column=True)
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
@@ -585,6 +571,30 @@ class GLS:
         self._einv = None
         if coarse is not None:
             self._set_coarse(coarse)
+
+    def set_templates(self, templates=None, shared_templates=None):
+        """Set (or replace) `templates` and `shared_templates` (see the class),
+        keeping the rest of the setup: pixels, preconditioner, coarse level.
+        Collective with MPI. The constraints `shared_groups` are kept."""
+        # local amplitudes after the unknowns of flagged samples, then (on rank 0
+        # only) the shared ones
+        self._tmpl, self.namp = self._parse_templates(templates)
+        self._shared, nsh = self._parse_templates(shared_templates)
+        comm = self.comm
+        self.nshared = nsh if comm is None else max(comm.allgather(nsh))
+        self._nsh_loc = self.nshared if self._root else 0  # the shared amplitudes in this rank's PCG vectors
+        self._shv = np.zeros(self.nshared)  # the shared amplitudes for P, set by _apply
+        if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)) + self.nshared:  # collective
+            if self._solved is None:
+                self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
+            for k, ip in enumerate(self.ip):
+                bad = ~self._solved[np.minimum(ip, self.nobs - 1)] & (ip < self.nobs)
+                for values, _ in self._tmpl[k] + self._shared[k]:
+                    values[bad] = 0.0
+        diag = self._template_diag(self._shared, self.nshared)
+        diag = diag if comm is None else comm.allreduce(diag)
+        self._locprec = np.concatenate([self._flagprec, self._inverse(self._template_diag(self._tmpl, self.namp)),
+                                        self._inverse(diag)[: self._nsh_loc]])
 
     def _parse_templates(self, templates):
         """Per chunk, the (values, labels) of its templates (0 where not applied),

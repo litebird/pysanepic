@@ -146,8 +146,10 @@ $\delta g$ at once, without MPI communication for the gains; their
 preconditioner is the exact diagonal of $T^T N^{-1} T$, computed at setup
 from the autocorrelation of each amplitude's template (an FFT of twice its
 span) and the first row of the circulant $N^{-1}$. Then
-$g \leftarrow g\,(1 + \delta g)$, `n_iter` times; each iteration starts the
-PCG from the maps of the previous one.
+$g \leftarrow g\,(1 + \delta g)$, `n_iter` times; the pixels, the
+preconditioner and the coarse level are set up once, and each iteration only
+replaces the TOD and the templates (`GLS.set_templates`) and starts the PCG
+from the maps of the previous one.
 
 Templates are not applied to samples in pixels whose Q/U are not solved: their
 polarized signal is not in the model and would bias the amplitudes. For the

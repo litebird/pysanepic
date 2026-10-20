@@ -404,9 +404,10 @@ def test_calibration_noiseless():
     # through the 1/f weights, in the maps and in the gains
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
     band = np.abs(hp.pix2vec(nside, np.arange(12 * nside**2))[2]) < 0.3
-    for cal, model in ((CalibrationParameters(gain_period_s=per / fs), None),
-                       (CalibrationParameters(gain_period_s=per / fs, mask=~band), None),  # 1 = used: the band is left out
-                       (CalibrationParameters(gain_period_s=per / fs, n_iter=2), sky)):  # sky model: a map
+    # noiseless: 3 iterations (the default 2 stops at ~3e-8)
+    for cal, model in ((CalibrationParameters(gain_period_s=per / fs, n_iter=3), None),
+                       (CalibrationParameters(gain_period_s=per / fs, mask=~band, n_iter=3), None),  # 1 = used: the band is left out
+                       (CalibrationParameters(gain_period_s=per / fs, n_iter=3, cache_model=True), sky)):  # sky model: a map
         r = make_maps(data, nside, coordinates="E", params=params, calibration=cal, sky_model=model)
         assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
         seen = r.maps[1] != hp.UNSEEN
@@ -533,10 +534,10 @@ def test_bandpass_templates():
     spot[hp.query_disc(nside, hp.ang2vec(1.0, 2.0), np.radians(10))] = False
     # samples out of the gain fit only (band): calibrated with the gains of the
     # previous iteration, so the iterations converge slower (~5x each)
-    cases = [(CalibrationParameters(gain_period_s=per / fs), 1e-9),
-             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot), 1e-9),
+    cases = [(CalibrationParameters(gain_period_s=per / fs, n_iter=3), 1e-9),
+             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot, n_iter=3, cache_model=True), 1e-9),
              (CalibrationParameters(gain_period_s=per / fs, mask={"gain": band * spot, "bandpass": spot}, n_iter=10), 1e-8)]
-    cases.append((CalibrationParameters(gain_period_s=per / fs), 1e-9, fg))  # with a sky model too
+    cases.append((CalibrationParameters(gain_period_s=per / fs, n_iter=3), 1e-9, fg))  # with a sky model too
     for cal, tol, *model in cases:
         r = make_maps(data, nside, coordinates="E", params=params, bandpass_templates={"fg": fg}, calibration=cal,
                       sky_model=model[0] if model else None)

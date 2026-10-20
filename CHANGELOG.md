@@ -28,6 +28,12 @@ Changes on `main` that are not in a release yet.
   ignored or fitted).
 - `CalibrationParameters.mask` is 1 for pixels used, 0 for pixels left out
   (the usual convention), and can be `{"gain": ..., "bandpass": ...}`.
+- Calibration: `n_iter` defaults to 2; the GLS setup is reused between the
+  iterations and each one starts from the previous maps; templates added and
+  summed with numba kernels, and the diagonal of their preconditioner from
+  autocorrelations (exact, ~2 FFTs per chunk): on G100 (8 days, 8 detectors,
+  nside 256) a calibrated run went from 390 to 159 s. `cache_model` keeps the
+  model TODs between the iterations. `GLS.set_templates`.
 - `GLS(shared_templates=..., shared_groups=...)`: template amplitudes shared by
   all the MPI processes, with sum-zero constraints; `GLS.binned(tod)`;
   `Pointing.angles(coordinates)`.

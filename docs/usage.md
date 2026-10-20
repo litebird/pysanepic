@@ -252,7 +252,7 @@ subtracted from the calibrated data.
 ```python
 from pysanepic import CalibrationParameters, make_maps
 
-cal = CalibrationParameters(gain_period_s=1200.0, mask=galactic_mask, n_iter=3)  # 0 on the Galactic plane
+cal = CalibrationParameters(gain_period_s=1200.0, mask=galactic_mask)  # 0 on the Galactic plane
 result = make_maps(data, nside, params=params, calibration=cal)
 result.gains  # one array per DetectorData: gain of each 20-minute period
 ```
@@ -260,7 +260,8 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 | Field | Meaning |
 |---|---|
 | `gain_period_s` | One gain per detector and period of this duration [s], from the first sample of each `DetectorData`; `inf`: one per `DetectorData` |
-| `n_iter` | Calibration iterations, each a full GLS solve (default 3) |
+| `n_iter` | Calibration iterations, each a GLS solve (default 2: enough when the noise dominates; more for noiseless tests). The setup of the GLS is built once and reused, and each solve starts from the previous maps |
+| `cache_model` | Keep the TOD of the sky model and of the bandpass templates in memory between the iterations, instead of computing them again (default `False`; 8 bytes per sample each) |
 | `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the fits (e.g. the Galactic plane), as the usual masks; or `{"gain": ..., "bandpass": ...}`, one per kind of fit (see [below](#bandpass-templates)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
 
 The absolute calibration comes from the orbital dipole: a gain common to all

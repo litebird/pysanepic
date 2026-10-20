@@ -23,6 +23,7 @@ amplitudes local to each process, returned in `info["amplitudes"]`;
 `shared_templates` have amplitudes shared by all the processes, with
 `shared_groups` summing to zero, in `info["shared_amplitudes"]`; see
 {class}`~pysanepic.GLS`). `apply_A` and `rhs` are not available with templates.
+`set_templates` replaces the templates keeping the rest of the setup, and
 `binned(tod)` gives the binned (white-noise) map of timelines laid out like
 `pix`.
 
