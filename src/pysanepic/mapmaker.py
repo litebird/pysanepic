@@ -166,7 +166,8 @@ class DetectorData:
     the sky is psi + pol_angle_rad without HWP, and
     psi + 2 hwp_angle - pol_angle_rad with an ideal HWP, with psi from `pointing`.
     The TOD model is d = I + pol_efficiency (Q cos 2a + U sin 2a) + noise, with
-    `a` that angle.
+    `a` that angle; with calibration, d = g (I + pol_efficiency (Q cos 2a +
+    U sin 2a) + dipole) + noise (see :class:`CalibrationParameters`).
 
     noise: the noise model, a :class:`OneOverFNoise` or a
     :class:`TabulatedNoise` (any object with a `weights(ns, fs)` method giving
@@ -181,7 +182,9 @@ class DetectorData:
     which is the exact GLS solution without them.
 
     dipole: the dipole signal in the TOD (K, like `tod`), or None; needed with
-    calibration (see :class:`CalibrationParameters`).
+    calibration (see :class:`CalibrationParameters`), and then subtracted from
+    the calibrated TOD. Ignored without calibration: subtract it from `tod`
+    beforehand if it should not be in the maps.
     """
 
     tod: np.ndarray
@@ -255,13 +258,14 @@ class MapResult:
     Attributes
     ----------
     maps : (3, npix) I/Q/U in K, or (1, npix) if pol=False; RING ordering,
-        hp.UNSEEN where not solved.
+        hp.UNSEEN where not solved. With calibration: from the calibrated TOD,
+        DetectorData.dipole subtracted.
     hit_map : number of samples per pixel.
     nside, coordinates : pixelization of the maps.
     iterations : number of PCG iterations.
     converged : whether norm(r)^2 / norm(b)^2 < tol was reached.
-    residuals : norm(r)^2 / norm(b)^2 at each iteration (of the last
-        calibration iteration).
+    residuals : norm(r)^2 / norm(b)^2 at each iteration. With calibration,
+        iterations, converged and residuals are those of the last GLS solve.
     gains : with calibration, the gains of the DetectorData of this rank (in
         the order of `data`, groups expanded): one array each, one gain per
         period of gain_period_s from its first sample. None otherwise.
@@ -343,14 +347,27 @@ class GLSParameters:
 class CalibrationParameters:
     """Gain calibration on the dipole, fitted together with the maps.
 
-    The TOD is modeled as d = g (P m + D) + n, with D = DetectorData.dipole
-    and one gain g per detector and period. Linearized around the current
-    gains: d / g - D = P m + T dg + n, with the template T = D + P m_prev,
-    solved for the map and dg at once by the PCG, then g <- g (1 + dg) and again,
-    `n_iter` times. Only D is subtracted: a dipole left in the map (e.g. the
-    solar one) must not be in D. A gain common to all periods would rescale
-    the map too: it is fixed by the part of D that is not a sky signal (the
-    orbital dipole), so D must include it.
+    The TOD is modeled as d = g (P m + D) + n, with P m the I/Q/U signal (as in
+    :class:`DetectorData`), D = DetectorData.dipole and one gain g per
+    detector and period. Linearized around the current gains (1 at the start):
+    d / g - D = P m + T dg + n, with the template T = D + P m_prev (the I/Q/U
+    maps of the previous iteration, polarization included), solved for the
+    maps and dg at once by the PCG, then g <- g (1 + dg) and again, `n_iter`
+    times. Neglected: dg P (m - m_prev), which vanishes as the iterations
+    converge, and the noise rescaled by 1 / g (weights unchanged).
+
+    Only D is subtracted: a dipole left in the map (e.g. the solar one) must
+    not be in D. A gain common to all periods would rescale the map too: it
+    is fixed by the part of D that is not a sky signal (the orbital dipole),
+    so D must include it; the solar dipole and the sky give the relative
+    gains. Samples in pixels whose Q/U are not solved (see
+    GLSParameters.min_pol_rcond) do not enter the fit of the gains (their
+    polarization is not modelled) but are calibrated. Signal not described
+    by one sky map for all detectors (structure below the pixel size,
+    foregrounds seen differently through different bandpasses) biases the
+    gains: mask it. The gains are unknowns local to the process of their
+    detector (no MPI communication). The pol_efficiency and the polarization
+    angles are not calibrated.
 
     Attributes
     ----------
@@ -364,11 +381,13 @@ class CalibrationParameters:
         where signal below the pixel size or not in the model would bias the
         gains through the 1/f weights): their samples are flagged in the
         n_iter iterations (with GLSParameters.flag_method; "offset" takes no
-        memory), then one more GLS solve makes the maps with all the samples
-        and the final gains. None: all pixels.
-    sky : I/Q/U maps (nside and coordinates of the output maps) for the
-        template, T = D + P sky, in every iteration; None: the maps of the
-        previous iteration.
+        memory; together with DetectorData.flags), then one more GLS solve
+        makes the maps with all the samples and the final gains. None: all
+        pixels.
+    sky : I/Q/U maps in K (nside and coordinates of the output maps; UNSEEN
+        taken as 0) for the template, T = D + P sky, in every iteration
+        instead of the maps of the previous iteration (None). Its errors
+        enter only multiplied by dg.
     """
 
     gain_period_s: float = 3600.0
@@ -507,7 +526,9 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     calibration : CalibrationParameters or None
         Fit the gains on the dipole together with the maps (see
         CalibrationParameters); `data` is then read n_iter times (+ 1 with a
-        mask).
+        mask): a generator is turned into a list first, so the pointings are
+        still computed one detector at a time but the DetectorData are all
+        kept. The gains are in MapResult.gains.
     """
     if calibration is None:
         return _make_maps(data, nside, coordinates, params, comm, nthreads, verbose)

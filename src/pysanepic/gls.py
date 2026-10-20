@@ -819,7 +819,9 @@ class GLS:
 
         Stops when norm(r)^2 / norm(b)^2 < tol (same criterion as SANEPIC).
         x0: optional starting map (ncomp, nobs). Returns (map (ncomp, nobs) on
-        every rank, info dict).
+        every rank, info dict) with "iterations", "converged", "residuals"
+        (norm(r)^2 / norm(b)^2 at each iteration) and "amplitudes" (the
+        template amplitudes of this rank, by label; empty without templates).
         """
         b = self._apply(tod=_chunks(tod))
         bb = self._dot(b, b)
