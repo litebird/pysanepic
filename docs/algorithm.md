@@ -156,6 +156,29 @@ not fixed on the sky, the orbital dipole: it sets the absolute calibration.
 In noiseless tests the iterations converge as
 $3\times10^{-4} \to 3\times10^{-8} \to 5\times10^{-15}$.
 
+## Sky model and bandpass templates
+
+A sky model $S$ is subtracted from the TOD, $d - S(t) = P\,m_\text{res} + n$,
+and the maps are $m_\text{res} + \bar S$, with $\bar S$ the binned map of
+$S(t)$ ($(P^T P)^{-1} P^T S$, white weights). For a model sampled in the pixel
+$S(t) = P\,\bar S$ and nothing changes where Q/U are solved; for alm
+interpolated at the pointing, $S(t) - P\,\bar S$ is the structure of the
+model below the pixel size, which the GLS would otherwise spread through the
+1/f weights. If the model is exact, $m_\text{res}$ is noise only and the maps
+are the binned maps of the signal.
+
+Bandpass templates $B_k(t)$ enter the model as $\sum_k a_{ik} B_k(t)$, with
+one amplitude per template and detector. These amplitudes are *shared*
+unknowns: a detector has `DetectorData` on several processes, so they are
+kept on the first process, broadcast before each product and summed over the
+processes after it (an allreduce of a few numbers per PCG iteration). The
+common part $\sum_i a_{ik}$ multiplies a sky signal and is degenerate with
+the map: the constraint $\sum_i a_{ik} = 0$ is imposed by projecting the
+shared part of the PCG vectors (the operator becomes $\Pi A \Pi$, with $\Pi$
+the projector on the constraint). With calibration all of it is linearized
+together: $d/g - D - S - \sum a B = P\,m_\text{res} + T\,\delta g +
+\sum B\,\delta a + n$, $T = D + S + \sum a B + P\,m_\text{res,prev}$.
+
 ## Differences from the C++ SANEPIC
 
 - 3×3 block preconditioner (the C++ code has the Jacobi one, also available);

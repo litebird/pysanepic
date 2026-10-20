@@ -147,6 +147,7 @@ The conventions are the same as litebird_sim:
 | `iterations` | Number of PCG iterations |
 | `residuals` | $\lvert r\rvert^2/\lvert b\rvert^2$ at each iteration |
 | `gains` | With [calibration](#calibration), one array of gains per `DetectorData` of this process; `None` otherwise |
+| `bandpass` | With [bandpass templates](#bandpass-templates), `{template: {detector: amplitude}}`, on every process; `None` otherwise |
 
 Pixels without hits are `healpy.UNSEEN` in all components. In pixels where Q
 and U cannot be separated (too few hits, or a poor coverage of polarization
@@ -260,12 +261,62 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 |---|---|
 | `gain_period_s` | One gain per detector and period of this duration [s], from the first sample of each `DetectorData`; `inf`: one per `DetectorData` |
 | `n_iter` | Calibration iterations, each a full GLS solve (default 3) |
-| `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the calibration (e.g. the Galactic plane), as the usual masks; then one more solve makes the maps with all the samples |
-| `sky` | I/Q/U maps for the template instead of the map of the previous iteration |
+| `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the fits (e.g. the Galactic plane), as the usual masks; or `{"gain": ..., "bandpass": ...}`, one per kind of fit (see [below](#bandpass-templates)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
 
 The absolute calibration comes from the orbital dipole: a gain common to all
 periods would otherwise just rescale the map. Signal that the map cannot
 model, such as the Galaxy below the pixel size, biases the gains through the
-1/f weights: mask it. See [calibration](algorithm.md#calibration) and the
+1/f weights: model it (`sky_model` as alm, `bandpass_templates`, below) or
+mask it. See [calibration](algorithm.md#calibration) and the
 [notebook](notebooks/calibration), where the gain period and the mask
 are tested.
+
+## Sky model
+
+`make_maps(sky_model=...)` takes a model of the sky seen by all the detectors,
+I or I/Q/U in K in the coordinates of the maps, as one array or a dict of
+components that are summed (e.g. `{"cmb": ..., "fg": ...}`):
+
+- **alm** (complex, healpy order, mmax = lmax): interpolated at the exact
+  pointing of each sample with `ducc0.sht.synthesis_general` (the `Pointing`
+  needs angles);
+- **HEALPix maps** at the output nside: sampled in the pixel.
+
+Its TOD is subtracted from the data and its binned map is put back in the
+result, so the maps are still those of the whole sky. With alm this removes the
+structure of the model below the pixel size, which otherwise leaks through the
+1/f weights into the maps (pixelization noise) and, with calibration, into the
+gains. With maps the result only changes in pixels whose Q/U are not solved
+(their polarization is removed) and in the calibration template. Without
+calibration the dipole is not used.
+
+## Bandpass templates
+
+`make_maps(bandpass_templates={name: template, ...})` fits, for each template
+(maps or alm, as `sky_model`, but not part of it), one amplitude per detector
+(`DetectorData.name`, shared by all its `DetectorData`, also on different MPI
+processes), with the amplitudes of a template summing to zero over the
+detectors (their common part is the map). For the foregrounds seen through
+different bands:
+
+```python
+result = make_maps(data, nside, params=params, calibration=cal,
+                   sky_model={"cmb": cmb_alm, "fg": fg_alm},
+                   bandpass_templates={"fg_deriv1": dfg_dnu_alm})   # or {"fg": fg_alm}
+result.bandpass   # {"fg_deriv1": {"d0": shift of the band of d0 [GHz], ...}}
+```
+
+With the derivative of the foreground with respect to frequency
+($F_i \simeq F + \Delta\nu_i\,\partial F/\partial\nu$) the amplitudes are the
+shifts of the bands, and the spatial variation of the spectral index is taken
+into account; with `{"fg": ...}` each detector scales the foreground. Several
+templates (components, higher derivatives) can be passed, but templates nearly
+proportional to each other are not separable. The fit is in the same PCG as
+the maps: in one solve, or in each calibration iteration.
+
+A mask per kind of fit, e.g. `mask={"gain": galaxy * sources, "bandpass":
+sources}`: the bandpass amplitudes are fitted on the Galaxy, where the
+foreground is bright, point sources missing from the model are left out of
+everything. Samples left out of some fits only keep the other templates; they
+are calibrated with the values of the previous iteration, so the iterations
+converge slower. See the [notebook](notebooks/sky_model).

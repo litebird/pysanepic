@@ -59,6 +59,7 @@ notebooks/noise_estimation
 notebooks/correlated_noise
 notebooks/common_mode_estimation
 notebooks/calibration
+notebooks/sky_model
 ```
 
 ```{toctree}

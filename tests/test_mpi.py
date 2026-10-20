@@ -81,6 +81,31 @@ def test_calibration_mpi():
                 assert np.abs(g - g0).max() < 1e-9
 
 
+def test_bandpass_mpi():
+    """Bandpass amplitudes shared by the two halves of each detector, on
+    different ranks: the serial result, on every rank."""
+    import dataclasses
+
+    from pysanepic import GLSParameters, make_maps
+    from test_mapmaker import _bandpass_data
+
+    comm = MPI.COMM_WORLD
+    n, per = 60_000, 12_000
+    data, true, _, fg = _bandpass_data(16, n, 10.0, per, np.array([0.05, -0.02, 0.03, 0.01]))
+    t = np.arange(n)
+    halves = []
+    for d, g in zip(data, true):
+        flat = d.tod / g[t // per] - d.dipole
+        for sl in (slice(0, n // 2), slice(n // 2, n)):
+            p = d.pointing
+            halves.append(dataclasses.replace(d, tod=flat[sl], dipole=None, pointing=dataclasses.replace(
+                p, theta=p.theta[sl], phi=p.phi[sl], psi=p.psi[sl])))
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20), bandpass_templates={"fg": fg})
+    res = make_maps(halves[comm.rank :: comm.size], 16, comm=comm, **kw).bandpass["fg"]
+    ref = make_maps(halves, 16, **kw).bandpass["fg"]
+    assert set(res) == set(ref) and all(abs(res[k] - ref[k]) < 1e-9 for k in ref)
+
+
 def test_more_ranks_than_pixels():
     """With MPI some ranks may own no pixels at all: same result as serial."""
     comm = MPI.COMM_WORLD
@@ -210,5 +235,6 @@ if __name__ == "__main__":
     test_detector_groups_mpi()
     test_estimate_common_modes_mpi()
     test_calibration_mpi()
+    test_bandpass_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

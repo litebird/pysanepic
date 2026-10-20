@@ -19,8 +19,12 @@ for the exact GLS without them); `apply_A` and `rhs` are then not available,
 use `solve`. `common_modes` correlates chunks observed at the same times, and
 `templates`, a list of `(chunk, values, labels)`, fits template amplitudes
 with the map (the TOD of the chunk gets `values * a[labels]`, labels -1: none;
-amplitudes local to each process, returned in `info["amplitudes"]`; see
+amplitudes local to each process, returned in `info["amplitudes"]`;
+`shared_templates` have amplitudes shared by all the processes, with
+`shared_groups` summing to zero, in `info["shared_amplitudes"]`; see
 {class}`~pysanepic.GLS`). `apply_A` and `rhs` are not available with templates.
+`binned(tod)` gives the binned (white-noise) map of timelines laid out like
+`pix`.
 
 ```python
 import numpy as np

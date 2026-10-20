@@ -9,6 +9,7 @@ Run with: pytest tests/  (or: python tests/test_mapmaker.py)
 
 import dataclasses
 
+import ducc0
 import healpy as hp
 import numpy as np
 import pytest
@@ -329,6 +330,49 @@ def test_templates_exact_gls():
         GLS(pix, psi, w, templates=templates[:1]).rhs(tod)
 
 
+def test_shared_templates_exact_gls():
+    """Shared amplitudes (one per "detector", over chunks) with a sum-zero
+    constraint, plus a local one: equal the dense GLS restricted to the
+    constraint (null-space basis), also when the shared template is a sky
+    signal (P B), whose common amplitude is degenerate with the map."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(29)
+    npix, ns, fs, nchunk = 6, 96, 10.0, 4
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, fs, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    Ps, _ = _dense_gls(pix, psi, np.eye(ns), npix)
+    B = rng.normal(size=3 * npix)  # a sky template: exactly degenerate in its common amplitude
+    det = [0, 1, 0, 1]  # chunks 0, 2 of "detector" 0, chunks 1, 3 of detector 1
+    shared = [(k, Ps[k] @ B, np.full(ns, det[k])) for k in range(nchunk)]
+    shared += [(k, rng.normal(size=ns), np.full(ns, 2 + det[k])) for k in range(nchunk)]  # a second template
+    local = [(2, rng.normal(size=ns), np.zeros(ns, int))]
+    g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, templates=local,
+            shared_templates=shared, shared_groups=[[0, 1], [2, 3]])
+    x, info = g.solve(tod, tol=1e-26, maxiter=1000)
+    assert info["converged"] and info["shared_amplitudes"].shape == (4,)
+
+    # dense: unknowns [map, local, shared]; the constraint by a null-space basis
+    n = 3 * npix
+    cols = [np.hstack([P, np.zeros((ns, 5))]) for P in Ps]
+    cols[2][:, n] += local[0][1]
+    for k, values, labels in shared:
+        cols[k][np.arange(ns), n + 1 + labels] += values
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+    Ninv = np.linalg.inv(np.linalg.inv(np.fft.irfft(w[0], n=ns)[lag]))
+    A = sum(P.T @ Ninv @ P for P in cols)
+    b = sum(P.T @ Ninv @ d for P, d in zip(cols, tod))
+    C = np.zeros((2, n + 5))
+    C[0, n + 1 : n + 3] = C[1, n + 3 : n + 5] = 1
+    Z = np.linalg.svd(C)[2][2:].T  # basis of the null space of C
+    ref = Z @ np.linalg.solve(Z.T @ A @ Z, Z.T @ b)
+    assert np.abs(x - ref[:n].reshape(3, npix)).max() < 1e-9 * np.abs(ref).max()
+    assert np.allclose(info["amplitudes"], ref[n : n + 1], rtol=1e-8)
+    assert np.allclose(info["shared_amplitudes"], ref[n + 1 :], rtol=1e-8, atol=1e-12)
+
+
 def _calibration_data(nside, n, fs, per):
     """_four_detectors with solar + orbital dipole (the orbital velocity turns
     once over the data, as in the year of _scan) and gains drifting every `per`
@@ -360,10 +404,10 @@ def test_calibration_noiseless():
     # through the 1/f weights, in the maps and in the gains
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
     band = np.abs(hp.pix2vec(nside, np.arange(12 * nside**2))[2]) < 0.3
-    for cal in (CalibrationParameters(gain_period_s=per / fs),
-                CalibrationParameters(gain_period_s=per / fs, mask=~band),  # 1 = used: the band is left out
-                CalibrationParameters(gain_period_s=per / fs, sky=sky, n_iter=2)):
-        r = make_maps(data, nside, coordinates="E", params=params, calibration=cal)
+    for cal, model in ((CalibrationParameters(gain_period_s=per / fs), None),
+                       (CalibrationParameters(gain_period_s=per / fs, mask=~band), None),  # 1 = used: the band is left out
+                       (CalibrationParameters(gain_period_s=per / fs, n_iter=2), sky)):  # sky model: a map
+        r = make_maps(data, nside, coordinates="E", params=params, calibration=cal, sky_model=model)
         assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
         seen = r.maps[1] != hp.UNSEEN
         err = r.maps[:, seen] - sky[:, seen]
@@ -374,6 +418,141 @@ def test_calibration_noiseless():
         make_maps([dataclasses.replace(data[0], dipole=None)], nside, calibration=CalibrationParameters())
     with pytest.raises(ValueError, match="mask"):
         make_maps(data, nside, calibration=CalibrationParameters(mask=band[:10]))
+
+
+def test_sky_model_sampling():
+    """alm interpolated at the pixel centers equal the alm2map maps sampled in
+    the pixel (I and Q/U with the polarization angle and efficiency); a
+    rotated pointing gives the same signal."""
+    from pysanepic.mapmaker import _components, _project_maps, _sample
+
+    nside, lmax = 8, 16
+    rng = np.random.default_rng(31)
+    alm = (rng.normal(size=(3, hp.Alm.getsize(lmax))) + 1j * rng.normal(size=(3, hp.Alm.getsize(lmax))))
+    alm[:, : lmax + 1] = alm[:, : lmax + 1].real  # m = 0: real
+    maps = hp.alm2map(alm, nside, lmax=lmax)
+    pix = np.arange(12 * nside**2)
+    theta, phi = hp.pix2ang(nside, pix)
+    psi = rng.uniform(0, np.pi, pix.size)
+    d = DetectorData(tod=np.zeros(pix.size), pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="G"),
+                     sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3, pol_efficiency=0.9)
+    angle = psi + 0.3
+    ref = _project_maps(maps, pix, angle, 0.9)
+    assert np.abs(_sample(_components(alm, nside, "x"), d, pix, angle, "G", 1) - ref).max() < 1e-8 * np.abs(ref).max()
+    assert np.allclose(_sample(_components(maps, nside, "x"), d, pix, angle, "G", 1), ref)
+    # the same pointing in Ecliptic coordinates, interpolated in Galactic
+    th_e, ph_e = hp.Rotator(coord=["G", "E"])(theta, phi)
+    psi_e = psi - hp.Rotator(coord=["G", "E"]).angle_ref(theta, phi)
+    d_e = dataclasses.replace(d, pointing=Pointing(theta=th_e, phi=ph_e, psi=psi_e, coordinates="E"))
+    assert np.abs(_sample(_components(alm, nside, "x"), d_e, pix, angle, "G", 1) - ref).max() < 1e-6 * np.abs(ref).max()
+    with pytest.raises(ValueError, match="alm"):
+        _components(alm[:, :-1], nside, "x")
+    with pytest.raises(ValueError, match="pixels"):
+        _components(maps[:, :-1], nside, "x")
+
+
+def _subpixel_data(nside, n, fs, hi=64, seed=33):
+    """_four_detectors on a sky with structure below the pixel size: the TOD
+    interpolated from alm at lmax 2 hi; returns (data, alm)."""
+    rng = np.random.default_rng(seed)
+    lmax = 2 * hi
+    cl = 1e-8 / (1 + np.arange(lmax + 1)) ** 1.5
+    alm = np.array([hp.synalm(cl, lmax=lmax) for _ in range(3)])
+    data = []
+    for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
+        theta, phi, psi = _scan(n, rng)
+        loc = np.stack([theta, phi % (2 * np.pi)], axis=1)
+        t = ducc0.sht.synthesis_general(alm=alm[:1], spin=0, lmax=lmax, loc=loc, epsilon=1e-12)[0]
+        q, u = ducc0.sht.synthesis_general(alm=alm[1:], spin=2, lmax=lmax, loc=loc, epsilon=1e-12)
+        a = psi + pol_angle
+        data.append(DetectorData(tod=t + q * np.cos(2 * a) + u * np.sin(2 * a),
+                                 pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,
+                                 noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
+                                 pol_angle_rad=pol_angle, name=f"d{i}"))
+    return data, alm
+
+
+def test_sky_model():
+    """A sky model as alm removes the structure below the pixel size: noiseless
+    1/f GLS maps equal the binned maps (the white-noise GLS), which they do
+    not without the model; as maps it changes nothing if Q/U are solved
+    everywhere."""
+    nside, n, fs = 16, 60_000, 10.0
+    data, alm = _subpixel_data(nside, n, fs)
+    # default min_pol_rcond: in near-singular pixels the iterative and the direct (binned) solutions differ
+    params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64)
+    plain = make_maps(data, nside, coordinates="E", params=params)
+    seen = plain.maps[1] != hp.UNSEEN
+    white = make_maps([dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=40.0)) for d in data], nside,
+                      coordinates="E", params=params)
+    as_alm = make_maps(data, nside, coordinates="E", params=params, sky_model=alm)
+
+    def diff(a, b):
+        e = (a.maps - b.maps)[:, seen]
+        e[0] -= e[0].mean()  # I monopole unconstrained with 1/f weights
+        return np.abs(e).max() / np.abs(white.maps[:, seen]).max()
+
+    assert diff(plain, white) > 1e-3  # the structure below the pixel size leaks through the 1/f weights
+    assert diff(as_alm, white) < 1e-10
+    # as maps (sampled in the pixel), with Q/U solved everywhere: no change
+    p0 = dataclasses.replace(params, min_pol_rcond=0.0)
+    ref = make_maps(data, nside, coordinates="E", params=p0)
+    as_maps = make_maps(data, nside, coordinates="E", params=p0, sky_model={"cmb": hp.alm2map(alm, nside)})
+    assert diff(as_maps, ref) < 1e-8
+
+
+def _bandpass_data(nside, n, fs, per, amp):
+    """_calibration_data plus a foreground seen as (1 + amp[i]) F by detector i."""
+    data, true, sky = _calibration_data(nside, n, fs, per)
+    rng = np.random.default_rng(37)
+    fg = hp.smoothing(rng.normal(0, 3e-4, (3, 12 * nside**2)), fwhm=np.radians(10))
+    t = np.arange(n)
+    out = []
+    for i, (d, g) in enumerate(zip(data, true)):
+        pix, angle = hp.ang2pix(nside, d.pointing.theta, d.pointing.phi), d.pointing.psi + d.pol_angle_rad
+        f = fg[0, pix] + fg[1, pix] * np.cos(2 * angle) + fg[2, pix] * np.sin(2 * angle)
+        out.append(dataclasses.replace(d, tod=d.tod + g[t // per] * (1 + amp[i]) * f, name=f"d{i}"))
+    return out, true, sky, fg
+
+
+def test_bandpass_templates():
+    """A foreground seen with a different amplitude by each detector: the
+    amplitudes (minus their mean) are recovered, alone and with the gains,
+    and the maps are sky + (1 + mean) fg; also with masks for each fit."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per = 16, 120_000, 10.0, 12_000
+    amp = np.array([0.05, -0.02, 0.03, 0.01])
+    data, true, sky, fg = _bandpass_data(nside, n, fs, per, amp)
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
+    expect = {f"d{i}": a - amp.mean() for i, a in enumerate(amp)}
+    band = np.abs(hp.pix2vec(nside, np.arange(12 * nside**2))[2]) > 0.3  # 1 = used
+    spot = np.ones(12 * nside**2, bool)
+    spot[hp.query_disc(nside, hp.ang2vec(1.0, 2.0), np.radians(10))] = False
+    # samples out of the gain fit only (band): calibrated with the gains of the
+    # previous iteration, so the iterations converge slower (~5x each)
+    cases = [(CalibrationParameters(gain_period_s=per / fs), 1e-9),
+             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot), 1e-9),
+             (CalibrationParameters(gain_period_s=per / fs, mask={"gain": band * spot, "bandpass": spot}, n_iter=10), 1e-8)]
+    cases.append((CalibrationParameters(gain_period_s=per / fs), 1e-9, {"fg": fg}))  # with a sky model too
+    for cal, tol, *model in cases:
+        r = make_maps(data, nside, coordinates="E", params=params, bandpass_templates={"fg": fg}, calibration=cal,
+                      sky_model=model[0] if model else None)
+        assert max(abs(r.bandpass["fg"][k] - v) for k, v in expect.items()) < tol
+        assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < tol
+        seen = r.maps[1] != hp.UNSEEN
+        err = (r.maps - sky - (1 + amp.mean()) * fg)[:, seen]
+        err[0] -= err[0].mean()
+        assert np.abs(err).max() < 1e4 * tol * np.abs(sky).max()
+    # without gains (calibrated data, dipole removed): one solve
+    t = np.arange(n)
+    flat = [dataclasses.replace(d, tod=d.tod / g[t // per] - d.dipole, dipole=None) for d, g in zip(data, true)]
+    r = make_maps(flat, nside, coordinates="E", params=params, bandpass_templates={"fg": fg})
+    assert r.gains is None and max(abs(r.bandpass["fg"][k] - v) for k, v in expect.items()) < 1e-9
+    with pytest.raises(ValueError, match="name"):
+        make_maps([dataclasses.replace(flat[0], name=None)], nside, bandpass_templates={"fg": fg})
+    with pytest.raises(ValueError, match="mask"):
+        make_maps(data, nside, calibration=CalibrationParameters(mask={"gains": band}))
 
 
 def test_coarse_preconditioner():

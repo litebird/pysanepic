@@ -13,6 +13,23 @@ Changes on `main` that are not in a release yet.
   masked pixels out of the calibration (their samples are flagged) and makes
   the final maps with all the samples: in the notebook, the Galaxy below the
   pixel size biases the absolute calibration by 2% without it, 0.08% with it.
+- `make_maps(sky_model=...)`: a sky model (maps, or alm interpolated at the
+  pointing with `ducc0.sht.synthesis_general`; a dict of components is
+  summed) is subtracted from the TOD and its binned map put back: with alm, no
+  leakage of its structure below the pixel size through the 1/f weights.
+  Replaces `CalibrationParameters.sky`.
+- `make_maps(bandpass_templates={name: template})`: one amplitude per template
+  and detector (`DetectorData.name`), summing to zero over the detectors,
+  fitted with the maps (and the gains), in `MapResult.bandpass`; with
+  $\partial F/\partial\nu$ as template the amplitudes are the shifts of the
+  bands. In the notebook (dust with a varying spectral index, bands shifted
+  by ±1.5 GHz) the shifts are recovered within the noise and the Q/U error
+  drops from 3.8 to 1.3 µK.
+- `CalibrationParameters.mask` is 1 for pixels used, 0 for pixels left out
+  (the usual convention), and can be `{"gain": ..., "bandpass": ...}`.
+- `GLS(shared_templates=..., shared_groups=...)`: template amplitudes shared by
+  all the MPI processes, with sum-zero constraints; `GLS.binned(tod)`;
+  `Pointing.angles(coordinates)`.
 - `GLS(templates=[(chunk, values, labels), ...])`: template amplitudes fitted
   together with the map, local unknowns of each process, returned in
   `info["amplitudes"]`.
