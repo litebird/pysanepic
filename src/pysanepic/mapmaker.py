@@ -548,12 +548,13 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         mask): a generator is turned into a list first, so the pointings are
         still computed one detector at a time but the DetectorData are all
         kept. The gains are in MapResult.gains.
-    sky_model : array, dict of arrays, or None
-        A model of the sky seen by all the detectors, I or I/Q/U in K in the
-        coordinates of the maps: HEALPix maps at `nside` (real arrays) are
+    sky_model : array or None
+        A model of the whole sky seen by all the detectors (e.g. CMB +
+        foregrounds at the reference frequency), I or I/Q/U in K in the
+        coordinates of the maps: HEALPix maps at `nside` (real array) are
         sampled in the pixel, alm (complex, healpy order, mmax = lmax) are
         interpolated at the pointing (ducc0 synthesis_general; needs Pointing
-        angles); a dict (e.g. {"cmb": ..., "fg": ...}) is summed. Its TOD is
+        angles). Its TOD is
         subtracted and its binned map put back in the maps, so they are still
         those of the whole sky: with alm, the model removes its structure
         below the pixel size, which would otherwise leak through the 1/f
@@ -562,19 +563,19 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         polarization, which would leak too), and the calibration template.
     bandpass_templates : dict or None
         Templates of the signal that depends on the bandpass, e.g. {"fg": fg}
-        (the foreground scaled per detector) or {"fg_deriv1": dF/dnu,
-        "fg_deriv2": d2F/dnu2} (its expansion in the shift of the band; the
-        amplitudes are then the shifts): maps or alm, as sky_model, but not
-        part of it. Each one gets an amplitude per detector (DetectorData.name;
+        (the foreground scaled per detector) or {"fg_deriv1": dF/dnu} (the
+        first order of its expansion in the shift of the band, around the
+        frequency of the foreground in sky_model; the amplitudes are then the
+        shifts): maps or alm, as sky_model, but not part of it. Each one gets an amplitude per detector (DetectorData.name;
         shared by the DetectorData of a detector, also across MPI processes),
         summing to zero over the detectors (the common part is the map),
         fitted with the maps: in one solve, or in each calibration iteration.
         Templates nearly proportional to each other are not separable. The
         amplitudes are in MapResult.bandpass.
     """
-    sky = _components(sky_model, nside, "sky_model")
-    bands = {k: _components(v, nside, f"bandpass_templates[{k!r}]")[0] for k, v in (bandpass_templates or {}).items()}
-    if calibration is None and not sky and not bands:
+    sky = None if sky_model is None else _model(sky_model, nside, "sky_model")
+    bands = {k: _model(v, nside, f"bandpass_templates[{k!r}]") for k, v in (bandpass_templates or {}).items()}
+    if calibration is None and sky is None and not bands:
         return _make_maps(data, nside, coordinates, params, comm, nthreads, verbose)[0]
     data = list(data)
     dets = [d for x in data for d in (x.detectors if isinstance(x, DetectorGroup) else [x])]
@@ -605,7 +606,7 @@ class _Fit:
     """What _make_maps fits besides the maps, and the current estimates."""
 
     calibration: "CalibrationParameters | None"  # None: no gains (and no dipole)
-    sky: list  # sky model components (maps or alm), subtracted and put back
+    sky: np.ndarray | None  # sky model (maps or alm), subtracted and put back
     bands: dict  # bandpass templates: name -> map or alm, one amplitude per detector
     index: dict  # (template name, detector name) -> shared amplitude
     amp: np.ndarray  # current bandpass amplitudes
@@ -617,25 +618,22 @@ class _Fit:
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
 
-def _components(model, nside, name):
-    """Sky model components (a single array, or a dict of them): HEALPix maps
-    (real, (npix,) or (ncomp, npix)) or alm (complex, (nalm,) or (ncomp,
-    nalm), healpy order, mmax = lmax)."""
-    if model is None:
-        return []
-    out = []
-    for x in model.values() if isinstance(model, dict) else [model]:
-        x = np.atleast_2d(np.asarray(x))
-        if np.iscomplexobj(x):
-            lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
-            if (lmax + 1) * (lmax + 2) // 2 != x.shape[1]:
-                raise ValueError(f"{name}: alm must have (lmax+1)(lmax+2)/2 coefficients (mmax = lmax)")
-        elif x.shape[1] != 12 * nside * nside:
-            raise ValueError(f"{name}: maps must have 12 nside^2 = {12 * nside * nside} pixels (alm: complex)")
-        if x.shape[0] not in (1, 3):
-            raise ValueError(f"{name}: I or I/Q/U, not {x.shape[0]} components")
-        out.append(x)
-    return out
+def _model(x, nside, name):
+    """A sky model or template as (ncomp, n): HEALPix maps (real, (npix,) or
+    (ncomp, npix)) or alm (complex, (nalm,) or (ncomp, nalm), healpy order,
+    mmax = lmax); ncomp is 1 (I) or 3 (I/Q/U)."""
+    if isinstance(x, dict):
+        raise ValueError(f"{name}: one array (sum the components)")
+    x = np.atleast_2d(np.asarray(x))
+    if np.iscomplexobj(x):
+        lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
+        if (lmax + 1) * (lmax + 2) // 2 != x.shape[1]:
+            raise ValueError(f"{name}: alm must have (lmax+1)(lmax+2)/2 coefficients (mmax = lmax)")
+    elif x.shape[1] != 12 * nside * nside:
+        raise ValueError(f"{name}: maps must have 12 nside^2 = {12 * nside * nside} pixels (alm: complex)")
+    if x.shape[0] not in (1, 3):
+        raise ValueError(f"{name}: I or I/Q/U, not {x.shape[0]} components")
+    return x
 
 
 def _masks(mask, nside):
@@ -651,24 +649,22 @@ def _masks(mask, nside):
     return out
 
 
-def _sample(components, d, pix, angle, coordinates, nthreads):
-    """The TOD of a sky model for one DetectorData: maps sampled in the pixel,
-    alm interpolated at the pointing (ducc0 synthesis_general)."""
-    tod = np.zeros(len(pix))
-    loc = None
-    for x in components:
-        if not np.iscomplexobj(x):
-            tod += _project_maps(x, pix, angle, d.pol_efficiency)
-            continue
-        if loc is None:
-            theta, phi, _ = d.pointing.angles(coordinates, nthreads)
-            loc = np.stack([theta, phi], axis=1)
-        lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
-        eps = 1e-6 if x.dtype == np.complex64 else 1e-10
-        tod += ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
-        if x.shape[0] == 3:
-            q, u = ducc0.sht.synthesis_general(alm=x[1:], spin=2, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)
-            tod += d.pol_efficiency * (q * np.cos(2 * angle) + u * np.sin(2 * angle))
+def _sample(x, d, pix, angle, coordinates, nthreads):
+    """The TOD of a sky model (from _model, or None: 0) for one DetectorData:
+    maps sampled in the pixel, alm interpolated at the pointing (ducc0
+    synthesis_general)."""
+    if x is None:
+        return np.zeros(len(pix))
+    if not np.iscomplexobj(x):
+        return _project_maps(x, pix, angle, d.pol_efficiency)
+    theta, phi, _ = d.pointing.angles(coordinates, nthreads)
+    loc = np.stack([theta, phi], axis=1)
+    lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
+    eps = 1e-6 if x.dtype == np.complex64 else 1e-10
+    tod = ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
+    if x.shape[0] == 3:
+        q, u = ducc0.sht.synthesis_general(alm=x[1:], spin=2, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)
+        tod += d.pol_efficiency * (q * np.cos(2 * angle) + u * np.sin(2 * angle))
     return tod
 
 
@@ -709,7 +705,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             sky_tod = _sample(fit.sky, d, pix, angle, coordinates, nthreads)
             known = sky_tod.copy()
             for k, b in fit.bands.items():
-                btmpl[k] = _sample([b], d, pix, angle, coordinates, nthreads)
+                btmpl[k] = _sample(b, d, pix, angle, coordinates, nthreads)
                 known += fit.amp[fit.index[k, d.name]] * btmpl[k]
             if cal is not None:
                 per = int(round(cal.gain_period_s * fs)) if np.isfinite(cal.gain_period_s) else len(d.tod)
@@ -767,7 +763,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     for name, t in btmpl.items():
                         lab = np.concatenate([none, np.full(b - a, fit.index[name, d.name]), none])
                         shared.append((k, np.concatenate([zero, t[a:b], zero]), lab))
-                if fit.sky:
+                if fit.sky is not None:
                     model_c.append(np.concatenate([zero, sky_tod[a:b], zero]))  # the bandpass terms are not put back
             flagged = None if flags is None else flags[a:b]
             if flagged is not None and flagged.any():
@@ -828,7 +824,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             if fit.bands:
                 fit.amp = fit.amp + info["shared_amplitudes"]
         fit.gains = gains if cal is not None else None
-        if fit.sky:  # put back the sky model, as binned from its TOD: the maps of the whole sky
+        if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky
             m = m + gls.binned(model_c)
 
     hit_map = np.zeros(npix, dtype=np.int64)

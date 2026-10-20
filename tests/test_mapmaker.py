@@ -424,7 +424,7 @@ def test_sky_model_sampling():
     """alm interpolated at the pixel centers equal the alm2map maps sampled in
     the pixel (I and Q/U with the polarization angle and efficiency); a
     rotated pointing gives the same signal."""
-    from pysanepic.mapmaker import _components, _project_maps, _sample
+    from pysanepic.mapmaker import _model, _project_maps, _sample
 
     nside, lmax = 8, 16
     rng = np.random.default_rng(31)
@@ -438,17 +438,19 @@ def test_sky_model_sampling():
                      sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3, pol_efficiency=0.9)
     angle = psi + 0.3
     ref = _project_maps(maps, pix, angle, 0.9)
-    assert np.abs(_sample(_components(alm, nside, "x"), d, pix, angle, "G", 1) - ref).max() < 1e-8 * np.abs(ref).max()
-    assert np.allclose(_sample(_components(maps, nside, "x"), d, pix, angle, "G", 1), ref)
+    assert np.abs(_sample(_model(alm, nside, "x"), d, pix, angle, "G", 1) - ref).max() < 1e-8 * np.abs(ref).max()
+    assert np.allclose(_sample(_model(maps, nside, "x"), d, pix, angle, "G", 1), ref)
     # the same pointing in Ecliptic coordinates, interpolated in Galactic
     th_e, ph_e = hp.Rotator(coord=["G", "E"])(theta, phi)
     psi_e = psi - hp.Rotator(coord=["G", "E"]).angle_ref(theta, phi)
     d_e = dataclasses.replace(d, pointing=Pointing(theta=th_e, phi=ph_e, psi=psi_e, coordinates="E"))
-    assert np.abs(_sample(_components(alm, nside, "x"), d_e, pix, angle, "G", 1) - ref).max() < 1e-6 * np.abs(ref).max()
+    assert np.abs(_sample(_model(alm, nside, "x"), d_e, pix, angle, "G", 1) - ref).max() < 1e-6 * np.abs(ref).max()
     with pytest.raises(ValueError, match="alm"):
-        _components(alm[:, :-1], nside, "x")
+        _model(alm[:, :-1], nside, "x")
     with pytest.raises(ValueError, match="pixels"):
-        _components(maps[:, :-1], nside, "x")
+        _model(maps[:, :-1], nside, "x")
+    with pytest.raises(ValueError, match="one array"):
+        _model({"cmb": maps}, nside, "x")
 
 
 def _subpixel_data(nside, n, fs, hi=64, seed=33):
@@ -497,7 +499,7 @@ def test_sky_model():
     # as maps (sampled in the pixel), with Q/U solved everywhere: no change
     p0 = dataclasses.replace(params, min_pol_rcond=0.0)
     ref = make_maps(data, nside, coordinates="E", params=p0)
-    as_maps = make_maps(data, nside, coordinates="E", params=p0, sky_model={"cmb": hp.alm2map(alm, nside)})
+    as_maps = make_maps(data, nside, coordinates="E", params=p0, sky_model=hp.alm2map(alm, nside))
     assert diff(as_maps, ref) < 1e-8
 
 
@@ -534,7 +536,7 @@ def test_bandpass_templates():
     cases = [(CalibrationParameters(gain_period_s=per / fs), 1e-9),
              (CalibrationParameters(gain_period_s=per / fs, mask=band * spot), 1e-9),
              (CalibrationParameters(gain_period_s=per / fs, mask={"gain": band * spot, "bandpass": spot}, n_iter=10), 1e-8)]
-    cases.append((CalibrationParameters(gain_period_s=per / fs), 1e-9, {"fg": fg}))  # with a sky model too
+    cases.append((CalibrationParameters(gain_period_s=per / fs), 1e-9, fg))  # with a sky model too
     for cal, tol, *model in cases:
         r = make_maps(data, nside, coordinates="E", params=params, bandpass_templates={"fg": fg}, calibration=cal,
                       sky_model=model[0] if model else None)

@@ -14,8 +14,7 @@ Changes on `main` that are not in a release yet.
   the final maps with all the samples: in the notebook, the Galaxy below the
   pixel size biases the absolute calibration by 2% without it, 0.08% with it.
 - `make_maps(sky_model=...)`: a sky model (maps, or alm interpolated at the
-  pointing with `ducc0.sht.synthesis_general`; a dict of components is
-  summed) is subtracted from the TOD and its binned map put back: with alm, no
+  pointing with `ducc0.sht.synthesis_general`) is subtracted from the TOD and its binned map put back: with alm, no
   leakage of its structure below the pixel size through the 1/f weights.
   Replaces `CalibrationParameters.sky`.
 - `make_maps(bandpass_templates={name: template})`: one amplitude per template

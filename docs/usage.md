@@ -273,9 +273,9 @@ are tested.
 
 ## Sky model
 
-`make_maps(sky_model=...)` takes a model of the sky seen by all the detectors,
-I or I/Q/U in K in the coordinates of the maps, as one array or a dict of
-components that are summed (e.g. `{"cmb": ..., "fg": ...}`):
+`make_maps(sky_model=...)` takes a model of the whole sky seen by all the
+detectors (e.g. CMB plus foregrounds at the reference frequency of the
+channel), I or I/Q/U in K in the coordinates of the maps, as one array:
 
 - **alm** (complex, healpy order, mmax = lmax): interpolated at the exact
   pointing of each sample with `ducc0.sht.synthesis_general` (the `Pointing`
@@ -301,18 +301,28 @@ different bands:
 
 ```python
 result = make_maps(data, nside, params=params, calibration=cal,
-                   sky_model={"cmb": cmb_alm, "fg": fg_alm},
-                   bandpass_templates={"fg_deriv1": dfg_dnu_alm})   # or {"fg": fg_alm}
+                   sky_model=cmb_alm + fg_alm,                       # at the reference frequency nu0
+                   bandpass_templates={"fg_deriv1": dfg_dnu_alm})   # dF/dnu at nu0; or {"fg": fg_alm}
 result.bandpass   # {"fg_deriv1": {"d0": shift of the band of d0 [GHz], ...}}
 ```
 
 With the derivative of the foreground with respect to frequency
 ($F_i \simeq F + \Delta\nu_i\,\partial F/\partial\nu$) the amplitudes are the
 shifts of the bands, and the spatial variation of the spectral index is taken
-into account; with `{"fg": ...}` each detector scales the foreground. Several
-templates (components, higher derivatives) can be passed, but templates nearly
-proportional to each other are not separable. The fit is in the same PCG as
+into account; with `{"fg": ...}` each detector scales the foreground. The
+expansion is around the foreground in `sky_model`: the derivative must be at
+the same reference frequency, otherwise the difference is a common part that
+the amplitudes (summing to zero) cannot absorb. The fit is in the same PCG as
 the maps: in one solve, or in each calibration iteration.
+
+More templates can be passed if needed: other components, or higher orders
+of the expansion ($\tfrac{1}{2}\Delta\nu_i^2\,\partial^2F/\partial\nu^2$,
+`{"fg_deriv1": ..., "fg_deriv2": ...}`, whose amplitudes are then fitted
+freely, not as the square of the shift). Templates nearly proportional to
+each other are not separable: with a spectral index that varies little,
+$\partial^2F/\partial\nu^2 \simeq (\beta - 1)/\nu\;\partial F/\partial\nu$, and the
+two amplitudes are meaningless (the maps are not affected). The first
+derivative is usually enough: the second order is $\sim\Delta\nu/\nu$ smaller.
 
 A mask per kind of fit, e.g. `mask={"gain": galaxy * sources, "bandpass":
 sources}`: the bandpass amplitudes are fitted on the Galaxy, where the
