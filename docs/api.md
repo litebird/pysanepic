@@ -28,6 +28,9 @@
 .. autoclass:: pysanepic.GLSParameters
    :no-members:
 
+.. autoclass:: pysanepic.CalibrationParameters
+   :no-members:
+
 .. autoclass:: pysanepic.MapResult
    :no-members:
 ```

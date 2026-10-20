@@ -134,6 +134,28 @@ of a local unknown is its diagonal element of $P^T N^{-1} P$. Long runs can
 instead split the chunk (`split_gap_s`), see
 [flagged samples](parameters.md#flagged-samples).
 
+## Calibration
+
+The TOD is modeled as $d = g\,(P m + D) + n$, with $D$ the dipole and one gain
+$g$ per detector and period. Around the current gains,
+$d/g - D = P m + T\,\delta g + n$ with $T = D + P m_\text{prev}$ (the
+template, piecewise in time: one amplitude per period). The template
+amplitudes are local unknowns like those of flagged samples, with $T$ as
+their column of the pointing matrix, so the PCG solves for map and
+$\delta g$ at once, without MPI communication for the gains; their
+preconditioner is the exact diagonal of $T^T N^{-1} T$ (one FFT per
+amplitude at setup). Then $g \leftarrow g\,(1 + \delta g)$, `n_iter` times.
+
+Templates are not applied to samples in pixels whose Q/U are not solved: their
+polarized signal is not in the model and would bias the amplitudes. For the
+same reason a `mask` flags its samples during the iterations (with
+`flag_method`), and one last solve with the final gains makes the maps
+with all the samples. A gain common to all periods and detectors is
+degenerate with the scale of the map except through the part of $D$ that is
+not fixed on the sky, the orbital dipole: it sets the absolute calibration.
+In noiseless tests the iterations converge as
+$3\times10^{-4} \to 3\times10^{-8} \to 5\times10^{-15}$.
+
 ## Differences from the C++ SANEPIC
 
 - 3×3 block preconditioner (the C++ code has the Jacobi one, also available);
@@ -144,6 +166,7 @@ instead split the chunk (`split_gap_s`), see
 - zero padding (`pad_fill="zeros"`) besides SANEPIC's extrapolation;
 - flagged samples (the C++ code reads the options `-G`, `-g` and `-M` but does
   not use them);
+- calibration on the dipole and template fitting;
 - MPI without a master process: each process handles its own data, and the
   PCG state is distributed over the processes by pixel (see
   [MPI](performance.md#mpi-and-threads)); threads within each process;

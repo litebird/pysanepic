@@ -278,6 +278,104 @@ def test_common_modes_exact_gls():
             common_modes=[([0, 1], np.ones((2, 1)), np.ones((1, 26)))])
 
 
+def test_templates_exact_gls():
+    """Templates fitted with the map (amplitudes shared by chunks and by two
+    templates, a common-mode group, flagged samples): map and amplitudes equal
+    the dense GLS with the template columns appended to P."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(23)
+    npix, ns, fs = 6, 96, 10.0
+    f = np.fft.rfftfreq(ns, 1 / fs)
+    pix = rng.integers(0, npix, (4, ns))
+    psi = rng.uniform(0, np.pi, (4, ns))
+    tod = rng.normal(size=(4, ns))
+    w = np.array([one_over_f_weights(ns, fs, s, 0.5, 1.0, 0.05) for s in (1.0, 1.3, 0.8, 1.1)])
+    U, lam = rng.uniform(0.5, 1.5, (3, 1)), 3.0 / (1 + (f / 0.2) ** 2)[None]
+    flags = np.zeros((4, ns), bool)
+    flags[1, 30:36] = flags[3, 70] = True
+    half = np.arange(ns) >= ns // 2
+    templates = [  # (chunk, values, amplitude labels)
+        (0, rng.normal(size=ns), half.astype(int)),  # two amplitudes on chunk 0
+        (1, rng.normal(size=ns), np.full(ns, 2)),
+        (3, rng.normal(size=ns), np.where(half, -1, 2)),  # shares amplitude 2, half of the chunk
+        (3, rng.normal(size=ns), np.full(ns, 3)),  # a second template on chunk 3
+    ]
+    g = GLS(np.where(flags, -1 - np.arange(ns), pix), psi, w, min_pol_rcond=0.0, angle_dtype=np.float64,
+            common_modes=[([0, 1, 2], U, lam)], templates=templates)
+    assert g.namp == 4
+    x, info = g.solve(np.where(flags, np.nan, tod), tol=1e-26, maxiter=1000)
+    assert info["converged"]
+
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+    circ = lambda spec: np.fft.irfft(spec, n=ns)[lag]  # noqa: E731
+    Ng = np.block([[circ((i == j) / w[i] + (U[i] * U[j]) @ lam) for j in range(3)] for i in range(3)])
+    Ps, _ = _dense_gls(pix, psi, np.eye(ns), npix)
+    Ps = [np.hstack([P, np.zeros((ns, 4))]) for P in Ps]
+    for k, values, labels in templates:
+        Ps[k][labels >= 0, 3 * npix + labels[labels >= 0]] += values[labels >= 0]
+    A, b = np.zeros((3 * npix + 4, 3 * npix + 4)), np.zeros(3 * npix + 4)
+    for rows, N in ((list(range(3)), Ng), ([3], circ(1 / w[3]))):
+        P = np.vstack([Ps[k] for k in rows])
+        d = np.concatenate([tod[k] for k in rows])
+        keep = ~np.concatenate([flags[k] for k in rows])
+        Ninv = np.linalg.inv(N[np.ix_(keep, keep)])
+        A += P[keep].T @ Ninv @ P[keep]
+        b += P[keep].T @ Ninv @ d[keep]
+    ref = np.linalg.solve(A, b)
+    assert np.abs(x - ref[: 3 * npix].reshape(3, npix)).max() < 1e-9 * np.abs(ref).max()
+    assert np.allclose(info["amplitudes"], ref[3 * npix :], rtol=1e-9)
+    with pytest.raises(ValueError, match="templates"):
+        GLS(pix, psi, w, templates=templates[:1]).rhs(tod)
+
+
+def _calibration_data(nside, n, fs, per):
+    """_four_detectors with solar + orbital dipole (the orbital velocity turns
+    once over the data, as in the year of _scan) and gains drifting every `per`
+    samples: (data, true gains, sky)."""
+    rng = np.random.default_rng(5)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    solar = 3.36e-3 * np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
+    t = np.arange(n)
+    orbital = 2.7e-4 * np.array([-np.sin(2 * np.pi * t / n), np.cos(2 * np.pi * t / n), 0 * t])
+    data, true = [], []
+    for d in _four_detectors(n, fs, rng, sky, nside):
+        th, ph = d.pointing.theta, d.pointing.phi
+        nvec = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
+        dipole = solar @ nvec + np.sum(orbital * nvec, axis=0)
+        g = 1 + 0.01 * rng.normal(size=n // per)
+        true.append(g)
+        data.append(dataclasses.replace(d, tod=g[t // per] * (d.tod + dipole), dipole=dipole))
+    return data, true, sky
+
+
+def test_calibration_noiseless():
+    """Gains drifting every 1200 s, solar + orbital dipole: the gains and the
+    maps are recovered, also with a mask and with an external sky template."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per = 16, 120_000, 10.0, 12_000
+    data, true, sky = _calibration_data(nside, n, fs, per)
+    # every pixel solved in Q/U: elsewhere the unmodelled polarization leaks
+    # through the 1/f weights, in the maps and in the gains
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
+    band = np.abs(hp.pix2vec(nside, np.arange(12 * nside**2))[2]) < 0.3
+    for cal in (CalibrationParameters(gain_period_s=per / fs),
+                CalibrationParameters(gain_period_s=per / fs, mask=band),
+                CalibrationParameters(gain_period_s=per / fs, sky=sky, n_iter=2)):
+        r = make_maps(data, nside, coordinates="E", params=params, calibration=cal)
+        assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
+        seen = r.maps[1] != hp.UNSEEN
+        err = r.maps[:, seen] - sky[:, seen]
+        err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
+        assert np.abs(err).max() < 1e-7 * np.abs(sky).max()
+    assert make_maps(data[:1], nside, coordinates="E", params=params).gains is None
+    with pytest.raises(ValueError, match="dipole"):
+        make_maps([dataclasses.replace(data[0], dipole=None)], nside, calibration=CalibrationParameters())
+    with pytest.raises(ValueError, match="mask"):
+        make_maps(data, nside, calibration=CalibrationParameters(mask=band[:10]))
+
+
 def test_coarse_preconditioner():
     """The two-level preconditioner (coarse_nside) gives the same maps in
     fewer iterations with a common mode, also with padding (virtual pixels)
