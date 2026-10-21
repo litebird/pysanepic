@@ -612,8 +612,12 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         foreground (the common gain) and a common shift of the band are nearly
         degenerate when the spectral index varies little; they are separated
         only by the dipole and the CMB, which the gain rescales too, so the
-        absolute calibration keeps an error of ~0.1 kappa and is noisier.
-        Without calibration there is no such degeneracy. False (default).
+        absolute calibration keeps an error of up to ~0.1 kappa (none in a
+        noiseless G100 test) and is noisier: with noise the common part is
+        measured only as well as the structure below the pixel size allows
+        (~0.02 GHz with 16 days of 16 detectors), so it pays off for long
+        runs. Without calibration there is no such degeneracy. False
+        (default).
     """
     sky = None if sky_model is None else _model(sky_model, nside, "sky_model")
     bands = {k: _model(v, nside, f"bandpass_templates[{k!r}]") for k, v in (bandpass_templates or {}).items()}

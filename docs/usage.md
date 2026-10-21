@@ -361,6 +361,24 @@ shift 0.3 GHz, $\kappa = 3.3\times10^{-3}$):
 | sum-zero amplitudes | $+3.1\times10^{-3}$ | 0 (by construction) |
 | `bandpass_common=True` | $-2.8\times10^{-4}$ | 0.33 GHz (true 0.30) |
 
+On G100 (16 days, 16 detectors at 118 GHz, mean shift 0.031 GHz,
+$\kappa = 4.1\times10^{-4}$), the absolute calibration with respect to the run
+without mismatch, the same sky and noise:
+
+| | noiseless | with 1/f noise | mean shift found (noise) |
+|---|---|---|---|
+| sum-zero amplitudes | $+4.0\times10^{-4}$ | $+3.5\times10^{-4}$ | – |
+| `bandpass_common=True` | $-1.4\times10^{-6}$ | $+2.2\times10^{-4}$ | 0.013 GHz (true 0.031) |
+
+Without noise the bias goes entirely; with the noise of 16 days of 16
+detectors the common part is measured only to ~0.02 GHz, comparable with the
+shift itself, and the bias drops by ~40% in this realization. The common
+part is constrained only below the pixel size, so it needs much data (or a
+bright foreground with structure): it pays off for long runs; for short
+ones, give the sky model at the mean band. The PCG needs more iterations
+(52 instead of 13 in the noiseless case), as the common part is weakly
+constrained.
+
 Use it when the frequency of the sky model is not known to better than
 $\sim\nu_0/(\beta\cdot\text{required calibration})$; otherwise give the sky model at
 the mean band of the detectors.
