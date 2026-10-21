@@ -331,21 +331,17 @@ class GLSParameters:
         the gap are neglected, but long gaps do not slow down the PCG. inf:
         never; 0: every run.
     coarse_nside : two-level preconditioner: the PCG also solves exactly for
-        the I map at this HEALPix resolution (power of 2, <= nside), which
-        takes care of the slow large-scale modes. The setup costs about one
-        PCG iteration per coarse pixel (12 at coarse_nside=1). With common
-        modes 1 halves the iterations (46 -> 21 on G100, -33% time); without
-        them it saves fewer iterations than its setup costs. 0 (default):
-        off.
-    coarse_monopole : with coarse_nside = 0, the two-level preconditioner on
-        the I monopole alone (one coarse pixel: all the sky), which is poorly
-        constrained with 1/f weights and is the slowest mode of the PCG,
-        especially with calibration, where it is coupled to the common gain.
-        Its setup costs one PCG iteration; in a test it cut the iterations
-        from 31 to 22 (maps) and from 43 to 33 (calibration). True (default);
-        False: the preconditioner of pysanepic <= 0.4. The maps are the same
-        within the tolerance. Ignored with coarse_nside > 0, whose coarse
-        level contains the monopole.
+        the I map at a coarse resolution, which takes care of the slow
+        large-scale modes. 0 (default): the I monopole alone (one coarse pixel,
+        the whole sky), poorly constrained with 1/f weights and the slowest
+        mode of the PCG, especially with calibration, where it is coupled to
+        the common gain; its setup costs one PCG iteration (in a test it cut
+        the iterations from 31 to 22 for maps, from 43 to 33 with
+        calibration). N >= 1 (a power of 2, <= nside): the I map at nside N,
+        whose setup costs about one PCG iteration per coarse pixel (12 at
+        N = 1); with common modes 1 halves the iterations (46 -> 21 on G100,
+        -33% time). None: no coarse level (the preconditioner of pysanepic
+        0.4, where 0 meant this). The maps are the same within the tolerance.
     """
 
     chunk_s: float = 3600.0
@@ -360,8 +356,7 @@ class GLSParameters:
     flag_method: str = "marginalize"
     split_gap_s: float = 300.0
     fft_dtype: type = np.float64
-    coarse_nside: int = 0
-    coarse_monopole: bool = True
+    coarse_nside: int | None = 0
 
 
 @dataclass(kw_only=True)
@@ -706,8 +701,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     if params.flag_method not in ("marginalize", "offset"):
         raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize' or 'offset'")
     nc = params.coarse_nside
-    if nc < 0 or (nc and (nc & (nc - 1) or nc > nside)):
-        raise ValueError(f"coarse_nside must be 0 or a power of 2 <= nside, not {nc}")
+    if nc is not None and (nc < 0 or (nc and (nc & (nc - 1) or nc > nside))):
+        raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
@@ -890,7 +885,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         fft_lengths=nfft_c,
         fft_dtype=params.fft_dtype,
         common_modes=common_modes,
-        coarse=_coarse_pixels(nside, nc) if nc else (_monopole_pixel(nside) if params.coarse_monopole else None),
+        coarse=None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
         templates=templates,
         shared_templates=shared,
         shared_groups=fit.groups if fit is not None and fit.fit else None,

@@ -13,7 +13,7 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
 - Supports polarization efficiency and any coordinate system.
 - Noise correlated between detectors (common modes of a wafer), with a
   two-level preconditioner for the large scales (`GLSParameters.coarse_nside`;
-  by default on the I monopole, the slowest mode).
+  by default on the I monopole alone, the slowest mode).
 - Noise spectra, couplings and common modes estimated from the data
   (`estimate_noise`).
 - Gain calibration on the dipole, fitted with the maps

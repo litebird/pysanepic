@@ -97,8 +97,8 @@ one product by $P^T N^{-1} P$ per coarse pixel, about one PCG iteration each;
 afterwards $M_2$ costs two sums over the coarse pixels. This is the additive
 two-level preconditioner of Grigori, Stompor & Szydlarski (2012), with a
 coarse space of piecewise-constant maps instead of eigenvectors. By default
-(`coarse_monopole`, with `coarse_nside=0`) the coarse space is the I
-monopole alone, $Z$ a single column: $E$ costs one product, and it removes
+(`coarse_nside=0`) the coarse space is the I monopole alone, $Z$ a single
+column (one coarse pixel, the whole sky): $E$ costs one product, and it removes
 the slowest mode of the PCG, the monopole, poorly constrained by 1/f weights
 and, with calibration, coupled to the common gain. The C++ SANEPIC uses the
 Jacobi preconditioner only.
