@@ -278,7 +278,8 @@ class MapResult:
         period of gain_period_s from its first sample. None otherwise.
     bandpass : with bandpass_templates, the amplitude of each template for
         each detector, {template name: {detector name: amplitude}} (summing to
-        zero over the detectors), on every rank. None otherwise.
+        zero over the detectors, unless bandpass_common), on every rank. None
+        otherwise.
     """
 
     maps: np.ndarray
@@ -540,7 +541,7 @@ def _coarse_pixels(nside, coarse_nside):
 
 
 def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=None, verbose=False, calibration=None,
-              sky_model=None, bandpass_templates=None):
+              sky_model=None, bandpass_templates=None, bandpass_common=False):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
 
     Parameters
@@ -585,15 +586,39 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         (the foreground scaled per detector) or {"fg_deriv1": dF/dnu} (the
         first order of its expansion in the shift of the band, around the
         frequency of the foreground in sky_model; the amplitudes are then the
-        shifts): maps or alm, as sky_model, but not part of it. Each one gets an amplitude per detector (DetectorData.name;
-        shared by the DetectorData of a detector, also across MPI processes),
-        summing to zero over the detectors (the common part is the map),
-        fitted with the maps: in one solve, or in each calibration iteration.
+        shifts): maps or alm, as sky_model, but not part of it. Each one gets
+        an amplitude per detector (DetectorData.name; shared by the
+        DetectorData of a detector, also across MPI processes), fitted with the
+        maps: in one solve, or in each calibration iteration. By default the
+        amplitudes sum to zero over the detectors: only the differences between
+        detectors are fitted, and the common part (how far the mean band of
+        the detectors is from the frequency of sky_model) is left to the maps.
         Templates nearly proportional to each other are not separable. The
         amplitudes are in MapResult.bandpass.
+    bandpass_common : bool
+        Fit also the common part of each bandpass template: the amplitudes are
+        free, not summing to zero (with derivative templates, the band shifts
+        with respect to the frequency of sky_model, not to their mean). Why:
+        with calibration, if the mean band of the detectors is not at the
+        frequency of sky_model, the foreground in the data is the model scaled
+        by kappa = beta * mean shift / nu (for dust); the maps absorb that
+        pixel by pixel, but not below the pixel size, where only the common
+        gain can rescale the signal, so the absolute calibration is biased by
+        ~kappa (4e-4 on G100 for a mean shift of 0.03 GHz at 118 GHz). Fitting
+        the common part removes most of it (10x in a noiseless test). It
+        needs the templates as alm: the common part is constrained only by
+        their structure below the pixel size (as maps it is exactly the map,
+        and a ValueError is raised). Limitation: a common rescaling of the
+        foreground (the common gain) and a common shift of the band are nearly
+        degenerate when the spectral index varies little; they are separated
+        only by the dipole and the CMB, which the gain rescales too, so the
+        absolute calibration keeps an error of ~0.1 kappa and is noisier.
+        Without calibration there is no such degeneracy. False (default).
     """
     sky = None if sky_model is None else _model(sky_model, nside, "sky_model")
     bands = {k: _model(v, nside, f"bandpass_templates[{k!r}]") for k, v in (bandpass_templates or {}).items()}
+    if bandpass_common and any(not np.iscomplexobj(b) for b in bands.values()):
+        raise ValueError("bandpass_common needs the bandpass templates as alm: as maps their common part is the map itself")
     if calibration is None and sky is None and not bands:
         return _make_maps(data, nside, coordinates, params, comm, nthreads, verbose)[0]
     data = list(data)
@@ -610,7 +635,8 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     index = {(k, n): i for i, (k, n) in enumerate((k, n) for k in bands for n in names)}
     masks = _masks(None if calibration is None else calibration.mask, nside)
     fit = _Fit(calibration=calibration, sky=sky, bands=bands, index=index, amp=np.zeros(len(index)),
-               groups=[[index[k, n] for n in names] for k in bands], mask_gain=masks[0], mask_band=masks[1],
+               groups=[] if bandpass_common else [[index[k, n] for n in names] for k in bands],
+               mask_gain=masks[0], mask_band=masks[1],
                cache={} if calibration is not None and calibration.cache_model else None)
     for _ in range(1 if calibration is None else calibration.n_iter):
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]

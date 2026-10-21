@@ -26,6 +26,13 @@ Changes on `main` that are not in a release yet.
   drops from 3.8 to 1.3 µK. New notebooks `sky_model` and `validation` (the
   same noise with and without gain variation and bandpass mismatch, each
   ignored or fitted).
+- `make_maps(bandpass_common=True)`: the bandpass amplitudes are free instead
+  of summing to zero, so the common part of the band shifts (the mean band
+  with respect to the frequency of the sky model) is fitted too, from the
+  structure of the templates (alm only) below the pixel size. Without it a
+  mean shift biases the absolute calibration by ~beta * shift / nu (4e-4 on
+  G100); with it most of the bias goes (10x in a test), the rest from the
+  near-degeneracy of a common foreground scaling with the common gain.
 - `CalibrationParameters.mask` is 1 for pixels used, 0 for pixels left out
   (the usual convention), and can be `{"gain": ..., "bandpass": ...}`.
 - **Behaviour change**: `GLSParameters.coarse_nside=0` (the default) is now a

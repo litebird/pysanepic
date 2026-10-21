@@ -325,6 +325,46 @@ $\partial^2F/\partial\nu^2 \simeq (\beta - 1)/\nu\;\partial F/\partial\nu$, and 
 two amplitudes are meaningless (the maps are not affected). The first
 derivative is usually enough: the second order is $\sim\Delta\nu/\nu$ smaller.
 
+### The common part of the band shifts
+
+By default the amplitudes of each template sum to zero: only the differences
+between the detectors are fitted. The common part, i.e. how far the mean band
+of the detectors is from the frequency of `sky_model`, is left to the maps,
+which absorb it pixel by pixel. With calibration this biases the absolute
+calibration. If the mean band is at $\nu_0 + \overline{\Delta\nu}$, the dust in
+the data is the model scaled by $\kappa = \beta\,\overline{\Delta\nu}/\nu_0$. Below
+the pixel size, where the model (as alm) has structure, the only unknown that
+can rescale the signal is the gain common to all the detectors, so the
+absolute calibration moves by about $\kappa$. On G100 (16 detectors at
+118 GHz, $\overline{\Delta\nu} = 0.031$ GHz, $\kappa = 4.1\times10^{-4}$), noiseless:
+
+| band shifts | absolute calibration | I error |
+|---|---|---|
+| mean 0.031 GHz, sum-zero amplitudes | $+4.0\times10^{-4}$ | 0.47 µK |
+| the same, mean removed | $+2.9\times10^{-5}$ | 0.03 µK |
+| no mismatch | $+8.5\times10^{-7}$ | 0.00 µK |
+
+Q and U are not affected. `make_maps(bandpass_common=True)` fits the common
+part too: the amplitudes are free, and with derivative templates they are
+the shifts with respect to the frequency of `sky_model`. It needs the
+templates as alm: the common part is constrained only by their structure
+below the pixel size (as maps it is exactly the map, and `make_maps` raises
+an error). Without calibration it is exact. With calibration it removes most
+of the bias, but not all: a common rescaling of the foreground (the common
+gain) and a common shift of the band are nearly degenerate when the spectral
+index varies little, and are separated only by the dipole and the CMB, which
+the gain rescales too. In a local noiseless test (4 detectors, 140 GHz, mean
+shift 0.3 GHz, $\kappa = 3.3\times10^{-3}$):
+
+| | absolute calibration | mean shift found |
+|---|---|---|
+| sum-zero amplitudes | $+3.1\times10^{-3}$ | 0 (by construction) |
+| `bandpass_common=True` | $-2.8\times10^{-4}$ | 0.33 GHz (true 0.30) |
+
+Use it when the frequency of the sky model is not known to better than
+$\sim\nu_0/(\beta\cdot\text{required calibration})$; otherwise give the sky model at
+the mean band of the detectors.
+
 A mask per kind of fit, e.g. `mask={"gain": galaxy * sources, "bandpass":
 sources}`: the bandpass amplitudes are fitted on the Galaxy, where the
 foreground is bright, point sources missing from the model are left out of

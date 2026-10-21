@@ -558,6 +558,36 @@ def test_bandpass_templates():
         make_maps(data, nside, calibration=CalibrationParameters(mask={"gains": band}))
 
 
+def test_bandpass_common():
+    """Templates as alm, a foreground seen as (1 + a_i) F, F also in the sky
+    model: with mean(a) = 0 the default (sum-zero) amplitudes are a_i; with
+    mean(a) != 0 bandpass_common fits the common part too (constrained by
+    the structure of F below the pixel size) and they are a_i again; as maps
+    the common part is the map itself, an error."""
+    nside, n, fs = 16, 60_000, 10.0
+    data, alm = _subpixel_data(nside, n, fs)
+    lmax = (int(np.sqrt(8 * alm.shape[1] + 1)) - 3) // 2
+    np.random.seed(43)
+    fg = np.array([hp.synalm(3e-9 / (1 + np.arange(lmax + 1)) ** 2, lmax=lmax) for _ in range(3)])
+    fg_tod = []
+    for d in data:
+        loc = np.stack([d.pointing.theta, d.pointing.phi % (2 * np.pi)], axis=1)
+        t = ducc0.sht.synthesis_general(alm=fg[:1], spin=0, lmax=lmax, loc=loc, epsilon=1e-12)[0]
+        q, u = ducc0.sht.synthesis_general(alm=fg[1:], spin=2, lmax=lmax, loc=loc, epsilon=1e-12)
+        a = d.pointing.psi + d.pol_angle_rad
+        fg_tod.append(t + q * np.cos(2 * a) + u * np.sin(2 * a))
+    # Q/U solved everywhere: elsewhere the template is 0 and the polarization of a_i F leaks
+    params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64, min_pol_rcond=0.0)
+    kw = dict(coordinates="E", params=params, sky_model=alm + fg, bandpass_templates={"fg": fg})
+    for amp, common in ((np.array([0.04, -0.03, 0.02, -0.03]), False), (np.array([0.05, -0.02, 0.03, 0.01]), True)):
+        out = [dataclasses.replace(d, tod=d.tod + (1 + a) * f) for d, f, a in zip(data, fg_tod, amp)]
+        r = make_maps(out, nside, bandpass_common=common, **kw)
+        got = np.array(list(r.bandpass["fg"].values()))
+        assert np.abs(got - amp).max() < 1e-6, (common, got - amp)
+    with pytest.raises(ValueError, match="bandpass_common"):
+        make_maps(data, nside, coordinates="E", bandpass_templates={"fg": hp.alm2map(fg, nside, lmax=lmax)}, bandpass_common=True)
+
+
 def test_coarse_preconditioner():
     """The two-level preconditioner (coarse_nside) gives the same maps in
     fewer iterations with a common mode, also with padding (virtual pixels)
