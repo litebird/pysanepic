@@ -13,6 +13,44 @@ Changes on `main` that are not in a release yet.
   masked pixels out of the calibration (their samples are flagged) and makes
   the final maps with all the samples: in the notebook, the Galaxy below the
   pixel size biases the absolute calibration by 2% without it, 0.08% with it.
+- `make_maps(sky_model=...)`: a sky model (maps, or alm interpolated at the
+  pointing with `ducc0.sht.synthesis_general`) is subtracted from the TOD and its binned map put back: with alm, no
+  leakage of its structure below the pixel size through the 1/f weights.
+  Replaces `CalibrationParameters.sky`.
+- `make_maps(bandpass_templates={name: template})`: one amplitude per template
+  and detector (`DetectorData.name`), summing to zero over the detectors,
+  fitted with the maps (and the gains), in `MapResult.bandpass`; with
+  $\partial F/\partial\nu$ as template the amplitudes are the shifts of the
+  bands. In the notebook (dust with a varying spectral index, bands shifted
+  by ±1.5 GHz) the shifts are recovered within the noise and the Q/U error
+  drops from 3.8 to 1.3 µK. New notebooks `sky_model` and `validation` (the
+  same noise with and without gain variation and bandpass mismatch, each
+  ignored or fitted).
+- `make_maps(bandpass_common=True)`: the bandpass amplitudes are free instead
+  of summing to zero, so the common part of the band shifts (the mean band
+  with respect to the frequency of the sky model) is fitted too, from the
+  structure of the templates (alm only) below the pixel size. Without it a
+  mean shift biases the absolute calibration by ~beta * shift / nu (4e-4 on
+  G100); with it most of the bias goes (10x in a test), the rest from the
+  near-degeneracy of a common foreground scaling with the common gain.
+- `CalibrationParameters.mask` is 1 for pixels used, 0 for pixels left out
+  (the usual convention), and can be `{"gain": ..., "bandpass": ...}`.
+- **Behaviour change**: `GLSParameters.coarse_nside=0` (the default) is now a
+  two-level preconditioner on the I monopole alone (one coarse pixel), the
+  slowest mode of the PCG (with calibration, coupled to the common gain), at
+  the cost of one product at setup: 31 → 22 iterations for maps and 43 → 33
+  with calibration in a test, 62 → 49 s and 152 → 125 s on G100. The maps are
+  the same within the tolerance. `coarse_nside=None` gives the preconditioner
+  of 0.4 (where 0 meant no coarse level).
+- Calibration: `n_iter` defaults to 2; the GLS setup is reused between the
+  iterations and each one starts from the previous maps; templates added and
+  summed with numba kernels, and the diagonal of their preconditioner from
+  autocorrelations (exact, ~2 FFTs per chunk): on G100 (8 days, 8 detectors,
+  nside 256) a calibrated run went from 390 to 159 s. `cache_model` keeps the
+  model TODs between the iterations. `GLS.set_templates`.
+- `GLS(shared_templates=..., shared_groups=...)`: template amplitudes shared by
+  all the MPI processes, with sum-zero constraints; `GLS.binned(tod)`;
+  `Pointing.angles(coordinates)`.
 - `GLS(templates=[(chunk, values, labels), ...])`: template amplitudes fitted
   together with the map, local unknowns of each process, returned in
   `info["amplitudes"]`.

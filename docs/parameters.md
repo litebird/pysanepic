@@ -18,7 +18,7 @@ so new options need no change on the litebird_sim side.
 | `flag_method` | `"marginalize"` | Flagged samples (`DetectorData.flags`) in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact) or `"offset"` (one offset per run, samples set to 0) |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
-| `coarse_nside` | 0 | Two-level preconditioner: also solve exactly for the I map at this resolution (a power of 2); 1 with common modes, see [Preconditioner](#preconditioner). 0: off |
+| `coarse_nside` | 0 | Two-level preconditioner: also solve exactly for the I map at a coarse resolution. 0: the I monopole alone (one PCG iteration of setup); N (a power of 2): the I map at nside N, 1 with common modes; `None`: off (the preconditioner of pysanepic 0.4). See [Preconditioner](#preconditioner) |
 
 The sections below explain how to choose them.
 
@@ -100,16 +100,38 @@ common mode):
 
 | GLS | `coarse_nside` | iterations | setup | total time |
 |---|---|---|---|---|
-| common mode modelled | 0 | 46 | – | 285 s |
+| common mode modelled | off | 46 | – | 285 s |
 | | 1 | 21 | 54 s | 191 s |
 | | 2 | 22 | 247 s | 403 s |
 | | 4 | 22 | 969 s | 1124 s |
-| correlation ignored | 0 | 20 | – | 79 s |
+| correlation ignored | off | 20 | – | 79 s |
 | | 1 | 13 | 31 s | 91 s |
 
 With common modes `coarse_nside=1` is the best choice (−33% time); higher
-resolutions only add setup. Without them the iterations saved do not pay for
-the setup, so the default is 0. The maps are the same within the tolerance.
+resolutions only add setup. Without them the 12 products of the setup do not
+pay for the iterations they save. (These runs are without a coarse level,
+`None`; the monopole level, `0`, did not exist yet.)
+
+Most of what the coarse level gains comes from one mode: the I monopole,
+which 1/f weights constrain poorly and which is the last to converge. With
+calibration it is worse, as the monopole is coupled to the gain common to all
+the detectors: the residual stalls for ~10 iterations until both converge
+together. `coarse_nside=0` (the default) is a coarse level of one pixel, the
+whole sky: it solves for the monopole alone, and its setup costs a single
+product by $P^T N^{-1} P$. In a local test (4 detectors, 1/f noise, nside 16):
+
+| `coarse_nside` | maps | calibration (1st + 2nd solve) | setup |
+|---|---|---|---|
+| `None` (off) | 31 | 43 + 34 | – |
+| `0` (monopole, default) | 22 | 33 + 25 | 1 product |
+| `1` | 25 | 33 + 24 | 12 products |
+
+and on G100 (8 days, 8 detectors, nside 256, calibration with one gain per
+hour): maps 21 → 12 iterations (62 → 49 s), calibration 44 + 7 → 30 + 7
+(152 → 125 s), calibration with a bandpass template 35 + 40 → 35 + 12
+(236 → 182 s). Every level, `N ≥ 1` included, contains the monopole: it
+changes only the speed of the PCG, the maps are the same within the
+tolerance.
 
 ## Angle precision
 

@@ -181,6 +181,21 @@ def _backproject(ip, t, c2, s2, pol, edges, buf, locbuf):
                     buf[p, 2] += t[i] * s2[i]
 
 
+@numba.njit(parallel=True, cache=True)
+def _add_template(t, values, labels, amp):
+    """t += values * amp[labels] (values are 0 where the template is not applied)."""
+    for i in numba.prange(t.size):
+        t[i] += values[i] * amp[labels[i]]
+
+
+@numba.njit(cache=True)
+def _template_dot(values, labels, f, out):
+    """out[labels] += values * f: T^T f for one template of a chunk."""
+    # ponytail: serial (a scatter to few amplitudes); ~ms per day of data
+    for i in range(f.size):
+        out[labels[i]] += values[i] * f[i]
+
+
 # cos and sin on a grid of [-pi, pi), for _cos_sin
 _TRIG_N = 4096
 _TRIG_COS = np.cos(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
@@ -417,12 +432,22 @@ class GLS:
         modelled and would bias the amplitudes). solve() returns
         the amplitudes in info["amplitudes"]; their preconditioner is the exact
         diagonal of T^T N^-1 T (own noise only, as for the pixels).
+    shared_templates : list of (k, values, labels), or None
+        Like `templates`, but the amplitudes are shared by all the ranks
+        (labels 0, 1, ... with the same meaning on every rank, e.g. one per
+        detector when its chunks are on several ranks); kept on rank 0 and
+        broadcast at each product (one small allreduce). solve() returns them
+        in info["shared_amplitudes"] on every rank.
+    shared_groups : list of index arrays, or None
+        Constraints on the shared amplitudes: those of each group sum to zero
+        (imposed by projecting the PCG vectors), e.g. the amplitudes of a sky
+        template per detector, whose common part is degenerate with the map.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -473,15 +498,8 @@ class GLS:
                 self.nflag += labels.size
         if self.nobs + self.nflag >= 2**31:
             raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
-        # templates: amplitudes after the unknowns of flagged samples
-        self._tmpl = [[] for _ in self.ip]
-        self.namp = 0
-        for k, values, labels in templates or []:
-            labels = np.asarray(labels, dtype=np.int64)
-            used = (labels >= 0) & (self.ip[k] < self.nobs)
-            # ponytail: values kept in float64 (one TOD per template); float32 if memory matters
-            self._tmpl[k].append((np.where(used, values, 0.0), np.where(used, labels, 0)))
-            self.namp = max(self.namp, int(labels.max(initial=-1)) + 1)
+        self._root = comm is None or comm.rank == 0
+        self._shgroups = [np.asarray(g, dtype=np.int64) for g in shared_groups or []]
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self.pol = psi is not None or pol_angles is not None
         self.ncomp = 3 if self.pol else 1
@@ -529,12 +547,6 @@ class GLS:
             if min_pol_rcond > 0:
                 self.mask[1:] &= self._pol_rcond(cov) >= min_pol_rcond
         del cov
-        if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)):  # collective: all ranks
-            solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
-            for k, tmpl in enumerate(self._tmpl):
-                bad = ~solved[np.minimum(self.ip[k], self.nobs - 1)] & (self.ip[k] < self.nobs)
-                for values, _ in tmpl:
-                    values[bad] = 0.0
 
         blocks = np.zeros((self.nobs, 6))
         last_w = c = None  # consecutive chunks often share their weights array
@@ -546,7 +558,9 @@ class GLS:
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks, self.nobs + self.nflag, self._locprec)
-        self._locprec = np.concatenate([1.0 / self._locprec, self._template_precond()])
+        self._flagprec = 1.0 / self._locprec
+        self._solved = None  # the full Q/U mask, for the templates
+        self.set_templates(templates, shared_templates)
         blocks = self._scatter_sum(blocks, by_column=True)
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
@@ -558,23 +572,86 @@ class GLS:
         if coarse is not None:
             self._set_coarse(coarse)
 
-    def _template_precond(self):
-        """Inverse diagonal of T^T N^-1 T (own noise of each chunk; 0 for unused
-        amplitudes)."""
-        # ponytail: one FFT per amplitude and chunk at setup (24 per daily chunk with
-        # hourly gains); c[0] * sum(values^2) if it shows up
-        diag = np.zeros(self.namp)
-        for k, tmpl in enumerate(self._tmpl):
+    def set_templates(self, templates=None, shared_templates=None):
+        """Set (or replace) `templates` and `shared_templates` (see the class),
+        keeping the rest of the setup: pixels, preconditioner, coarse level.
+        Collective with MPI. The constraints `shared_groups` are kept."""
+        # local amplitudes after the unknowns of flagged samples, then (on rank 0
+        # only) the shared ones
+        self._tmpl, self.namp = self._parse_templates(templates)
+        self._shared, nsh = self._parse_templates(shared_templates)
+        comm = self.comm
+        self.nshared = nsh if comm is None else max(comm.allgather(nsh))
+        self._nsh_loc = self.nshared if self._root else 0  # the shared amplitudes in this rank's PCG vectors
+        self._shv = np.zeros(self.nshared)  # the shared amplitudes for P, set by _apply
+        if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)) + self.nshared:  # collective
+            if self._solved is None:
+                self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
+            for k, ip in enumerate(self.ip):
+                bad = ~self._solved[np.minimum(ip, self.nobs - 1)] & (ip < self.nobs)
+                for values, _ in self._tmpl[k] + self._shared[k]:
+                    values[bad] = 0.0
+        diag = self._template_diag(self._shared, self.nshared)
+        diag = diag if comm is None else comm.allreduce(diag)
+        self._locprec = np.concatenate([self._flagprec, self._inverse(self._template_diag(self._tmpl, self.namp)),
+                                        self._inverse(diag)[: self._nsh_loc]])
+
+    def _parse_templates(self, templates):
+        """Per chunk, the (values, labels) of its templates (0 where not applied),
+        and the number of amplitudes."""
+        out, n = [[] for _ in self.ip], 0
+        for k, values, labels in templates or []:
+            labels = np.asarray(labels, dtype=np.int64)
+            used = (labels >= 0) & (self.ip[k] < self.nobs)
+            # ponytail: values kept in float64 (one TOD per template); float32 if memory matters
+            out[k].append((np.where(used, values, 0.0), np.where(used, labels, 0).astype(np.int32)))
+            n = max(n, int(labels.max(initial=-1)) + 1)
+        return out, n
+
+    def _template_diag(self, tmpls, n):
+        """Diagonal of T^T N^-1 T (own noise of each chunk) for this rank's
+        chunks: for the samples v of an amplitude, spanning L samples,
+        v^T C v = c[0] R[0] + 2 sum_l c[l] R[l], with c the first row of the
+        circulant N^-1 of the chunk and R the autocorrelation of v, computed
+        with an FFT of length 2L: exact, and ~2 FFTs of the chunk in all
+        instead of one per amplitude."""
+        diag = np.zeros(n)
+        kernels = {}  # first row of N^-1, by weights array and FFT length
+        for k, tmpl in enumerate(tmpls):
+            if not tmpl:
+                continue
+            key = (id(self.weights[k]), self._nfft[k])
+            if key not in kernels:
+                kernels[key] = ducc0.fft.c2r(np.asarray(self.weights[k], dtype=complex), lastsize=self._nfft[k],
+                                             forward=False, inorm=2, nthreads=self.nthreads)
+            c = kernels[key]
             for values, labels in tmpl:
                 for a in np.unique(labels[values != 0]):
-                    t = np.where(labels == a, values, 0.0)
-                    diag[a] += np.dot(t, self._filter(t, k, False))
+                    idx = np.flatnonzero((labels == a) & (values != 0))
+                    i0, i1 = idx[0], idx[-1] + 1
+                    v = np.where(labels[i0:i1] == a, values[i0:i1], 0.0)
+                    m = fast_fft_length(2 * v.size)
+                    f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=self.nthreads)
+                    r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[: v.size]
+                    diag[a] += c[0] * r[0] + 2 * np.dot(c[1 : v.size], r[1:])
+        return diag
+
+    @staticmethod
+    def _inverse(diag):
         return np.divide(1.0, diag, out=np.zeros_like(diag), where=diag > 0)
 
+    def _project_shared(self, a):
+        """Remove the mean of each group of shared amplitudes (in place)."""
+        for g in self._shgroups:
+            a[g] -= a[g].mean()
+        return a
+
     def _template_back(self, k, f):
-        """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf."""
+        """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf and _shbuf."""
         for values, labels in self._tmpl[k]:
-            self._locbuf[self.nflag :] += np.bincount(labels, values * f, minlength=self.namp)
+            _template_dot(values, labels, f, self._locbuf[self.nflag :])
+        for values, labels in self._shared[k]:
+            _template_dot(values, labels, f, self._shbuf)
 
     def _set_coarse(self, coarse):
         """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
@@ -588,7 +665,7 @@ class GLS:
         count = self._csum(np.ones(self._cidx.size), nz)
         used = np.flatnonzero(count > 0)
         E = np.zeros((nz, nz))
-        x = np.zeros(self._nsky + self.nflag + self.namp)
+        x = np.zeros(self._nsky + self.nflag + self.namp + self._nsh_loc)
         for q in used:  # the same coarse pixels on every rank: _apply is collective
             x[self._cidx] = self._cpar == q
             E[:, q] = np.bincount(self._cpar, self._apply(x)[self._cidx], minlength=nz)
@@ -730,9 +807,13 @@ class GLS:
         if v is not None:
             self._gather(v[: self._nsky].reshape(self.ncomp, self.nloc).T, out=self._full)  # the whole map, for P
             loc = v[self._nsky :]
+            if self.nshared:
+                sh = self._project_shared(v[len(v) - self._nsh_loc :].copy()) if self._root else None
+                self._shv = sh if self.comm is None else self.comm.bcast(sh)
         buf = self._buf
         buf[:] = 0.0
         self._locbuf[:] = 0.0
+        self._shbuf = np.zeros(self.nshared)
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
                 if self._grouped[k]:
@@ -744,7 +825,9 @@ class GLS:
                 self._template_back(k, f)
             for chunks, U, M in self._groups:
                 self._apply_group(chunks, U, M, v, tod, loc, buf)
-        return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf])
+        sh = self._shbuf if self.comm is None or not self.nshared else self.comm.allreduce(self._shbuf)
+        return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf,
+                               self._project_shared(sh)[: self._nsh_loc]])
 
     def _chunk_tod(self, k, v, tod, loc, c2, s2, pol):
         """P v on chunk k (v given), or the TOD of chunk k (flagged samples set to 0)."""
@@ -757,7 +840,9 @@ class GLS:
         t = np.empty(ip.size)
         _project(ip, self._full, c2, s2, pol, loc, t)
         for values, labels in self._tmpl[k]:
-            t += values * loc[self.nflag + labels]
+            _add_template(t, values, labels, loc[self.nflag : self.nflag + self.namp])
+        for values, labels in self._shared[k]:
+            _add_template(t, values, labels, self._shv)
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
@@ -793,12 +878,14 @@ class GLS:
     def _precond_flat(self, r):
         sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
         z = np.concatenate([sky.ravel(), r[self._nsky :] * self._locprec])
+        if self._nsh_loc:
+            self._project_shared(z[len(z) - self._nsh_loc :])
         if self._einv is not None:
             z[self._cidx] += (self._einv @ self._csum(r[self._cidx], self._nz))[self._cpar]
         return z
 
     def _no_flags(self):
-        if self.nflag or self.namp:
+        if self.nflag or self.namp or self.nshared:
             raise ValueError("apply_A and rhs work on the pixels only: with flagged samples or templates use solve()")
 
     def apply_A(self, m):
@@ -821,7 +908,8 @@ class GLS:
         x0: optional starting map (ncomp, nobs). Returns (map (ncomp, nobs) on
         every rank, info dict) with "iterations", "converged", "residuals"
         (norm(r)^2 / norm(b)^2 at each iteration) and "amplitudes" (the
-        template amplitudes of this rank, by label; empty without templates).
+        template amplitudes of this rank, by label; empty without templates)
+        and "shared_amplitudes" (on every rank).
         """
         b = self._apply(tod=_chunks(tod))
         bb = self._dot(b, b)
@@ -862,13 +950,41 @@ class GLS:
             if verbose and (self.comm is None or self.comm.rank == 0):
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
 
-        info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history), "amplitudes": x[self._nsky + self.nflag :].copy()}
+        a0 = self._nsky + self.nflag
+        shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
+        info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),
+                "amplitudes": x[a0 : a0 + self.namp].copy(),
+                "shared_amplitudes": shared if self.comm is None else self.comm.bcast(shared)}
         del b, r, z, d  # q does not exist if maxiter == 0
         self._full = self._buf = self._locbuf = None  # free the work maps before gathering the result
         self._fftbuf = {}
         # full mask now, while all ranks are here, so that to_healpix is not collective
         self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
         return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
+
+    def binned(self, tod):
+        """Binned map (P^T P)^-1 P^T tod (white noise), (ncomp, nobs) on every
+        rank, for timelines laid out like `pix`; I only where Q/U are not
+        solved, 0 where not observed; flagged samples are not used. Collective
+        with MPI."""
+        cov = np.zeros((self.nobs, 7))
+        rhs = np.zeros((self.nobs, self.ncomp))
+        with numba_threads(self.nthreads):
+            for k, ip in enumerate(self.ip):
+                pol, c2, s2 = self._pol_arrays(k)
+                _coverage(ip, c2, s2, pol, cov)
+                _backproject(ip, np.asarray(tod[k], dtype=float), c2, s2, pol, self._edges, rhs, np.zeros(self.nflag))
+        cov = self._scatter_sum(cov, by_column=True)
+        rhs = self._scatter_sum(rhs)
+        out = np.zeros((self.ncomp, self.nloc))
+        i_only = self.mask[0] & ~self.mask[-1] if self.pol else self.mask[0]
+        out[0, i_only] = rhs[i_only, 0] / cov[i_only, 0]
+        if self.pol:
+            n, c, s, cc, cs, ss = cov[:, 0], *cov[:, 2:].T
+            M = np.stack([n, c, s, c, cc, cs, s, cs, ss], axis=1).reshape(-1, 3, 3)
+            good = self.mask[1]
+            out[:, good] = np.linalg.solve(M[good], rhs[good][..., None])[..., 0].T
+        return self.full(out)
 
     def to_healpix(self, m, nside, fill=np.nan):
         """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2); labels
