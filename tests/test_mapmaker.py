@@ -574,7 +574,7 @@ def test_coarse_preconditioner():
     flags[1000:1010] = True
     dets[1] = dataclasses.replace(dets[1], flags=flags)
     group = [DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=own)])]
-    params = GLSParameters(chunk_s=chunk / fs, tol=1e-14, pad_s=60.0, split_gap_s=np.inf)
+    params = GLSParameters(chunk_s=chunk / fs, tol=1e-14, pad_s=60.0, split_gap_s=np.inf, coarse_monopole=False)
     ref = make_maps(group, nside, coordinates="E", params=params)
     for nc in (1, 2):
         r = make_maps(group, nside, coordinates="E", params=dataclasses.replace(params, coarse_nside=nc))
@@ -585,6 +585,31 @@ def test_coarse_preconditioner():
     for bad in (3, 32, -1):
         with pytest.raises(ValueError, match="coarse_nside"):
             make_maps(group, nside, coordinates="E", params=dataclasses.replace(params, coarse_nside=bad))
+
+
+def test_coarse_monopole():
+    """The coarse level on the I monopole alone (default): the same maps in
+    fewer iterations, without and with calibration."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per = 16, 120_000, 10.0, 12_000
+    data, _, _ = _calibration_data(nside, n, fs, per)
+    rng = np.random.default_rng(41)
+    noisy = [dataclasses.replace(d, tod=d.tod + 2e-5 * np.cumsum(rng.normal(size=n)) / np.sqrt(n) * 30
+                                 + 1e-5 * rng.normal(size=n)) for d in data]
+    params = GLSParameters(chunk_s=1200.0, tol=1e-12)
+    for cal in (None, CalibrationParameters(gain_period_s=per / fs)):
+        kw = dict(coordinates="E", calibration=cal)
+        if cal is None:
+            kw["data"] = [dataclasses.replace(d, tod=d.tod - d.dipole) for d in noisy]
+        else:
+            kw["data"] = noisy
+        off = make_maps(nside=nside, params=dataclasses.replace(params, coarse_monopole=False), **kw)
+        on = make_maps(nside=nside, params=params, **kw)
+        assert on.iterations <= off.iterations - 5, (cal, on.iterations, off.iterations)  # 35 -> 25, 49 -> 39
+        seen = off.maps != hp.UNSEEN
+        assert np.array_equal(seen, on.maps != hp.UNSEEN)
+        assert np.abs(on.maps[seen] - off.maps[seen]).max() < 1e-4 * np.abs(off.maps[seen]).max()
 
 
 def test_estimate_common_modes():

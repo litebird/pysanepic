@@ -12,7 +12,8 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
 - Pure Python with numba and ducc0; runs with MPI (mpi4py) and threads.
 - Supports polarization efficiency and any coordinate system.
 - Noise correlated between detectors (common modes of a wafer), with a
-  two-level preconditioner for the large scales (`GLSParameters.coarse_nside`).
+  two-level preconditioner for the large scales (`GLSParameters.coarse_nside`;
+  by default on the I monopole, the slowest mode).
 - Noise spectra, couplings and common modes estimated from the data
   (`estimate_noise`).
 - Gain calibration on the dipole, fitted with the maps

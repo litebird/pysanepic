@@ -19,6 +19,7 @@ so new options need no change on the litebird_sim side.
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
 | `coarse_nside` | 0 | Two-level preconditioner: also solve exactly for the I map at this resolution (a power of 2); 1 with common modes, see [Preconditioner](#preconditioner). 0: off |
+| `coarse_monopole` | True | With `coarse_nside=0`, solve exactly for the I monopole alone (one PCG iteration of setup), the slowest mode of the PCG; False: the preconditioner of pysanepic ≤ 0.4. See [Preconditioner](#preconditioner) |
 
 The sections below explain how to choose them.
 
@@ -110,6 +111,25 @@ common mode):
 With common modes `coarse_nside=1` is the best choice (−33% time); higher
 resolutions only add setup. Without them the iterations saved do not pay for
 the setup, so the default is 0. The maps are the same within the tolerance.
+(These runs are without `coarse_monopole`, which did not exist yet.)
+
+Most of what the coarse level gains comes from one mode: the I monopole,
+which 1/f weights constrain poorly and which is the last to converge. With
+calibration it is worse, as the monopole is coupled to the gain common to all
+the detectors: the residual stalls for ~10 iterations until both converge
+together. `coarse_monopole` (the default) solves for the monopole alone, a
+coarse level of one pixel, whose setup costs a single product by
+$P^T N^{-1} P$. In a local test (4 detectors, 1/f noise, nside 16):
+
+| preconditioner | maps | calibration (1st + 2nd solve) | setup |
+|---|---|---|---|
+| block only (`coarse_monopole=False`) | 31 | 43 + 34 | – |
+| `coarse_monopole` (default) | 22 | 33 + 25 | 1 product |
+| `coarse_nside=1` | 25 | 33 + 24 | 12 products |
+
+It changes only the speed of the PCG: the maps are the same within the
+tolerance. With `coarse_nside > 0` it is ignored (the coarse level contains
+the monopole).
 
 ## Angle precision
 

@@ -28,6 +28,12 @@ Changes on `main` that are not in a release yet.
   ignored or fitted).
 - `CalibrationParameters.mask` is 1 for pixels used, 0 for pixels left out
   (the usual convention), and can be `{"gain": ..., "bandpass": ...}`.
+- `GLSParameters.coarse_monopole` (default True): the two-level preconditioner
+  on the I monopole alone, the slowest mode of the PCG (with calibration,
+  coupled to the common gain), at the cost of one product at setup: 31 → 22
+  iterations for maps and 43 → 33 with calibration in a test. **Behaviour
+  change**: faster convergence, the same maps within the tolerance; False
+  gives the preconditioner of 0.4.
 - Calibration: `n_iter` defaults to 2; the GLS setup is reused between the
   iterations and each one starts from the previous maps; templates added and
   summed with numba kernels, and the diagonal of their preconditioner from

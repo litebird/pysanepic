@@ -337,6 +337,15 @@ class GLSParameters:
         modes 1 halves the iterations (46 -> 21 on G100, -33% time); without
         them it saves fewer iterations than its setup costs. 0 (default):
         off.
+    coarse_monopole : with coarse_nside = 0, the two-level preconditioner on
+        the I monopole alone (one coarse pixel: all the sky), which is poorly
+        constrained with 1/f weights and is the slowest mode of the PCG,
+        especially with calibration, where it is coupled to the common gain.
+        Its setup costs one PCG iteration; in a test it cut the iterations
+        from 31 to 22 (maps) and from 43 to 33 (calibration). True (default);
+        False: the preconditioner of pysanepic <= 0.4. The maps are the same
+        within the tolerance. Ignored with coarse_nside > 0, whose coarse
+        level contains the monopole.
     """
 
     chunk_s: float = 3600.0
@@ -352,6 +361,7 @@ class GLSParameters:
     split_gap_s: float = 300.0
     fft_dtype: type = np.float64
     coarse_nside: int = 0
+    coarse_monopole: bool = True
 
 
 @dataclass(kw_only=True)
@@ -513,6 +523,12 @@ def _flag_labels(f, method):
         return -1 - np.arange(int(f.sum()), dtype=np.int32)
     starts, stops = _flag_runs(f)
     return np.repeat(-1 - np.arange(starts.size, dtype=np.int32), stops - starts)
+
+
+def _monopole_pixel(nside):
+    """Pixel labels -> 0 for the pixels of the sky, -1 for virtual pixels: a
+    coarse level with the I monopole alone."""
+    return lambda labels: np.where(labels < 12 * nside * nside, 0, -1)
 
 
 def _coarse_pixels(nside, coarse_nside):
@@ -874,7 +890,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         fft_lengths=nfft_c,
         fft_dtype=params.fft_dtype,
         common_modes=common_modes,
-        coarse=_coarse_pixels(nside, nc) if nc else None,
+        coarse=_coarse_pixels(nside, nc) if nc else (_monopole_pixel(nside) if params.coarse_monopole else None),
         templates=templates,
         shared_templates=shared,
         shared_groups=fit.groups if fit is not None and fit.fit else None,
