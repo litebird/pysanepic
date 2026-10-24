@@ -4,12 +4,17 @@
 
 Changes on `main` that are not in a release yet.
 
+## 0.5.1 (2026-10-24)
+
 - `make_maps` refuses `sky_model` or `bandpass_templates` as alm with a
   `Pointing` in pixels before processing any detector, with a message naming
-  them (it failed at the first detector, from `Pointing.angles`).
+  them (it failed at the first detector, from `Pointing.angles`). (#37)
 - With alm models the angles of each detector are rotated to the coordinates
   of the maps once, for the pixels and for all the models (they were rotated
-  again for the sky model and for each bandpass template).
+  again for the sky model and for each bandpass template); same results. (#38)
+- Docs: the `coordinates` of a `Pointing` are declared, not inferred;
+  litebird_sim passes pixels, or angles with alm models, in the coordinates of
+  the maps. (#38)
 
 ## 0.5.0 (2026-10-22)
 
