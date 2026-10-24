@@ -627,6 +627,11 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         return _make_maps(data, nside, coordinates, params, comm, nthreads, verbose)[0]
     data = list(data)
     dets = [d for x in data for d in (x.detectors if isinstance(x, DetectorGroup) else [x])]
+    alm = [k for k, x in [("sky_model", sky), *((f"bandpass_templates[{k!r}]", b) for k, b in bands.items())]
+           if x is not None and np.iscomplexobj(x)]
+    if alm and any(d.pointing.pix is not None for d in dets):
+        raise ValueError(f"{', '.join(alm)} as alm are interpolated at the pointing: they need Pointing angles "
+                         "(theta, phi), not pixels (or pass them as maps)")
     if calibration is not None and any(d.dipole is None for d in dets):
         raise ValueError("calibration needs DetectorData.dipole")
     names = []
