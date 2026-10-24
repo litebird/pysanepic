@@ -69,7 +69,13 @@ forms:
 - **pixels already computed**: `Pointing(pix=..., nside=..., psi=..., coordinates=..., ordering="RING")`.
   They are used as they are, so `nside` and `coordinates` must be those of the
   output maps (otherwise `make_maps` raises an error), and ψ must be in the same
-  coordinates. Pass `pix` as int32 to avoid a copy. litebird_sim uses this form.
+  coordinates. Pass `pix` as int32 to avoid a copy. A `sky_model` or
+  `bandpass_templates` given as alm need the angles.
+
+The coordinates are not inferred: `coordinates` must be those of the angles or
+pixels and of ψ. litebird_sim (`make_sanepic_gls_map`) computes the pointings in
+the coordinates of the maps and passes pixels, or angles when a model is given
+as alm (its `pointing_form`), so pysanepic does not rotate them.
 
 | Field | Meaning |
 |---|---|
