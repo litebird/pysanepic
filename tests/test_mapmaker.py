@@ -425,7 +425,7 @@ def test_sky_model_sampling():
     """alm interpolated at the pixel centers equal the alm2map maps sampled in
     the pixel (I and Q/U with the polarization angle and efficiency); a
     rotated pointing gives the same signal."""
-    from pysanepic.mapmaker import _model, _project_maps, _sample
+    from pysanepic.mapmaker import _model, _pixels_and_angles, _project_maps, _sample
 
     nside, lmax = 8, 16
     rng = np.random.default_rng(31)
@@ -439,13 +439,18 @@ def test_sky_model_sampling():
                      sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3, pol_efficiency=0.9)
     angle = psi + 0.3
     ref = _project_maps(maps, pix, angle, 0.9)
-    assert np.abs(_sample(_model(alm, nside, "x"), d, pix, angle, "G", 1) - ref).max() < 1e-8 * np.abs(ref).max()
-    assert np.allclose(_sample(_model(maps, nside, "x"), d, pix, angle, "G", 1), ref)
+    p, a, loc = _pixels_and_angles(d, nside, "G", 1, loc=True)
+    assert np.array_equal(p, pix) and np.allclose(a, angle)
+    assert np.abs(_sample(_model(alm, nside, "x"), d, pix, angle, loc, 1) - ref).max() < 1e-8 * np.abs(ref).max()
+    assert np.allclose(_sample(_model(maps, nside, "x"), d, pix, angle, None, 1), ref)
     # the same pointing in Ecliptic coordinates, interpolated in Galactic
     th_e, ph_e = hp.Rotator(coord=["G", "E"])(theta, phi)
     psi_e = psi - hp.Rotator(coord=["G", "E"]).angle_ref(theta, phi)
     d_e = dataclasses.replace(d, pointing=Pointing(theta=th_e, phi=ph_e, psi=psi_e, coordinates="E"))
-    assert np.abs(_sample(_model(alm, nside, "x"), d_e, pix, angle, "G", 1) - ref).max() < 1e-6 * np.abs(ref).max()
+    _, _, loc_e = _pixels_and_angles(d_e, nside, "G", 1, loc=True)
+    assert np.abs(_sample(_model(alm, nside, "x"), d_e, pix, angle, loc_e, 1) - ref).max() < 1e-6 * np.abs(ref).max()
+    assert _pixels_and_angles(dataclasses.replace(d, pointing=Pointing(pix=pix, nside=nside, psi=psi, coordinates="G")),
+                              nside, "G", 1, loc=True)[2] is None
     with pytest.raises(ValueError, match="alm"):
         _model(alm[:, :-1], nside, "x")
     with pytest.raises(ValueError, match="pixels"):

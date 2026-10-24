@@ -93,6 +93,11 @@ class Pointing:
 
     def pixels_and_psi(self, nside, coordinates, nthreads=1):
         """RING pixels at `nside` and psi in `coordinates` (the output maps)."""
+        return self._pixels_psi_loc(nside, coordinates, nthreads)[:2]
+
+    def _pixels_psi_loc(self, nside, coordinates, nthreads=1):
+        """pixels_and_psi and the (theta, phi) of the samples, (n, 2), in
+        `coordinates` (None for pixels): the angles are rotated only once."""
         if self.pix is not None:
             if self.nside != nside or self.coordinates != coordinates:
                 raise ValueError(
@@ -102,10 +107,10 @@ class Pointing:
             pix = np.asarray(self.pix)
             if self.ordering == "NESTED":
                 pix = ducc0.healpix.Healpix_Base(nside, "NEST").nest2ring(pix, nthreads=nthreads)
-            return pix, np.asarray(self.psi)
+            return pix, np.asarray(self.psi), None
         theta, phi, psi = self.angles(coordinates, nthreads)
-        pix = ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(np.stack([theta, phi], axis=1), nthreads=nthreads)
-        return pix, psi
+        loc = np.stack([theta, phi], axis=1)
+        return ducc0.healpix.Healpix_Base(nside, "RING").ang2pix(loc, nthreads=nthreads), psi, loc
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -452,11 +457,12 @@ def _rotate(theta, phi, psi, R, out):
         out[2, i] = psi[i] + np.arctan2(cx * vx + cy * vy + cz * vz, bx * ax + by * ay + bz * az)
 
 
-def _pixels_and_angles(d, nside, coordinates, nthreads):
-    pix, psi = d.pointing.pixels_and_psi(nside, coordinates, nthreads)
-    if d.hwp_angle is None:
-        return pix, psi + d.pol_angle_rad
-    return pix, psi + 2 * d.hwp_angle - d.pol_angle_rad
+def _pixels_and_angles(d, nside, coordinates, nthreads, loc=False):
+    """Pixels and polarization angles; with loc, also the (theta, phi) of the
+    samples for alm models (else, or for pixels, None)."""
+    pix, psi, xy = d.pointing._pixels_psi_loc(nside, coordinates, nthreads)
+    angle = psi + d.pol_angle_rad if d.hwp_angle is None else psi + 2 * d.hwp_angle - d.pol_angle_rad
+    return pix, angle, xy if loc else None
 
 
 def _pad(tod, m, fill, nfit_max=20000):
@@ -675,6 +681,11 @@ class _Fit:
     cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, bandpass TODs)
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
+    @property
+    def alm(self):
+        """Some model is alm: the samples need (theta, phi)."""
+        return any(x is not None and np.iscomplexobj(x) for x in (self.sky, *self.bands.values()))
+
 
 def _model(x, nside, name):
     """A sky model or template as (ncomp, n): HEALPix maps (real, (npix,) or
@@ -707,16 +718,14 @@ def _masks(mask, nside):
     return out
 
 
-def _sample(x, d, pix, angle, coordinates, nthreads):
+def _sample(x, d, pix, angle, loc, nthreads):
     """The TOD of a sky model (from _model, or None: 0) for one DetectorData:
-    maps sampled in the pixel, alm interpolated at the pointing (ducc0
-    synthesis_general)."""
+    maps sampled in the pixel, alm interpolated at the pointing `loc` ((n, 2)
+    theta, phi in the coordinates of the maps; ducc0 synthesis_general)."""
     if x is None:
         return np.zeros(len(pix))
     if not np.iscomplexobj(x):
         return _project_maps(x, pix, angle, d.pol_efficiency)
-    theta, phi, _ = d.pointing.angles(coordinates, nthreads)
-    loc = np.stack([theta, phi], axis=1)
     lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
     eps = 1e-6 if x.dtype == np.complex64 else 1e-10
     tod = ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
@@ -756,19 +765,21 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         nonlocal n_virtual, nchunk, ndata
         first = nchunk
         ndata += 1
-        pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
+        sample = fit is not None and (fit.cache is None or ndata not in fit.cache)
+        # the (theta, phi) only for alm models, not to keep them otherwise
+        pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=sample and fit.alm)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
         flags, tod_all, tmpl, btmpl = d.flags, d.tod, None, {}
         if fit is not None:
             # d = g (P m + D + S + sum_k a_k B_k) + n, linearized around the current g, a:
             # d / g - D - S - sum a B = P m_res + T dg + sum B da + n, T = D + S + sum a B + P m_res_prev
-            if fit.cache is not None and ndata in fit.cache:
+            if not sample:
                 sky_tod, cached = fit.cache[ndata]
                 btmpl = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
             else:
-                sky_tod = _sample(fit.sky, d, pix, angle, coordinates, nthreads)
-                btmpl = {k: _sample(b, d, pix, angle, coordinates, nthreads) for k, b in fit.bands.items()}
+                sky_tod = _sample(fit.sky, d, pix, angle, loc, nthreads)
+                btmpl = {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in fit.bands.items()}
                 if fit.cache is not None:
                     fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in btmpl.items()}
             known = sky_tod.copy()
@@ -929,7 +940,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
 
 def _model_tod(d, maps, nside, coordinates, nthreads):
     """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0)."""
-    pix, angle = _pixels_and_angles(d, nside, coordinates, nthreads)
+    pix, angle, _ = _pixels_and_angles(d, nside, coordinates, nthreads)
     return _project_maps(maps, pix, angle, d.pol_efficiency)
 
 
