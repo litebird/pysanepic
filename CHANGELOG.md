@@ -7,6 +7,9 @@ Changes on `main` that are not in a release yet.
 - `make_maps` refuses `sky_model` or `bandpass_templates` as alm with a
   `Pointing` in pixels before processing any detector, with a message naming
   them (it failed at the first detector, from `Pointing.angles`).
+- With alm models the angles of each detector are rotated to the coordinates
+  of the maps once, for the pixels and for all the models (they were rotated
+  again for the sky model and for each bandpass template).
 
 ## 0.5.0 (2026-10-22)
 
