@@ -4,6 +4,10 @@
 
 Changes on `main` that are not in a release yet.
 
+- `make_maps` refuses `sky_model` or `bandpass_templates` as alm with a
+  `Pointing` in pixels before processing any detector, with a message naming
+  them (it failed at the first detector, from `Pointing.angles`).
+
 ## 0.5.0 (2026-10-22)
 
 - **Behaviour change**: `GLSParameters.coarse_nside=0` (the default) is now a

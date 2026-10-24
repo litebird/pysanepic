@@ -452,6 +452,13 @@ def test_sky_model_sampling():
         _model(maps[:, :-1], nside, "x")
     with pytest.raises(ValueError, match="one array"):
         _model({"cmb": maps}, nside, "x")
+    # alm need angles: a pixel pointing is refused before any detector is processed
+    d_pix = dataclasses.replace(d, pointing=Pointing(pix=pix, nside=nside, psi=psi, coordinates="G"))
+    with pytest.raises(ValueError, match="sky_model as alm"):
+        make_maps([d_pix], nside, "G", sky_model=alm)
+    with pytest.raises(ValueError, match=r"bandpass_templates\['fg'\] as alm"):
+        make_maps([dataclasses.replace(d_pix, name="d0")], nside, "G", bandpass_templates={"fg": alm})
+    make_maps([d_pix], nside, "G", sky_model=maps)  # maps are sampled in the pixel
 
 
 def _subpixel_data(nside, n, fs, hi=64, seed=33):
