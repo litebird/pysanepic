@@ -914,9 +914,11 @@ class GLS:
         b = self._apply(tod=_chunks(tod))
         bb = self._dot(b, b)
         x = np.zeros_like(b)
-        if x0 is not None:
+        if x0 is None:
+            r = b.copy()  # A 0 = 0: no product
+        else:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
-        r = b - self._apply(x, exact=True)
+            r = b - self._apply(x, exact=True)
         z = self._precond_flat(r)
         d = z.copy()
         delta = self._dot(r, z)
@@ -928,7 +930,7 @@ class GLS:
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
             x += alpha * d
-            true_residual = it % recompute_every == 0
+            true_residual = (it + 1) % recompute_every == 0  # after every recompute_every-th step
             if true_residual:
                 r = b - self._apply(x, exact=True)  # true residual, avoids drift
             else:
