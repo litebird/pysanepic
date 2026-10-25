@@ -8,7 +8,11 @@ Changes on `main` that are not in a release yet.
   initial residual is the right-hand side (it was computed as $b - A\,0$),
   and the true residual is recomputed after every `recompute_every`-th step
   instead of also after the first one: ~24 → 21 products in a 20-iteration
-  run. Same maps within the tolerance.
+  run. Same maps within the tolerance. (#40)
+- Common modes: $N^{-1}$ of a `DetectorGroup` keeps the spectra of its
+  detectors between the two passes of the Woodbury product instead of
+  recomputing them: the same FFTs as uncorrelated noise (1.5 times before),
+  for 8 bytes per sample of the group while it is processed. Same maps. (#41)
 
 ## 0.5.1 (2026-10-24)
 

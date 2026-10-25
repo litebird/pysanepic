@@ -58,9 +58,9 @@ M = (I + \Lambda\, U^T D^{-1} U)^{-1}\,\Lambda,$$
 $N^{-1}$ costs $O(n_\text{det}\, r + r^3)$ per frequency besides the FFTs. It is
 applied in two passes over the detectors of the group: the first accumulates
 $z = \sum_i U_i D_i^{-1} \tilde t_i$ ($r$ spectra), the second computes
-$D_i^{-1}(\tilde t_i - U_i M z)$ for each detector, recomputing its FFT, so
-that only one detector is in memory at a time (1.5 times the FFTs of
-uncorrelated noise). The block preconditioner uses $D$ only, so the PCG needs
+$D_i^{-1}(\tilde t_i - U_i M z)$ for each detector, from the spectra
+$\tilde t_i$ of the first pass, kept while the group is processed (8 bytes
+per sample of the group): the same FFTs as uncorrelated noise. The block preconditioner uses $D$ only, so the PCG needs
 more iterations when the modes are strong, unless the two-level preconditioner
 is used (see [below](#two-level-preconditioner)). Q/U signal in pixels where Q/U are not
 solved (too few angles) is not modelled, and with correlated noise it leaks
