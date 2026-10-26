@@ -17,7 +17,7 @@ Changes on `main` that are not in a release yet.
   amplitude in one pass over each chunk (it scanned the chunk once per
   amplitude): `set_templates` 1.49 → 0.43 s with gains every 10 minutes
   (8 detectors × 1 day at 19 Hz), now independent of the gain period. Same
-  preconditioner.
+  preconditioner. (#42)
 
 ## 0.5.1 (2026-10-24)
 
