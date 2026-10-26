@@ -4,6 +4,8 @@
 
 Changes on `main` that are not in a release yet.
 
+## 0.5.2 (2026-10-26)
+
 - PCG: two products by $P^T N^{-1} P$ fewer per solve. Without `x0` the
   initial residual is the right-hand side (it was computed as $b - A\,0$),
   and the true residual is recomputed after every `recompute_every`-th step
