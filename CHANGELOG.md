@@ -4,6 +4,12 @@
 
 Changes on `main` that are not in a release yet.
 
+- PCG: two products by $P^T N^{-1} P$ fewer per solve. Without `x0` the
+  initial residual is the right-hand side (it was computed as $b - A\,0$),
+  and the true residual is recomputed after every `recompute_every`-th step
+  instead of also after the first one: ~24 → 21 products in a 20-iteration
+  run. Same maps within the tolerance.
+
 ## 0.5.1 (2026-10-24)
 
 - `make_maps` refuses `sky_model` or `bandpass_templates` as alm with a

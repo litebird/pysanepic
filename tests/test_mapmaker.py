@@ -1144,3 +1144,22 @@ if __name__ == "__main__":
     test_contiguous_run_kernel()
     test_pixel_order()
     print("ok")
+
+
+def test_solve_products():
+    """solve from x0=None does no product for the initial residual and recomputes
+    the true residual after every recompute_every-th step, not after the first."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(3)
+    npix, ns, nchunk = 6, 128, 3
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05)
+    g = GLS(pix, psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0, angle_dtype=np.float64, preconditioner="jacobi")
+    calls = []
+    apply = g._apply
+    g._apply = lambda *a, **k: calls.append(1) or apply(*a, **k)
+    _, info = g.solve(rng.normal(size=(nchunk, ns)), tol=1e-30, maxiter=12, recompute_every=5)
+    assert info["iterations"] == 12
+    assert len(calls) == 1 + 12 + 2  # rhs, one per iteration, true residual after steps 5 and 10
