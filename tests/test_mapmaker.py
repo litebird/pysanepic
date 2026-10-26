@@ -1163,3 +1163,21 @@ def test_solve_products():
     _, info = g.solve(rng.normal(size=(nchunk, ns)), tol=1e-30, maxiter=12, recompute_every=5)
     assert info["iterations"] == 12
     assert len(calls) == 1 + 12 + 2  # rhs, one per iteration, true residual after steps 5 and 10
+
+
+def test_template_diag_dense():
+    """The preconditioner of the template amplitudes is the exact diagonal of
+    T^T N^-1 T, also for labels that are interleaved and not in time order."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(5)
+    npix, ns, nchunk = 6, 128, 2
+    pix = rng.integers(0, npix, (nchunk, ns))
+    w = one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05)
+    g = GLS(pix, None, np.tile(w, (nchunk, 1)))
+    labels = [np.repeat([3, 0, 2, 0, 1], [20, 30, 25, 33, 20]), np.where(rng.random(ns) < 0.2, -1, rng.integers(0, 4, ns))]
+    values = rng.normal(size=(nchunk, ns))
+    g.set_templates([(k, values[k], labels[k]) for k in range(nchunk)])
+    cinv = np.fft.irfft(w, n=ns)[(np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns]
+    ref = [sum(t @ cinv @ t for t in (np.where(labels[k] == a, values[k], 0.0) for k in range(nchunk))) for a in range(4)]
+    assert np.allclose(g._template_diag(g._tmpl, g.namp), ref, rtol=1e-12, atol=0)

@@ -13,6 +13,11 @@ Changes on `main` that are not in a release yet.
   detectors between the two passes of the Woodbury product instead of
   recomputing them: the same FFTs as uncorrelated noise (1.5 times before),
   for 8 bytes per sample of the group while it is processed. Same maps. (#41)
+- The preconditioner of the template amplitudes finds the samples of every
+  amplitude in one pass over each chunk (it scanned the chunk once per
+  amplitude): `set_templates` 1.49 → 0.43 s with gains every 10 minutes
+  (8 detectors × 1 day at 19 Hz), now independent of the gain period. Same
+  preconditioner.
 
 ## 0.5.1 (2026-10-24)
 
