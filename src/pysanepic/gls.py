@@ -849,26 +849,26 @@ class GLS:
         """P^T N^-1 P on chunks with common modes: N^-1 = D^-1 - D^-1 U M U^T D^-1
         (Woodbury), M = (I + Lambda U^T D^-1 U)^-1 Lambda. First pass:
         z = sum_k U_k D_k^-1 F t_k; second pass: F^-1 D_k^-1 (F t_k - U_k M z)
-        for each chunk, recomputing its FFT, so that one chunk at a time is in
-        memory. Always in float64."""
+        for each chunk, with the spectra F t_k of the first pass kept (8 bytes
+        per sample of the group, while it is processed). Always in float64."""
+        # ponytail: all the spectra of the group in memory; recompute them in the
+        # second pass (1.5x the FFTs) if a group ever does not fit
         m = self._nfft[chunks[0]]
-
-        def spectrum(k):
+        z = np.zeros((U.shape[1], m // 2 + 1), complex)
+        spectra = []
+        for j, k in enumerate(chunks):
             pol, c2, s2 = self._pol_arrays(k)
             t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
-            n = t.size
-            if m > n:
-                t = np.concatenate([t, np.zeros(m - n)])
-            return ducc0.fft.r2c(t, nthreads=self.nthreads), n, (pol, c2, s2)
-
-        z = np.zeros((U.shape[1], m // 2 + 1), complex)
-        for j, k in enumerate(chunks):
-            f, _, _ = spectrum(k)
-            f *= self.weights[k]
-            z += U[j][:, None] * f
+            if m > t.size:
+                t = np.concatenate([t, np.zeros(m - t.size)])
+            f = ducc0.fft.r2c(t, nthreads=self.nthreads)
+            spectra.append(f)
+            z += U[j][:, None] * (f * self.weights[k])
         y = np.einsum("fab,bf->af", M, z)
         for j, k in enumerate(chunks):
-            f, n, (pol, c2, s2) = spectrum(k)
+            f, n = spectra[j], self.ip[k].size
+            spectra[j] = None
+            pol, c2, s2 = self._pol_arrays(k)
             f -= U[j] @ y
             f *= self.weights[k]
             t = ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[:n]
