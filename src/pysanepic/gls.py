@@ -626,9 +626,14 @@ class GLS:
                                              forward=False, inorm=2, nthreads=self.nthreads)
             c = kernels[key]
             for values, labels in tmpl:
-                for a in np.unique(labels[values != 0]):
-                    idx = np.flatnonzero((labels == a) & (values != 0))
-                    i0, i1 = idx[0], idx[-1] + 1
+                # one pass: the samples of each amplitude, in time order (stable
+                # sort, O(n) when the labels already increase in time)
+                idx = np.flatnonzero(values != 0)
+                idx = idx[np.argsort(labels[idx], kind="stable")]
+                lab = labels[idx]
+                cuts = np.flatnonzero(np.diff(lab)) + 1
+                for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, idx.size]):
+                    a, i0, i1 = lab[lo], idx[lo], idx[hi - 1] + 1
                     v = np.where(labels[i0:i1] == a, values[i0:i1], 0.0)
                     m = fast_fft_length(2 * v.size)
                     f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=self.nthreads)
