@@ -15,6 +15,7 @@ chunk when it is used.
 """
 
 import os
+import queue
 import types
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -271,7 +272,22 @@ def _serial(kernel):
     return numba.njit(nogil=True, cache=True)(g)
 
 
-_project_1, _add_template_1, _add_scaled_1, _cos_sin_1 = map(_serial, (_project, _add_template, _add_scaled, _cos_sin))
+_project_1, _add_template_1, _add_scaled_1, _cos_sin_1, _backproject_1 = map(
+    _serial, (_project, _add_template, _add_scaled, _cos_sin, _backproject))
+
+# ponytail: fixed budget for the private P^T maps of the chunk workers (nside 512
+# x 48 workers: 3.6 GB); above it, P^T by pixel ranges; make it a parameter if needed
+_PRIVATE_MAPS_BYTES = 4e9
+
+
+@numba.njit(parallel=True, cache=True)
+def _reduce_maps(maps, buf):
+    """buf += sum of the private maps of the chunk workers, which are zeroed."""
+    for p in numba.prange(buf.shape[0]):
+        for w in range(maps.shape[0]):
+            for c in range(buf.shape[1]):
+                buf[p, c] += maps[w, p, c]
+                maps[w, p, c] = 0.0
 
 
 @numba.njit(cache=True)
@@ -523,6 +539,7 @@ class GLS:
         self._w32 = {}  # weights in float32, by id of the (shared) float64 arrays
         self._fftbuf = {}  # FFT work buffers, reused over chunks and iterations
         self._slots = []  # work buffers of the chunk workers (see _apply_chunks)
+        self._maps = None  # their private P^T maps
         self._pool = None
         fl = [p.size for p in self.ip] if fft_lengths is None else np.broadcast_to(fft_lengths, (len(self.ip),)).tolist()
         self._nfft = [int(m) for m in fl]
@@ -692,18 +709,23 @@ class GLS:
         v^T C v = c[0] R[0] + 2 sum_l c[l] R[l], with c the first row of the
         circulant N^-1 of the chunk and R the autocorrelation of v, computed
         with an FFT of length 2L: exact, and ~2 FFTs of the chunk in all
-        instead of one per amplitude."""
+        instead of one per amplitude. The chunks in parallel, one per thread
+        (see _apply_chunks)."""
         diag = np.zeros(n)
         kernels = {}  # first row of N^-1, by weights array and FFT length
-        for k, tmpl in enumerate(tmpls):
-            if not tmpl:
-                continue
+        ks = [k for k, tmpl in enumerate(tmpls) if tmpl]
+        for k in ks:
             key = (id(self.weights[k]), self._nfft[k])
             if key not in kernels:
                 kernels[key] = ducc0.fft.c2r(np.asarray(self.weights[k], dtype=complex), lastsize=self._nfft[k],
                                              forward=False, inorm=2, nthreads=self.nthreads)
-            c = kernels[key]
-            for values, labels in tmpl:
+        nw = min(self.nthreads, len(ks))
+        nthreads = self.nthreads if nw <= 1 else max(1, self.nthreads // nw)
+
+        def chunk(k):
+            """(amplitude, v^T C v) of each amplitude of chunk k."""
+            c, out = kernels[id(self.weights[k]), self._nfft[k]], []
+            for values, labels in tmpls[k]:
                 if np.ndim(labels) == 0:  # one amplitude in the whole chunk
                     labels = np.full(values.size, labels, np.int32)
                 # one pass: the samples of each amplitude, in time order (stable
@@ -718,10 +740,21 @@ class GLS:
                     a, i0, i1 = lab[lo], idx[lo], idx[hi - 1] + 1
                     v = np.where(labels[i0:i1] == a, values[i0:i1].astype(float), 0.0)
                     m = fast_fft_length(2 * v.size)
-                    f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=self.nthreads)
-                    r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[: v.size]
-                    diag[a] += c[0] * r[0] + 2 * np.dot(c[1 : v.size], r[1:])
+                    f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=nthreads)
+                    r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=nthreads)[: v.size]
+                    out.append((a, c[0] * r[0] + 2 * np.dot(c[1 : v.size], r[1:])))
+            return out
+
+        for out in (map(chunk, ks) if nw <= 1 else self._workers(nw).map(chunk, ks)):
+            for a, x in out:  # in the order of the chunks: the same sums as serial
+                diag[a] += x
         return diag
+
+    def _workers(self, nw):
+        """The thread pool of the chunk workers, with at least `nw` threads."""
+        if self._pool is None or self._pool._max_workers < nw:
+            self._pool = ThreadPoolExecutor(nw, thread_name_prefix="pysanepic")
+        return self._pool
 
     @staticmethod
     def _inverse(diag):
@@ -927,41 +960,62 @@ class GLS:
                                self._project_shared(sh)[: self._nsh_loc]])
 
     def _apply_chunks(self, ks, v, tod, loc, single, buf):
-        """P^T N^-1 P v (or P^T N^-1 tod) on the chunks `ks`, in parallel: in
-        batches of one chunk per worker thread, each worker computes N^-1 P v
-        of its chunk and T^T of it in its own buffers (`slot`), with the serial
+        """P^T N^-1 P v (or P^T N^-1 tod) on the chunks `ks`, in parallel: one
+        chunk per worker thread at a time, each worker computes N^-1 P v of
+        its chunk and T^T of it in its own buffers (`slot`), with the serial
         numba kernels and single-threaded FFTs: the chunks are long and their
         FFTs memory bound, so one FFT on many threads scales poorly (2-4x on
         48 cores of G100) and one FFT per thread well (15x in float64, 25x in
-        float32). Then all the threads add P^T of each chunk to the map, by
-        pixel ranges as without workers. Each worker keeps ~40 bytes per
-        sample of the longest chunk."""
+        float32). P^T goes into a private map per worker if all of them fit in
+        _PRIVATE_MAPS_BYTES (nside 512: 75 MB each), summed at the end;
+        otherwise, in batches of one chunk per worker, all the threads add
+        P^T of each chunk to the map by pixel ranges, as without workers.
+        Each worker keeps ~40 bytes per sample of the longest chunk."""
         nw = min(self.nthreads, len(ks))
-        if self._pool is None or self._pool._max_workers < nw:
-            self._pool = ThreadPoolExecutor(nw, thread_name_prefix="pysanepic")
+        pool = self._workers(nw)
         while len(self._slots) < nw:
             nmax = max(ip.size for ip in self.ip)
             c2, s2 = (np.empty(nmax, self._c2.dtype), np.empty(nmax, self._c2.dtype)) if self.pol else (None, None)
             self._slots.append(dict(c2=c2, s2=s2, t=np.empty(nmax), fft={}))
         slots = self._slots[:nw]
-        for slot in slots:
+        private = nw * buf.nbytes <= _PRIVATE_MAPS_BYTES
+        if private and (self._maps is None or self._maps.shape[0] < nw):
+            self._maps = np.zeros((nw, *buf.shape))  # zeroed again by _reduce_maps
+        for j, slot in enumerate(slots):
             slot["nthreads"] = max(1, self.nthreads // nw)
             slot["loc"], slot["sh"] = np.zeros(self.namp), np.zeros(self.nshared)
+            if private:
+                slot["map"], slot["flag"] = self._maps[j], np.zeros(self.nflag)
+        free = queue.SimpleQueue()
+        for slot in slots:
+            free.put(slot)
+        whole = np.array([0, self.nobs], np.int64)  # one thread: all the pixels
 
-        def work(k, slot):
+        def work(k):
+            slot = free.get() if private else k[1]
+            k = k if private else k[0]
             pol, c2, s2 = self._pol_arrays(k, slot)
             t = self._chunk_tod(k, v, tod, loc, c2, s2, pol, slot)
             f = self._filter(t, k, single, slot)
             self._template_back(k, f, slot["loc"], slot["sh"], serial=True)
-            return pol, c2, s2, f
+            if not private:
+                return pol, c2, s2, f
+            _backproject_1(self.ip[k], f, c2, s2, pol, whole, slot["map"], slot["flag"])
+            free.put(slot)
 
-        for i in range(0, len(ks), nw):
-            batch = ks[i : i + nw]
-            for k, (pol, c2, s2, f) in zip(batch, self._pool.map(work, batch, slots)):
-                _backproject(self.ip[k], f, c2, s2, pol, self._edges, buf, self._locbuf)
+        if private:
+            list(pool.map(work, ks))
+            _reduce_maps(self._maps[:nw], buf)
+        else:
+            for i in range(0, len(ks), nw):
+                batch = ks[i : i + nw]
+                for k, (pol, c2, s2, f) in zip(batch, pool.map(work, zip(batch, slots))):
+                    _backproject(self.ip[k], f, c2, s2, pol, self._edges, buf, self._locbuf)
         for slot in slots:
             self._locbuf[self.nflag :] += slot["loc"]
             self._shbuf += slot["sh"]
+            if private:
+                self._locbuf[: self.nflag] += slot["flag"]
 
     def _chunk_tod(self, k, v, tod, loc, c2, s2, pol, slot=None):
         """P v on chunk k (v given), or the TOD of chunk k (flagged samples set
@@ -1087,6 +1141,7 @@ class GLS:
         self._full = self._buf = self._locbuf = None
         self._fftbuf = {}
         self._slots = []
+        self._maps = None
 
     def _pcg(self, b, x, start, tol, maxiter, recompute_every, verbose):
         """PCG on A x = b from x (`start`: x is not 0); returns (x, iterations,
