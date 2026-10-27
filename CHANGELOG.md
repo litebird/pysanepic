@@ -36,7 +36,9 @@ Changes on `main` that are not in a release yet.
   with and without HWP; the fit is right to second order. (#46)
 - Template helpers (`pysanepic.templates`): `pol_angle_template`,
   `fwhm_template`, `beam_templates` / `beam_tods` (pointing offsets and
-  ellipticity as TODs, with the `sum_zero` the HWP needs) and
+  ellipticity as TODs, exact derivatives of the sky model from the
+  spin-raising and lowering operators with ducc0, with the `sum_zero` the
+  HWP needs) and
   `beam_parameters` (offsets and beam axes from the fitted amplitudes, the
   $\rho\rho^T$ of the offsets subtracted); the docs use them instead of the
   recipes. (#47)

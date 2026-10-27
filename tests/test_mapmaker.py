@@ -757,8 +757,8 @@ def _observe(alm, theta, phi, angle):
 
 def test_beam_templates():
     """Pointing offsets, ellipticities and FWHM of the beams: beam_templates
-    (TOD templates from the sky model resampled with the beam moved by +-eps,
-    first and second differences) and fwhm_template (the sky template of the
+    (TOD templates, the derivatives of the sky model along the axes of the
+    detectors) and fwhm_template (the sky template of the
     Laplacian, -l(l+1)/2 on T, -(l(l+1)-4)/2 on E, B). The
     TOD is the sky through elliptical Gaussian beams (Gauss-Hermite
     quadrature, with the offset) minus the same through the circular beam of
@@ -770,7 +770,7 @@ def test_beam_templates():
     from pysanepic import beam_parameters, beam_templates, fwhm_template
 
     nside, n, fs = 16, 120_000, 10.0
-    lmax, sig0, eps = 3 * nside - 1, np.radians(1.0), np.radians(1 / 60)
+    lmax, sig0 = 3 * nside - 1, np.radians(1.0)
     rng = np.random.default_rng(3)
     ell = np.arange(lmax + 1)
     sky = np.array([hp.synalm(f * 1e-8 / (1 + ell), lmax=lmax) for f in (1.0, 0.1, 0.03)])
@@ -812,7 +812,7 @@ def test_beam_templates():
             data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                                      sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0), pol_angle_rad=pol,
                                      hwp_angle=chi if hwp else None, name=f"d{i}", templates={"other": 0 * tod}))
-        data, tmpl = beam_templates(data, model, "E", eps=eps)
+        data, tmpl = beam_templates(data, model, "E")
         assert [t.sum_zero for t in tmpl.values()] == [False, False, not hwp, not hwp]
         assert set(data[0].templates) == {"other", "offset_x", "offset_y", "ell_plus", "ell_cross"}
         tmpl["fwhm"] = fwhm_template(model)
@@ -846,6 +846,40 @@ def test_beam_templates():
         assert max(err.values()) < tol, (scale, err)
     err = run(1.0, hwp=True)
     assert max(err.values()) < 2e-2, err
+
+
+def test_beam_tods_derivatives():
+    """beam_tods (spin-raising and lowering operators) against finite
+    differences of the sky resampled with the beam moved along the axes of
+    the detector, with psi transported: T, E and B separately, with and
+    without HWP, pol_efficiency 0.9; equal to the truncation of the
+    differences, (l eps)^2 / 12."""
+    from pysanepic import beam_tods
+    from pysanepic.mapmaker import _sample
+
+    rng = np.random.default_rng(5)
+    lmax, eps = 40, 2e-4
+    ell = np.arange(lmax + 1)
+    base = np.array([hp.synalm(1 / (1 + ell) ** 2, lmax=lmax) for _ in range(3)])
+    theta, phi, psi = _scan(20000, rng)
+    chi = rng.uniform(0, 2 * np.pi, len(psi))
+    for k in range(3):
+        alm = base * (np.arange(3) == k)[:, None]
+        for hwp in (None, chi):
+            d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                             sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3,
+                             pol_efficiency=0.9, hwp_angle=hwp)
+            got = beam_tods(d, alm, "E")
+            s = {}
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                th, ph, ps = _displaced(theta, phi, psi, dx * eps, dy * eps, d.pol_angle_rad)
+                angle = ps + d.pol_angle_rad if hwp is None else ps + 2 * hwp - d.pol_angle_rad
+                s[dx, dy] = _sample(alm, d, None, angle, np.stack([th, ph], axis=1), 1)
+            fd = {"offset_x": (s[1, 0] - s[-1, 0]) / (2 * eps), "offset_y": (s[0, 1] - s[0, -1]) / (2 * eps),
+                  "ell_plus": (s[1, 0] + s[-1, 0] - s[0, 1] - s[0, -1]) / (2 * eps**2),
+                  "ell_cross": (s[1, 1] + s[-1, -1] - s[1, -1] - s[-1, 1]) / (4 * eps**2)}
+            for name in fd:
+                assert np.std(got[name] - fd[name]) < 2e-5 * np.std(fd[name]), (k, hwp is None, name)
 
 
 def test_template_helpers_errors():

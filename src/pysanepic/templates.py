@@ -10,10 +10,11 @@ See the documentation (Templates) for what the amplitudes are.
 
 import dataclasses
 
+import ducc0
 import healpy as hp
 import numpy as np
 
-from .mapmaker import Template, _model, _sample
+from .mapmaker import Template, _model
 
 BEAM_NAMES = ("offset_x", "offset_y", "ell_plus", "ell_cross")
 
@@ -59,40 +60,36 @@ def fwhm_template(sky_alm, *, mask=None):
     return Template(sky=np.array(lap), sum_zero=True, mask=mask)
 
 
-def _displaced(theta, phi, psi, dx, dy, frame):
-    """The pointing moved by (dx, dy) [rad] along x = cos b e_theta + sin b
-    e_phi, y = -sin b e_theta + cos b e_phi, b = psi + frame, with psi
-    parallel-transported along the geodesic: (theta, phi, psi)."""
-    st, ct, sp, cp = np.sin(theta), np.cos(theta), np.sin(phi), np.cos(phi)
-    n = np.array([st * cp, st * sp, ct])
-    et, ep = np.array([ct * cp, ct * sp, -st]), np.array([-sp, cp, 0 * sp])
-    rho, b = np.hypot(dx, dy), psi + frame
-    t = (dx * (np.cos(b) * et + np.sin(b) * ep) + dy * (-np.sin(b) * et + np.cos(b) * ep)) / rho
-    w = np.cross(n, t, axis=0)
-    n2, t2 = np.cos(rho) * n + np.sin(rho) * t, -np.sin(rho) * n + np.cos(rho) * t
-    p = np.cos(psi) * et + np.sin(psi) * ep  # the direction of psi, transported
-    p2 = np.sum(p * t, 0) * t2 + np.sum(p * w, 0) * w
-    th2, ph2 = np.arccos(np.clip(n2[2], -1, 1)), np.arctan2(n2[1], n2[0]) % (2 * np.pi)
-    et2 = np.array([np.cos(th2) * np.cos(ph2), np.cos(th2) * np.sin(ph2), -np.sin(th2)])
-    ep2 = np.array([-np.sin(ph2), np.cos(ph2), 0 * ph2])
-    return th2, ph2, np.arctan2(np.sum(p2 * ep2, 0), np.sum(p2 * et2, 0))
+def _spin(alm, spin, lmax, loc, nthreads):
+    """The complex field -sum_lm (alm[0] + i alm[1]) sY_lm at `loc` (healpy
+    and ducc0 convention for spin > 0; for spin 0, sum_lm (alm[0] + i
+    alm[1]) Y_lm)."""
+    eps = 1e-6 if alm.dtype == np.complex64 else 1e-10
+    if spin == 0:
+        re, im = (ducc0.sht.synthesis_general(alm=a[None], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
+                  for a in alm)
+        return re + 1j * im
+    re, im = ducc0.sht.synthesis_general(alm=alm, spin=spin, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)
+    return re + 1j * im
 
 
-def beam_tods(d, sky_alm, coordinates, *, offsets=True, ellipticity=True, eps=None, nthreads=1):
+def beam_tods(d, sky_alm, coordinates, *, offsets=True, ellipticity=True, nthreads=1):
     """The beam templates of one DetectorData: pointing offsets and
     ellipticity, as TODs.
 
     d: a DetectorData with a Pointing as angles (theta, phi). sky_alm: the sky
     model through the mean beam, alm (T or T, E, B) in `coordinates`, those
-    of the maps. The model is resampled with the beam moved by +-eps [rad]
-    (default 0.1 / lmax) along the axes of the detector, x = cos b e_theta +
-    sin b e_phi and y = -sin b e_theta + cos b e_phi with b = psi +
-    pol_angle_rad, transporting the polarization frame: first differences
-    for the offsets (rho_x, rho_y [rad]), second differences for the
-    ellipticity, (d_xx - d_yy) / 2 and d_xy, whose amplitudes are the changes
-    c+, cx of the second moments [rad^2] (Sigma_xx = sigma^2 + c+, Sigma_yy =
-    sigma^2 - c+, Sigma_xy = cx). HWP angle and pol_efficiency are those of
-    `d`. 4 resamplings for the offsets, 8 for both.
+    of the maps. The templates are the derivatives of the model along the
+    axes of the detector, x = cos b e_theta + sin b e_phi and y = -sin b
+    e_theta + cos b e_phi with b = psi + pol_angle_rad: the first for the
+    offsets (rho_x, rho_y [rad]), (d_xx - d_yy) / 2 and d_xy for the
+    ellipticity, whose amplitudes are the changes c+, cx of the second
+    moments [rad^2] (Sigma_xx = sigma^2 + c+, Sigma_yy = sigma^2 - c+,
+    Sigma_xy = cx). They are exact, from the spin-raising and lowering
+    operators in harmonic space (ducc0 synthesis_general with spin 1 and 2 for
+    T; 0 to 4 for the covariant derivatives of Q + iU); HWP angle and
+    pol_efficiency are those of `d`. 2 syntheses for T, 3 + 4 more with
+    polarization.
 
     Returns {"offset_x", "offset_y", "ell_plus", "ell_cross": array like
     d.tod} (those asked for).
@@ -102,26 +99,46 @@ def beam_tods(d, sky_alm, coordinates, *, offsets=True, ellipticity=True, eps=No
     if not np.iscomplexobj(sky_alm):
         raise ValueError("beam_tods: the sky model as alm (complex), not maps")
     x = _model(sky_alm, 0, "beam_tods")
-    if eps is None:
-        eps = 0.1 / hp.Alm.getlmax(x.shape[1])
+    lmax = hp.Alm.getlmax(x.shape[1])
+    ell = np.arange(lmax + 1, dtype=float)
     theta, phi, psi = d.pointing.angles(coordinates, nthreads)
-    steps = [(1, 0), (-1, 0), (0, 1), (0, -1)] + ([(1, 1), (-1, -1), (1, -1), (-1, 1)] if ellipticity else [])
-    s = {}
-    for dx, dy in steps:
-        th, ph, ps = _displaced(theta, phi, psi, dx * eps, dy * eps, d.pol_angle_rad)
-        angle = ps + d.pol_angle_rad if d.hwp_angle is None else ps + 2 * d.hwp_angle - d.pol_angle_rad
-        s[dx, dy] = _sample(x, d, None, angle, np.stack([th, ph], axis=1), nthreads)
+    loc = np.stack([theta, phi], axis=1)
+    a = psi + d.pol_angle_rad if d.hwp_angle is None else psi + 2 * d.hwp_angle - d.pol_angle_rad
+    eb = np.exp(-1j * (psi + d.pol_angle_rad))  # e^{-ib}
+    # the polarization along the derivative: Re[gamma e^{-2ia} (derivative of Q + iU)]
+    pol = d.pol_efficiency * np.exp(-2j * a) if x.shape[0] == 3 else None
+
+    def fl(f, *alm):
+        return np.array([hp.almxfl(c, np.sqrt(np.maximum(f, 0))) for c in alm])
+
+    zero = np.zeros_like(x[0])
     out = {}
     if offsets:
-        out["offset_x"] = (s[1, 0] - s[-1, 0]) / (2 * eps)
-        out["offset_y"] = (s[0, 1] - s[0, -1]) / (2 * eps)
+        # d_b = -(e^{-ib} edth + e^{ib} edthbar) / 2 for any spin
+        dt = _spin(-fl(ell * (ell + 1), x[0], zero), 1, lmax, loc, nthreads)  # edth T
+        gx, gy = -(eb * dt).real, -(eb * dt).imag
+        if pol is not None:
+            dp = _spin(fl((ell - 2) * (ell + 3), x[1], x[2]), 3, lmax, loc, nthreads)  # edth P
+            dpb = _spin(-fl((ell + 2) * (ell - 1), x[1], x[2]), 1, lmax, loc, nthreads)  # edthbar P
+            gx = gx + (pol * -(eb * dp + np.conj(eb) * dpb) / 2).real
+            gy = gy + (pol * -(-1j * eb * dp + 1j * np.conj(eb) * dpb) / 2).real
+        out["offset_x"], out["offset_y"] = gx, gy
     if ellipticity:
-        out["ell_plus"] = (s[1, 0] + s[-1, 0] - s[0, 1] - s[0, -1]) / (2 * eps**2)
-        out["ell_cross"] = (s[1, 1] + s[-1, -1] - s[1, -1] - s[-1, 1]) / (4 * eps**2)
+        # (d_xx - d_yy) / 2 = (e^{-2ib} edth^2 + e^{2ib} edthbar^2) / 4, d_xy = -i (e^{-2ib} edth^2 - c.c.) / 4
+        e2 = eb**2
+        tt = _spin(-fl((ell - 1) * ell * (ell + 1) * (ell + 2), x[0], zero), 2, lmax, loc, nthreads)  # edth^2 T
+        hp_, hx = (e2 * tt).real / 2, (e2 * tt).imag / 2
+        if pol is not None:
+            f2 = (ell - 1) * ell * (ell + 1) * (ell + 2)
+            pp = _spin(fl((ell - 2) * (ell + 3) * (ell - 3) * (ell + 4), x[1], x[2]), 4, lmax, loc, nthreads)  # edth^2 P
+            ppb = -_spin(fl(f2, x[1], x[2]), 0, lmax, loc, nthreads)  # edthbar^2 P
+            hp_ = hp_ + (pol * (e2 * pp + np.conj(e2) * ppb) / 4).real
+            hx = hx + (pol * -1j * (e2 * pp - np.conj(e2) * ppb) / 4).real
+        out["ell_plus"], out["ell_cross"] = hp_, hx
     return out
 
 
-def beam_templates(data, sky_alm, coordinates, *, offsets=True, ellipticity=True, eps=None, nthreads=1):
+def beam_templates(data, sky_alm, coordinates, *, offsets=True, ellipticity=True, nthreads=1):
     """The beam templates of all the DetectorData (see :func:`beam_tods`).
 
     Returns (data, templates): the DetectorData as a list, with the TODs added
@@ -137,7 +154,7 @@ def beam_templates(data, sky_alm, coordinates, *, offsets=True, ellipticity=True
         raise ValueError("beam_templates: DetectorData with and without HWP (the ellipticity constraints differ)")
     out = []
     for d in data:
-        tods = beam_tods(d, sky_alm, coordinates, offsets=offsets, ellipticity=ellipticity, eps=eps, nthreads=nthreads)
+        tods = beam_tods(d, sky_alm, coordinates, offsets=offsets, ellipticity=ellipticity, nthreads=nthreads)
         old = d.templates or {}
         if set(old) & set(tods):
             raise ValueError(f"beam_templates: DetectorData.templates already has {sorted(set(old) & set(tods))}")

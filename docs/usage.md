@@ -521,10 +521,28 @@ Each term is a template whose amplitudes are these numbers, per detector:
   the $-4$ matters only at low $\ell$);
 - **offsets** and **ellipticity** turn with the detector (as $\psi$ and
   $2\psi$): they are not sky templates, but TODs computed for each detector,
-  by resampling the model with the beam moved by $\pm\varepsilon$ along $x$ and
-  $y$ (first and second differences). Moving the pointing, and transporting
-  the polarization frame with it, keeps the polarization of the model right
-  near the poles too.
+  the derivatives of the model along $x$ and $y$ at its pointing.
+
+The derivatives are exact, computed in harmonic space with the spin-raising
+and lowering operators $\eth$, $\bar\eth$ (the deprojection templates of
+the temperature, and of the polarization too). Along the direction at angle
+$b$, for a field of any spin (T, or $P = Q + iU$ with covariant derivatives,
+which keep the polarization right near the poles):
+
+$$
+\partial_x = -\tfrac12\left(e^{-ib}\,\eth + e^{ib}\,\bar\eth\right),\qquad
+\tfrac12(\partial_{xx} - \partial_{yy}) = \tfrac14\left(e^{-2ib}\,\eth^2 + e^{2ib}\,\bar\eth^2\right),
+$$
+
+and $\partial_y$, $\partial_{xy}$ the same with $b \to b + \pi/2$, $b + \pi/4$.
+$\eth T$, $\eth^2 T$, $\eth P$, $\bar\eth P$, $\eth^2 P$, $\bar\eth^2 P$ are
+fields of spin 1, 2, 3, 1, 4, 0: the alm of the model times
+$\sqrt{(\ell \mp s)(\ell \pm s + 1)}$ factors, synthesized at the pointing
+with ducc0 `synthesis_general`. The polarization enters the TOD as
+$\gamma\,\mathrm{Re}[e^{-2ia}\,\partial P]$, with $a$ the angle of the
+signal model, so the HWP is taken into account. A test compares them with
+finite differences of the model resampled with the beam moved along $x$ and
+$y$ (`test_beam_tods_derivatives`).
 
 The frame: $x = \cos b\, e_\theta + \sin b\, e_\phi$,
 $y = -\sin b\, e_\theta + \cos b\, e_\phi$ with $b = \psi + \text{pol\_angle}$,
@@ -570,8 +588,8 @@ beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
   polarization angle): it leaks the gradients of I into Q/U exactly as a
   polarization map would. With an HWP the polarization turns with
   $2\chi$ and the beam does not: the common ellipticity is measured, no
-  `sum_zero` (`beam_templates` chooses from the `hwp_angle` of the data). The common parts are absorbed by the maps only down to the
-  pixel: the sky model should be smoothed with the mean beam of the
+  `sum_zero` (`beam_templates` chooses from the `hwp_angle` of the data).
+  The common parts are absorbed by the maps only down to the pixel: the sky model should be smoothed with the mean beam of the
   detectors, or the rest of the structure below the pixel biases the fit (by
   ~1% in the test).
 - **Linearization**: the error on the fitted values is of second order. In
@@ -579,15 +597,11 @@ beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
   2.4°, $\ell \le 47$, offsets of a few arcminutes and ellipticities of a
   few %, with and without HWP), ~1% of the largest value, ~0.1% for 10 times
   smaller errors.
-- **Step**: `eps` (default $0.1/\ell_\text{max}$) small compared to the
-  scales of the model ($\ell_\text{max}\,\varepsilon \ll 1$: the error of
-  the differences is $\sim(\ell\varepsilon)^2/12$), but not so small that
-  the precision of the resampling ($10^{-10}$, divided by
-  $(\ell\varepsilon)^2$) dominates.
-- **Cost**: 8 resamplings of the model per detector, as many as with
-  `sky_model` (4 for the offsets only); the 4 templates are kept in memory
-  as 4 more TODs per detector. Fit only what is needed
-  (`beam_templates(..., ellipticity=False)` for the offsets).
+- **Cost**: per detector, 2 syntheses at the pointing for T only, 9 with
+  polarization (each like the sampling of `sky_model`); the 4 templates are
+  kept in memory as 4 more TODs per detector. Fit only what is needed
+  (`beam_templates(..., ellipticity=False)` for the offsets: 1 or 3
+  syntheses).
 
 ### Masks
 
