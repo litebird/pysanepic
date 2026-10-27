@@ -156,8 +156,12 @@ replaces the TOD and the templates (`GLS.set_templates`) and starts the PCG
 from the maps of the previous one.
 
 Templates are not applied to samples in pixels whose Q/U are not solved: their
-polarized signal is not in the model and would bias the amplitudes. For the
-same reason a `mask` flags its samples during the iterations (with
+polarized signal is not in the model and would bias the amplitudes. Those
+samples are then out of every fit, but still in the maps, calibrated with the
+gains of the previous iteration, and the iterations would converge slowly
+(~2x each with few detectors): after the first iteration they are flagged like
+those out of every mask (one more GLS setup, only if there are such pixels).
+Likewise a `mask` flags its samples during the iterations (with
 `flag_method`), and one last solve with the final gains makes the maps
 with all the samples. A gain common to all periods and detectors is
 degenerate with the scale of the map except through the part of $D$ that is

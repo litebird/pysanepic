@@ -18,6 +18,13 @@ Changes on `main` that are not in a release yet.
   all pixels, pass a mask of ones. `make_maps` warns when the masks of
   gains and templates differ. Equal masks are kept once in memory, and
   their samples are tested once per mask.
+- Calibration: the samples in pixels whose Q/U are not solved (out of every
+  fit) are flagged from the second iteration, like those out of every mask,
+  and back in the final maps. They were calibrated with the gains of the
+  previous iteration and slowed the iterations down to ~2x each (gain errors
+  of 6e-3 after 10 iterations with 3 detectors, 1e-9 after 4 now). One more
+  GLS setup, only when there are such pixels. New test
+  `test_calibration_unsolved_pol`.
 - **Breaking change**: one interface for the templates fitted with the maps,
   `make_maps(templates={name: Template(...)})`, which replaces
   `bandpass_templates` and `bandpass_common`; `MapResult.templates` replaces

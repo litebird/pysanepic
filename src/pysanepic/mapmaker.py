@@ -408,7 +408,9 @@ class CalibrationParameters:
     is not a sky signal (the orbital dipole), so D must include it; the
     solar dipole and the sky give the relative gains. Samples in pixels whose
     Q/U are not solved (see GLSParameters.min_pol_rcond) do not enter the
-    fits (their polarization is not modelled) but are calibrated. Signal not
+    fits (their polarization is not modelled) but are calibrated; from the
+    second iteration they are flagged like those out of every mask (one more
+    GLS setup), otherwise the iterations converge much slower. Signal not
     described by one sky map for all detectors biases the gains: structure
     below the pixel size (give the sky model as alm) and foregrounds seen
     through different bandpasses (a template of the foregrounds); mask what is left.
@@ -432,10 +434,9 @@ class CalibrationParameters:
         detectors and periods, all MPI processes) is below it. The
         iterations converge geometrically but slower where the gains are
         less constrained (periods with a weak dipole), and much slower with
-        samples left out of some fits only (see mask) or in pixels whose Q/U
-        are not solved (~2x per iteration in test_calibration_mpi): gain_tol
-        stops on the worst period. MapResult.calibration_iterations has the number
-        of iterations done.
+        samples left out of some fits only (see mask): gain_tol stops on the
+        worst period. MapResult.calibration_iterations has the number of
+        iterations done.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels used and 0 (False) for pixels left out of the gain fit, as
         the usual masks (combine them with a product), or None: all pixels.
@@ -757,11 +758,13 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                 print(f"calibration iteration {n_cal}: max |dg| = {dg:.3e}")
             if calibration.gain_tol is not None and dg < calibration.gain_tol:
                 break
+            if n_cal == 1 and calibration.n_iter > 1:
+                _mask_unsolved_pol(fit, res, verbose and (comm is None or comm.rank == 0))
     cov = None
     if template_covariance and index:
         p = GLSParameters() if params is None else params
         cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.tol, maxiter=p.maxiter, verbose=verbose)}
-    if mask_gain is not None or any(m is not None for m in masks.values()):  # masked samples may have been left out
+    if fit.mask_gain is not None or any(m is not None for m in fit.masks.values()):  # samples may have been left out
         fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
     out = {}
@@ -833,6 +836,35 @@ def _mask(mask, nside, name):
     if mask.shape != (12 * nside * nside,):
         raise ValueError(f"{name} must have 12 nside^2 = {12 * nside * nside} pixels")
     return None if np.all(mask != 0) else mask
+
+
+def _mask_unsolved_pol(fit, res, verbose):
+    """After the first calibration iteration: the samples in pixels whose Q/U
+    are not solved are out of every fit (their templates are 0, see
+    GLS.set_templates) but in the maps, calibrated with the gains of the
+    previous iteration, which slows the iterations down as a mask of the gains
+    alone. Leave those pixels out of every mask: the samples are flagged in the
+    next iterations (a new GLS) and back in the final maps. `res` is full on
+    every rank, so all of them take the same decision."""
+    if res.maps.shape[0] == 1:
+        return
+    out = (res.maps[1] == hp.UNSEEN) & (res.hit_map > 0)
+    if not out.any():
+        return
+    if verbose:
+        print(f"calibration: samples in {out.sum()} pixels without Q/U flagged in the next iterations")
+    keep, new = ~out, {}
+
+    def cut(m):  # equal masks stay one array
+        if m is None:
+            return keep
+        if id(m) not in new:
+            new[id(m)] = (m != 0) & keep
+        return new[id(m)]
+
+    fit.mask_gain = cut(fit.mask_gain)
+    fit.masks = {k: cut(m) for k, m in fit.masks.items()}
+    fit.gls = None
 
 
 def _sample(x, d, pix, angle, loc, nthreads):
