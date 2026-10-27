@@ -23,4 +23,4 @@ napoleon_use_ivar = True
 
 html_theme = "furo"
 html_title = f"pysanepic {release}"
-myst_heading_anchors = 2
+myst_heading_anchors = 3

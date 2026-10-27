@@ -14,7 +14,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, make_maps, one_over_f_weights
+from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, Template, make_maps, one_over_f_weights
 
 
 def _scan(n, rng):
@@ -371,6 +371,9 @@ def test_shared_templates_exact_gls():
     assert np.abs(x - ref[:n].reshape(3, npix)).max() < 1e-9 * np.abs(ref).max()
     assert np.allclose(info["amplitudes"], ref[n : n + 1], rtol=1e-8)
     assert np.allclose(info["shared_amplitudes"], ref[n + 1 :], rtol=1e-8, atol=1e-12)
+    # covariance of the shared amplitudes: the shared block of Z (Z^T A Z)^-1 Z^T
+    cov = (Z @ np.linalg.solve(Z.T @ A @ Z, Z.T))[n + 1 :, n + 1 :]
+    assert np.allclose(g.shared_covariance(tol=1e-26), cov, rtol=1e-8, atol=1e-10 * np.abs(cov).max())
 
 
 def _calibration_data(nside, n, fs, per):
@@ -461,8 +464,8 @@ def test_sky_model_sampling():
     d_pix = dataclasses.replace(d, pointing=Pointing(pix=pix, nside=nside, psi=psi, coordinates="G"))
     with pytest.raises(ValueError, match="sky_model as alm"):
         make_maps([d_pix], nside, "G", sky_model=alm)
-    with pytest.raises(ValueError, match=r"bandpass_templates\['fg'\] as alm"):
-        make_maps([dataclasses.replace(d_pix, name="d0")], nside, "G", bandpass_templates={"fg": alm})
+    with pytest.raises(ValueError, match=r"templates\['fg'\].sky as alm"):
+        make_maps([dataclasses.replace(d_pix, name="d0")], nside, "G", templates={"fg": Template(sky=alm)})
     make_maps([d_pix], nside, "G", sky_model=maps)  # maps are sampled in the pixel
 
 
@@ -531,9 +534,10 @@ def _bandpass_data(nside, n, fs, per, amp):
 
 
 def test_bandpass_templates():
-    """A foreground seen with a different amplitude by each detector: the
-    amplitudes (minus their mean) are recovered, alone and with the gains,
-    and the maps are sky + (1 + mean) fg; also with masks for each fit."""
+    """A foreground seen with a different amplitude by each detector, fitted
+    with a sky template summing to zero: the amplitudes (minus their mean)
+    are recovered, alone and with the gains, and the maps are sky + (1 +
+    mean) fg; also with masks for each fit."""
     from pysanepic import CalibrationParameters
 
     nside, n, fs, per = 16, 120_000, 10.0, 12_000
@@ -541,19 +545,22 @@ def test_bandpass_templates():
     data, true, sky, fg = _bandpass_data(nside, n, fs, per, amp)
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
     expect = {f"d{i}": a - amp.mean() for i, a in enumerate(amp)}
+    fg_tmpl = {"fg": Template(sky=fg, sum_zero=True)}
     band = np.abs(hp.pix2vec(nside, np.arange(12 * nside**2))[2]) > 0.3  # 1 = used
     spot = np.ones(12 * nside**2, bool)
     spot[hp.query_disc(nside, hp.ang2vec(1.0, 2.0), np.radians(10))] = False
     # samples out of the gain fit only (band): calibrated with the gains of the
     # previous iteration, so the iterations converge slower (~5x each)
-    cases = [(CalibrationParameters(gain_period_s=per / fs, n_iter=3), 1e-9),
-             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot, n_iter=3, cache_model=True), 1e-9),
-             (CalibrationParameters(gain_period_s=per / fs, mask={"gain": band * spot, "bandpass": spot}, n_iter=10), 1e-8)]
-    cases.append((CalibrationParameters(gain_period_s=per / fs, n_iter=3), 1e-9, fg))  # with a sky model too
-    for cal, tol, *model in cases:
-        r = make_maps(data, nside, coordinates="E", params=params, bandpass_templates={"fg": fg}, calibration=cal,
+    masked = lambda m: {"fg": Template(sky=fg, sum_zero=True, mask=m)}  # noqa: E731
+    cases = [(CalibrationParameters(gain_period_s=per / fs, n_iter=3), fg_tmpl, 1e-9),
+             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot, n_iter=3, cache_model=True),
+              masked(band * spot), 1e-9),
+             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot, n_iter=10), masked(spot), 1e-8)]
+    cases.append((CalibrationParameters(gain_period_s=per / fs, n_iter=3), fg_tmpl, 1e-9, fg))  # with a sky model too
+    for cal, tmpl, tol, *model in cases:
+        r = make_maps(data, nside, coordinates="E", params=params, templates=tmpl, calibration=cal,
                       sky_model=model[0] if model else None)
-        assert max(abs(r.bandpass["fg"][k] - v) for k, v in expect.items()) < tol
+        assert max(abs(r.templates["fg"][k] - v) for k, v in expect.items()) < tol
         assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < tol
         seen = r.maps[1] != hp.UNSEEN
         err = (r.maps - sky - (1 + amp.mean()) * fg)[:, seen]
@@ -562,20 +569,33 @@ def test_bandpass_templates():
     # without gains (calibrated data, dipole removed): one solve
     t = np.arange(n)
     flat = [dataclasses.replace(d, tod=d.tod / g[t // per] - d.dipole, dipole=None) for d, g in zip(data, true)]
-    r = make_maps(flat, nside, coordinates="E", params=params, bandpass_templates={"fg": fg})
-    assert r.gains is None and max(abs(r.bandpass["fg"][k] - v) for k, v in expect.items()) < 1e-9
+    r = make_maps(flat, nside, coordinates="E", params=params, templates=fg_tmpl)
+    assert r.gains is None and max(abs(r.templates["fg"][k] - v) for k, v in expect.items()) < 1e-9
+    # a template mask without calibration: the masked samples are left out of the fit, then back in the maps
+    r = make_maps(flat, nside, coordinates="E", params=params, templates=masked(spot))
+    assert max(abs(r.templates["fg"][k] - v) for k, v in expect.items()) < 1e-9
+    seen = r.maps[1] != hp.UNSEEN
+    assert np.all(seen[~spot] | (r.hit_map[~spot] == 0))  # the masked pixels are in the maps
+    err = (r.maps - sky - (1 + amp.mean()) * fg)[:, seen]
+    err[0] -= err[0].mean()
+    assert np.abs(err).max() < 1e-5 * np.abs(sky).max()
     with pytest.raises(ValueError, match="name"):
-        make_maps([dataclasses.replace(flat[0], name=None)], nside, bandpass_templates={"fg": fg})
-    with pytest.raises(ValueError, match="mask"):
-        make_maps(data, nside, calibration=CalibrationParameters(mask={"gains": band}))
+        make_maps([dataclasses.replace(flat[0], name=None)], nside, templates=fg_tmpl)
+    with pytest.raises(ValueError, match="sum_zero"):
+        make_maps(flat, nside, templates={"fg": Template(sky=fg)})  # as maps: the common part is the map
+    with pytest.raises(TypeError, match="Template"):
+        make_maps(flat, nside, templates={"fg": fg})
+    with pytest.raises(TypeError, match="Template.mask"):
+        CalibrationParameters(mask={"gain": band})
+    with pytest.raises(ValueError, match=r"templates\['fg'\].mask"):
+        make_maps(flat, nside, templates=masked(spot[:10]))
 
 
 def test_bandpass_common():
     """Templates as alm, a foreground seen as (1 + a_i) F, F also in the sky
-    model: with mean(a) = 0 the default (sum-zero) amplitudes are a_i; with
-    mean(a) != 0 bandpass_common fits the common part too (constrained by
-    the structure of F below the pixel size) and they are a_i again; as maps
-    the common part is the map itself, an error."""
+    model: with mean(a) = 0 the sum-zero amplitudes are a_i; with mean(a) !=
+    0 free amplitudes fit the common part too (constrained by the structure
+    of F below the pixel size) and they are a_i again."""
     nside, n, fs = 16, 60_000, 10.0
     data, alm = _subpixel_data(nside, n, fs)
     lmax = (int(np.sqrt(8 * alm.shape[1] + 1)) - 3) // 2
@@ -590,14 +610,60 @@ def test_bandpass_common():
         fg_tod.append(t + q * np.cos(2 * a) + u * np.sin(2 * a))
     # Q/U solved everywhere: elsewhere the template is 0 and the polarization of a_i F leaks
     params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64, min_pol_rcond=0.0)
-    kw = dict(coordinates="E", params=params, sky_model=alm + fg, bandpass_templates={"fg": fg})
+    kw = dict(coordinates="E", params=params, sky_model=alm + fg)
     for amp, common in ((np.array([0.04, -0.03, 0.02, -0.03]), False), (np.array([0.05, -0.02, 0.03, 0.01]), True)):
         out = [dataclasses.replace(d, tod=d.tod + (1 + a) * f) for d, f, a in zip(data, fg_tod, amp)]
-        r = make_maps(out, nside, bandpass_common=common, **kw)
-        got = np.array(list(r.bandpass["fg"].values()))
+        r = make_maps(out, nside, templates={"fg": Template(sky=fg, sum_zero=not common)}, **kw)
+        got = np.array(list(r.templates["fg"].values()))
         assert np.abs(got - amp).max() < 1e-6, (common, got - amp)
-    with pytest.raises(ValueError, match="bandpass_common"):
-        make_maps(data, nside, coordinates="E", bandpass_templates={"fg": hp.alm2map(fg, nside, lmax=lmax)}, bandpass_common=True)
+
+
+def test_tod_templates():
+    """Templates given as TOD in DetectorData.templates, in noiseless 1/f data:
+    one amplitude per detector (one detector without the template), one
+    common to all, one per DetectorData and period; recovered with the maps,
+    in one solve and with the gains. The covariance of the amplitudes per
+    detector and common is labelled and positive definite."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per, per_drift = 16, 120_000, 10.0, 12_000, 30_000
+    data, true, _ = _calibration_data(nside, n, fs, per)
+    rng = np.random.default_rng(41)
+    t = np.arange(n)
+    a_th = {"d0": 2e-3, "d1": -1e-3, "d2": 5e-4}
+    a_hk = 3e-4
+    a_drift = [rng.normal(0, 1e-4, n // per_drift) for _ in data]
+    tmpl = {"thermal": Template(), "hk": Template(common=True), "drift": Template(period_s=per_drift / fs)}
+    cal_data, flat = [], []
+    for i, (d, g) in enumerate(zip(data, true)):
+        tt = {"hk": rng.normal(size=n), "drift": (t % per_drift) / per_drift - 0.5}
+        if i < 3:
+            tt["thermal"] = np.convolve(rng.normal(size=n), np.ones(50) / 50, mode="same")
+        extra = a_hk * tt["hk"] + a_drift[i][t // per_drift] * tt["drift"] + a_th.get(f"d{i}", 0) * tt.get("thermal", 0)
+        dd = dataclasses.replace(d, tod=d.tod + g[t // per] * extra, name=f"d{i}", templates=tt)
+        cal_data.append(dd)
+        flat.append(dataclasses.replace(dd, tod=dd.tod / g[t // per] - d.dipole, dipole=None))
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
+    cal = CalibrationParameters(gain_period_s=per / fs, n_iter=3)
+    for dd, c in ((flat, None), (cal_data, cal)):
+        r = make_maps(dd, nside, coordinates="E", params=params, calibration=c, templates=tmpl,
+                      template_covariance=c is None)
+        assert r.templates["thermal"].keys() == a_th.keys()
+        assert max(abs(r.templates["thermal"][k] - v) for k, v in a_th.items()) < 1e-11
+        assert abs(r.templates["hk"] - a_hk) < 1e-11
+        assert max(np.abs(x - x0).max() for x, x0 in zip(r.templates["drift"], a_drift)) < 1e-11
+        if c is None:
+            cov = r.template_covariance
+        else:
+            assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-9
+            assert r.template_covariance is None
+    assert cov["labels"] == [("thermal", "d0"), ("thermal", "d1"), ("thermal", "d2"), ("hk", None)]
+    assert np.allclose(cov["matrix"], cov["matrix"].T, rtol=1e-6, atol=1e-6 * np.abs(cov["matrix"]).max())
+    assert np.all(np.linalg.eigvalsh(cov["matrix"]) > 0)
+    with pytest.raises(ValueError, match="period_s"):
+        Template(period_s=10.0, common=True)
+    with pytest.raises(ValueError, match="one value per sample"):
+        dataclasses.replace(flat[0], templates={"hk": np.zeros(10)})
 
 
 def test_coarse_preconditioner():

@@ -917,13 +917,50 @@ class GLS:
         and "shared_amplitudes" (on every rank).
         """
         b = self._apply(tod=_chunks(tod))
-        bb = self._dot(b, b)
         x = np.zeros_like(b)
-        if x0 is None:
-            r = b.copy()  # A 0 = 0: no product
-        else:
+        if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
-            r = b - self._apply(x, exact=True)
+        x, it, history = self._pcg(b, x, x0 is not None, tol, maxiter, recompute_every, verbose)
+        a0 = self._nsky + self.nflag
+        shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
+        info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),
+                "amplitudes": x[a0 : a0 + self.namp].copy(),
+                "shared_amplitudes": shared if self.comm is None else self.comm.bcast(shared)}
+        self._free()
+        # full mask now, while all ranks are here, so that to_healpix is not collective
+        self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
+        return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
+
+    def shared_covariance(self, tol=1e-10, maxiter=2000, recompute_every=10, verbose=False):
+        """Covariance of the shared template amplitudes, marginalized over the
+        maps, the flagged samples and the local amplitudes: the shared block of
+        A^-1, with A the operator of solve() (with `shared_groups`, of its
+        pseudo-inverse on the constraints: the covariance of the projected
+        amplitudes). One PCG solve per shared amplitude, A x = e_j, with the
+        current templates. (nshared, nshared) on every rank; collective."""
+        n = self._nsky + self.nflag + self.namp + self._nsh_loc
+        cov = np.zeros((self.nshared, self.nshared))
+        for j in range(self.nshared):
+            b = np.zeros(n)
+            if self._root:
+                b[n - self.nshared + j] = 1.0
+                self._project_shared(b[n - self.nshared :])
+            x, _, _ = self._pcg(b, np.zeros(n), False, tol, maxiter, recompute_every, verbose)
+            if self._root:
+                cov[:, j] = x[n - self.nshared :]
+        self._free()
+        return cov if self.comm is None else self.comm.bcast(cov)
+
+    def _free(self):
+        """Free the work maps and FFT buffers (allocated again when needed)."""
+        self._full = self._buf = self._locbuf = None
+        self._fftbuf = {}
+
+    def _pcg(self, b, x, start, tol, maxiter, recompute_every, verbose):
+        """PCG on A x = b from x (`start`: x is not 0); returns (x, iterations,
+        norm(r)^2 / norm(b)^2 at each iteration)."""
+        bb = self._dot(b, b)
+        r = b - self._apply(x, exact=True) if start else b.copy()  # A 0 = 0: no product
         z = self._precond_flat(r)
         d = z.copy()
         delta = self._dot(r, z)
@@ -956,18 +993,7 @@ class GLS:
                 delta = self._dot(r, z)
             if verbose and (self.comm is None or self.comm.rank == 0):
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
-
-        a0 = self._nsky + self.nflag
-        shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
-        info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),
-                "amplitudes": x[a0 : a0 + self.namp].copy(),
-                "shared_amplitudes": shared if self.comm is None else self.comm.bcast(shared)}
-        del b, r, z, d  # q does not exist if maxiter == 0
-        self._full = self._buf = self._locbuf = None  # free the work maps before gathering the result
-        self._fftbuf = {}
-        # full mask now, while all ranks are here, so that to_healpix is not collective
-        self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
-        return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
+        return x, it, history
 
     def binned(self, tod):
         """Binned map (P^T P)^-1 P^T tod (white noise), (ncomp, nobs) on every
