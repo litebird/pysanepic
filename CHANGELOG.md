@@ -28,6 +28,12 @@ Changes on `main` that are not in a release yet.
   errors; the common rotation goes into the maps); new test
   `test_pol_angle_template`, also with calibration and with an HWP, where
   the sign is reversed. (#45)
+- Docs: beams. Pointing offsets, ellipticities and FWHM of the detectors
+  fitted with templates: the FWHM as a sky template (the Laplacian of the
+  sky model), offsets and ellipticities as TOD templates from the model
+  resampled with the beam moved by ±ε, in a recipe (`docs/usage.md`).
+  New test `test_beam_templates`: the sky through elliptical Gaussian beams,
+  with and without HWP; the fit is right to second order. (#46)
 
 ## 0.5.2 (2026-10-26)
 

@@ -486,6 +486,134 @@ result.templates["pol_angle"]   # {"d0": delta_0 - mean, ...} [rad]
   be fitted together; `template_covariance=True` shows how much they are
   correlated.
 
+### Beams
+
+A detector sees the sky smoothed by its beam. If the beam differs from the
+one of the sky model by a small offset of its centre or a small change of
+its shape, the TOD changes, to first order, by the derivatives of the
+model at the pointing, weighted by the moments of the difference. In a frame
+$(x, y)$ on the sky attached to the detector:
+
+$$
+d \simeq s + \rho_x\,\partial_x s + \rho_y\,\partial_y s
++ \tfrac12\,\delta\sigma^2\,\nabla^2 s
++ c_+\,\tfrac12\,(\partial_{xx} - \partial_{yy})\,s + c_\times\,\partial_{xy}\,s
+$$
+
+with $s$ the sky model through its (circular) beam, $\rho$ the offset of the
+beam centre [rad], and $\delta\sigma^2$, $c_+$, $c_\times$ [rad²] the change of
+its second moments $\Sigma$:
+$\Sigma_{xx} = \sigma^2 + \delta\sigma^2 + c_+$,
+$\Sigma_{yy} = \sigma^2 + \delta\sigma^2 - c_+$, $\Sigma_{xy} = c_\times$. For a
+Gaussian beam with $\sigma_\text{maj}$, $\sigma_\text{min}$
+($\text{FWHM} = \sigma\sqrt{8 \ln 2}$) and major axis at an angle $\beta$ from
+$x$: $\delta\sigma^2 = (\sigma_\text{maj}^2 + \sigma_\text{min}^2)/2 - \sigma^2$,
+$c_+ = (\sigma_\text{maj}^2 - \sigma_\text{min}^2)\cos 2\beta / 2$,
+$c_\times = (\sigma_\text{maj}^2 - \sigma_\text{min}^2)\sin 2\beta / 2$.
+
+Each term is a template whose amplitudes are these numbers, per detector:
+
+- **FWHM**, $\tfrac12\nabla^2 s$, does not depend on the orientation of the
+  detector: a sky template, the alm of the model times $-\ell(\ell+1)/2$ for T
+  and $-(\ell(\ell+1) - 4)/2$ for E and B (the Laplacian of a spin-2 field;
+  the $-4$ matters only at low $\ell$);
+- **offsets** and **ellipticity** turn with the detector (as $\psi$ and
+  $2\psi$): they are not sky templates, but TODs computed for each detector,
+  by resampling the model with the beam moved by $\pm\varepsilon$ along $x$ and
+  $y$ (first and second differences). Moving the pointing, and transporting
+  the polarization frame with it, keeps the polarization of the model right
+  near the poles too.
+
+The frame: $x = \cos b\, e_\theta + \sin b\, e_\phi$,
+$y = -\sin b\, e_\theta + \cos b\, e_\phi$ with $b = \psi + \text{pol\_angle}$,
+in the coordinates of the maps; $b$ turns in the same sense as the polarization
+angle $a$ of the [signal model](#conventions), so without HWP $x$ is at the
+polarization angle of the detector. A different fixed choice (e.g. $b = \psi$)
+only rotates the amplitudes of each detector.
+
+```python
+import ducc0
+
+def displaced(theta, phi, psi, dx, dy, frame):
+    """The pointing moved by (dx, dy) [rad] along x, y (b = psi + frame), with
+    psi parallel-transported along the geodesic."""
+    st, ct, sp, cp = np.sin(theta), np.cos(theta), np.sin(phi), np.cos(phi)
+    n = np.array([st * cp, st * sp, ct])
+    et, ep = np.array([ct * cp, ct * sp, -st]), np.array([-sp, cp, 0 * sp])
+    rho, b = np.hypot(dx, dy), psi + frame
+    t = (dx * (np.cos(b) * et + np.sin(b) * ep) + dy * (-np.sin(b) * et + np.cos(b) * ep)) / rho
+    w = np.cross(n.T, t.T).T
+    n2, t2 = np.cos(rho) * n + np.sin(rho) * t, -np.sin(rho) * n + np.cos(rho) * t
+    p = np.cos(psi) * et + np.sin(psi) * ep  # the direction of psi, transported
+    p2 = np.sum(p * t, 0) * t2 + np.sum(p * w, 0) * w
+    th2, ph2 = np.arccos(np.clip(n2[2], -1, 1)), np.arctan2(n2[1], n2[0]) % (2 * np.pi)
+    et2 = np.array([np.cos(th2) * np.cos(ph2), np.cos(th2) * np.sin(ph2), -np.sin(th2)])
+    ep2 = np.array([-np.sin(ph2), np.cos(ph2), 0 * ph2])
+    return th2, ph2, np.arctan2(np.sum(p2 * ep2, 0), np.sum(p2 * et2, 0))
+
+def observe(alm, theta, phi, angle, gamma=1.0):
+    """I + gamma (Q cos 2a + U sin 2a) of the alm (T, E, B) at (theta, phi)."""
+    lmax, loc = hp.Alm.getlmax(alm.shape[1]), np.stack([theta, phi], axis=1)
+    i = ducc0.sht.synthesis_general(alm=alm[:1], spin=0, lmax=lmax, loc=loc, epsilon=1e-12)[0]
+    q, u = ducc0.sht.synthesis_general(alm=alm[1:], spin=2, lmax=lmax, loc=loc, epsilon=1e-12)
+    return i + gamma * (q * np.cos(2 * angle) + u * np.sin(2 * angle))
+
+def beam_templates(d, sky_alm, coordinates, eps):
+    """The TOD templates of DetectorData d for the sky model sky_alm (T, E, B,
+    in `coordinates`, those of the maps), with steps eps [rad]."""
+    theta, phi, psi = d.pointing.angles(coordinates)
+    s = {}
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+        th, ph, ps = displaced(theta, phi, psi, dx * eps, dy * eps, d.pol_angle_rad)
+        a = ps + d.pol_angle_rad if d.hwp_angle is None else ps + 2 * d.hwp_angle - d.pol_angle_rad
+        s[dx, dy] = observe(sky_alm, th, ph, a, d.pol_efficiency)
+    return {"offset_x": (s[1, 0] - s[-1, 0]) / (2 * eps),
+            "offset_y": (s[0, 1] - s[0, -1]) / (2 * eps),
+            "ell_plus": (s[1, 0] + s[-1, 0] - s[0, 1] - s[0, -1]) / (2 * eps**2),
+            "ell_cross": (s[1, 1] + s[-1, -1] - s[1, -1] - s[-1, 1]) / (4 * eps**2)}
+
+# sky_alm: T, E, B of the sky model through the mean beam, in Galactic coordinates
+data = [dataclasses.replace(d, templates={**(d.templates or {}), **beam_templates(d, sky_alm, "G", eps=0.1 / lmax)})
+        for d in data]
+ell = np.arange(lmax + 1)
+fwhm = np.array([hp.almxfl(a, -(ell * (ell + 1) - (4.0 if k else 0.0)) / 2) for k, a in enumerate(sky_alm)])
+hwp = data[0].hwp_angle is not None
+result = make_maps(data, nside, coordinates="G", params=params, sky_model=sky_alm, templates={
+    "offset_x": Template(), "offset_y": Template(),                 # rho_x, rho_y [rad]
+    "ell_plus": Template(sum_zero=not hwp), "ell_cross": Template(sum_zero=not hwp),  # c+, cx [rad^2]
+    "fwhm": Template(sky=fwhm, sum_zero=True),                      # delta sigma^2 [rad^2]
+})
+```
+
+- **What is fitted**: the second moments are about the nominal pointing, so
+  an offset adds $\rho\rho^T$ to them: the amplitudes are
+  $c_+ + (\rho_x^2 - \rho_y^2)/2$, $c_\times + \rho_x \rho_y$ and
+  $\delta\sigma^2 + |\rho|^2/2$; subtract the fitted offsets to get the shape
+  of the beam.
+- **Common parts**: a FWHM change common to all the detectors is a change
+  of the sky, and the maps absorb it (`sum_zero=True`). Without HWP so is a
+  common ellipticity (in the frame of each detector, which turns with its
+  polarization angle): it leaks the gradients of I into Q/U exactly as a
+  polarization map would. With an HWP the polarization turns with
+  $2\chi$ and the beam does not: the common ellipticity is measured, no
+  `sum_zero`. The common parts are absorbed by the maps only down to the
+  pixel: the sky model should be smoothed with the mean beam of the
+  detectors, or the rest of the structure below the pixel biases the fit (by
+  ~1% in the test).
+- **Linearization**: the error on the fitted values is of second order. In
+  a noiseless test (`tests/test_mapmaker.py::test_beam_templates`: FWHM
+  2.4°, $\ell \le 47$, offsets of a few arcminutes and ellipticities of a
+  few %, with and without HWP), ~1% of the largest value, ~0.1% for 10 times
+  smaller errors.
+- **Step**: `eps` small compared to the scales of the model
+  ($\ell_\text{max}\,\varepsilon \ll 1$: the error of the differences is
+  $\sim(\ell\varepsilon)^2/12$), but not so small that the precision of the
+  resampling ($10^{-12}$ relative, divided by $\varepsilon^2$) dominates:
+  e.g. $\varepsilon = 0.1/\ell_\text{max}$.
+- **Cost**: 8 resamplings of the model per detector, as many as with
+  `sky_model`; the 4 templates are kept in memory as 4 more TODs per
+  detector. Fit only what is needed (e.g. the offsets).
+
 ### Masks
 
 Each fit has its own mask (1 for pixels used, 0 for pixels left out):

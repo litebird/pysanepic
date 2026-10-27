@@ -722,6 +722,120 @@ def test_pol_angle_template():
     assert np.abs(got + (delta - delta.mean())).max() < 1e-8
 
 
+def _displaced(theta, phi, psi, dx, dy, frame):
+    """The pointing moved by (dx, dy) [rad] along x = cos b e_theta + sin b
+    e_phi, y = -sin b e_theta + cos b e_phi, b = psi + frame (as in
+    docs/usage.md), with psi parallel-transported along the geodesic."""
+    st, ct, sp, cp = np.sin(theta), np.cos(theta), np.sin(phi), np.cos(phi)
+    n = np.array([st * cp, st * sp, ct])
+    et, ep = np.array([ct * cp, ct * sp, -st]), np.array([-sp, cp, 0 * sp])
+    rho = np.hypot(dx, dy)
+    if rho == 0:
+        return theta, phi, psi
+    b = psi + frame
+    t = (dx * (np.cos(b) * et + np.sin(b) * ep) + dy * (-np.sin(b) * et + np.cos(b) * ep)) / rho
+    w = np.cross(n.T, t.T).T
+    n2, t2 = np.cos(rho) * n + np.sin(rho) * t, -np.sin(rho) * n + np.cos(rho) * t
+    p = np.cos(psi) * et + np.sin(psi) * ep
+    p2 = np.sum(p * t, 0) * t2 + np.sum(p * w, 0) * w
+    th2, ph2 = np.arccos(np.clip(n2[2], -1, 1)), np.arctan2(n2[1], n2[0]) % (2 * np.pi)
+    et2 = np.array([np.cos(th2) * np.cos(ph2), np.cos(th2) * np.sin(ph2), -np.sin(th2)])
+    ep2 = np.array([-np.sin(ph2), np.cos(ph2), 0 * ph2])
+    return th2, ph2, np.arctan2(np.sum(p2 * ep2, 0), np.sum(p2 * et2, 0))
+
+
+def _observe(alm, theta, phi, angle):
+    """I + Q cos 2a + U sin 2a of the alm (T, E, B) at (theta, phi)."""
+    lmax = hp.Alm.getlmax(alm.shape[1])
+    loc = np.stack([theta, phi], axis=1)
+    i = ducc0.sht.synthesis_general(alm=alm[:1], spin=0, lmax=lmax, loc=loc, epsilon=1e-12)[0]
+    q, u = ducc0.sht.synthesis_general(alm=alm[1:], spin=2, lmax=lmax, loc=loc, epsilon=1e-12)
+    return i + q * np.cos(2 * angle) + u * np.sin(2 * angle)
+
+
+def test_beam_templates():
+    """Pointing offsets, ellipticities and FWHM of the beams, by the recipe of
+    docs/usage.md: TOD templates from the sky model resampled with the beam
+    moved by +-eps (first and second differences), and the FWHM as the sky
+    template of the Laplacian (-l(l+1)/2 on T, -(l(l+1)-4)/2 on E, B). The
+    TOD is the sky through elliptical Gaussian beams (Gauss-Hermite
+    quadrature, with the offset) minus the same through the circular beam of
+    the model, plus the model: the fit recovers the offsets and the second
+    moments about the nominal pointing (the beam's plus rho rho^T) to second
+    order. Without HWP the ellipticity in the polarization frame common to
+    the detectors is degenerate with Q/U (sum_zero); with an HWP it is not."""
+    nside, n, fs = 16, 120_000, 10.0
+    lmax, sig0, eps = 3 * nside - 1, np.radians(1.0), np.radians(1 / 60)
+    rng = np.random.default_rng(3)
+    ell = np.arange(lmax + 1)
+    sky = np.array([hp.synalm(f * 1e-8 / (1 + ell), lmax=lmax) for f in (1.0, 0.1, 0.03)])
+    # the circular beam of the quadrature: a Gaussian in the tangent plane
+    r = np.linspace(0, 12 * sig0, 20001)
+    bl = [np.trapezoid(r / sig0**2 * np.exp(-r**2 / 2 / sig0**2) * np.polynomial.legendre.Legendre.basis(k)(np.cos(r)), r)
+          for k in ell]
+    model = np.array([hp.almxfl(a, bl) for a in sky])
+    fwhm = np.array([hp.almxfl(a, -(ell * (ell + 1) - (4.0 if k else 0.0)) / 2) for k, a in enumerate(model)])
+    gh, gw = np.polynomial.hermite.hermgauss(5)
+    pols = np.radians([0, 90, 45, 135])
+    scans = [_scan(n, rng) for _ in pols]
+    chi = 2 * np.pi * np.arange(n) / 600.0
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, angle_dtype=np.float64)
+    draw = rng.normal(size=(len(pols), 5))
+
+    def run(scale, hwp):
+        off = scale * np.radians(3 / 60) * draw[:, :2]  # a few arcmin
+        c = scale * sig0**2 * (0.05 * draw[:, 2:4] + [0.04, -0.03])  # c+, cx, with a common part
+        ds2 = scale * sig0**2 * 0.03 * draw[:, 4]
+        # second moments about the nominal pointing; without HWP sum to zero (see the docstring)
+        c_eff = c + np.stack([(off[:, 0] ** 2 - off[:, 1] ** 2) / 2, off[:, 0] * off[:, 1]], axis=1)
+        if not hwp:
+            c, c_eff = c - c_eff.mean(0), c_eff - c_eff.mean(0)
+        ds2 -= (ds2 + (off**2).sum(1) / 2).mean()
+        ds2_eff = ds2 + (off**2).sum(1) / 2
+        data = []
+        for i, ((theta, phi, psi), pol) in enumerate(zip(scans, pols)):
+            def angle(p, pol=pol):
+                return p + 2 * chi - pol if hwp else p + pol
+
+            tod = _observe(model, theta, phi, angle(psi))
+            cov = (sig0**2 + ds2[i]) * np.eye(2) + [[c[i, 0], c[i, 1]], [c[i, 1], -c[i, 0]]]
+            for sign, L, o in ((1, np.linalg.cholesky(cov), off[i]), (-1, sig0 * np.eye(2), 0 * off[i])):
+                for a, wa in zip(gh, gw):
+                    for b, wb in zip(gh, gw):
+                        u = L @ (np.sqrt(2) * np.array([a, b])) + o
+                        th, ph, ps = _displaced(theta, phi, psi, u[0], u[1], pol)
+                        tod += sign * wa * wb / np.pi * _observe(sky, th, ph, angle(ps))
+            s = {}
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                th, ph, ps = _displaced(theta, phi, psi, dx * eps, dy * eps, pol)
+                s[dx, dy] = _observe(model, th, ph, angle(ps))
+            tm = {"offset_x": (s[1, 0] - s[-1, 0]) / (2 * eps), "offset_y": (s[0, 1] - s[0, -1]) / (2 * eps),
+                  "ell_plus": (s[1, 0] + s[-1, 0] - s[0, 1] - s[0, -1]) / (2 * eps**2),
+                  "ell_cross": (s[1, 1] + s[-1, -1] - s[1, -1] - s[-1, 1]) / (4 * eps**2)}
+            data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                                     sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0), pol_angle_rad=pol,
+                                     hwp_angle=chi if hwp else None, name=f"d{i}", templates=tm))
+        tmpl = {"offset_x": Template(), "offset_y": Template(), "ell_plus": Template(sum_zero=not hwp),
+                "ell_cross": Template(sum_zero=not hwp), "fwhm": Template(sky=fwhm, sum_zero=True)}
+        res = make_maps(data, nside, coordinates="E", params=params, sky_model=model, templates=tmpl)
+        assert res.converged
+        err = {}
+        # relative to the largest offset, ellipticity and FWHM change
+        for k, truth, norm in (("offset_x", off[:, 0], off), ("offset_y", off[:, 1], off), ("ell_plus", c_eff[:, 0], c_eff),
+                               ("ell_cross", c_eff[:, 1], c_eff), ("fwhm", ds2_eff - ds2_eff.mean(), ds2_eff - ds2_eff.mean())):
+            got = np.array([res.templates[k][f"d{i}"] for i in range(len(pols))])
+            err[k] = np.abs(got - truth).max() / np.abs(norm).max()
+        return err
+
+    # offsets of a few arcmin and ellipticities of a few % at FWHM 2.4 deg, l <= 47:
+    # ~1%; 10 times smaller: ~0.1%, the second order
+    for scale, tol in ((1.0, 2e-2), (0.1, 2e-3)):
+        err = run(scale, hwp=False)
+        assert max(err.values()) < tol, (scale, err)
+    err = run(1.0, hwp=True)
+    assert max(err.values()) < 2e-2, err
+
+
 def test_coarse_preconditioner():
     """The two-level preconditioner (coarse_nside) gives the same maps in
     fewer iterations with a common mode, also with padding (virtual pixels)
