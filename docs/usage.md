@@ -268,6 +268,7 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 |---|---|
 | `gain_period_s` | One gain per detector and period of this duration [s], from the first sample of each `DetectorData`; `inf`: one per `DetectorData` |
 | `n_iter` | Calibration iterations, each a GLS solve (default 2: enough when the noise dominates; more for noiseless tests). The setup of the GLS is built once and reused, and each solve starts from the previous maps |
+| `gain_tol` | Stop the iterations when the largest absolute gain correction $\delta g$ (all detectors and periods) is below it; `n_iter` is then the maximum, and `MapResult.calibration_iterations` the number done (default `None`: always `n_iter`). The convergence is geometric, slower for periods with a weak dipole and much slower with samples left out of some fits only (a gain mask but templates on the whole sky) |
 | `cache_model` | Keep the TOD of the sky model and of the sky templates in memory between the iterations, instead of computing them again (default `False`; 8 bytes per sample each) |
 | `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the gain fit (e.g. the Galactic plane), as the usual masks; the templates have their own (`Template.mask`, see [below](#masks)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
 

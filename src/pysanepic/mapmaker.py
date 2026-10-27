@@ -301,6 +301,8 @@ class MapResult:
         array}, on every rank. With calibration, that of the last iteration.
         The amplitudes summing to zero have the covariance of the
         constrained amplitudes. None otherwise.
+    calibration_iterations : with calibration, the number of calibration
+        iterations done (n_iter, or fewer with gain_tol). None otherwise.
     """
 
     maps: np.ndarray
@@ -313,6 +315,7 @@ class MapResult:
     gains: list | None = None
     templates: dict | None = None
     template_covariance: dict | None = None
+    calibration_iterations: int | None = None
 
 
 @dataclass(kw_only=True)
@@ -421,7 +424,17 @@ class CalibrationParameters:
         the GLS is built once and reused, and each solve starts from the
         maps of the previous one). The first one uses T = D + S. 2 (default)
         is enough when the noise dominates the second-order terms; increase
-        it for noiseless tests or large gain errors.
+        it for noiseless tests or large gain errors. With gain_tol, the
+        maximum number of iterations.
+    gain_tol : None (default): always n_iter iterations. A number: stop
+        after the first iteration whose largest absolute gain correction dg (all
+        detectors and periods, all MPI processes) is below it. The
+        iterations converge geometrically but slower where the gains are
+        less constrained (periods with a weak dipole), and much slower with
+        samples left out of some fits only (see mask) or in pixels whose Q/U
+        are not solved (~2x per iteration in test_calibration_mpi): gain_tol
+        stops on the worst period. MapResult.calibration_iterations has the number
+        of iterations done.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels used and 0 (False) for pixels left out of the gain fit, as
         the usual masks (combine them with a product), or None: all pixels.
@@ -445,10 +458,13 @@ class CalibrationParameters:
 
     gain_period_s: float = 3600.0
     n_iter: int = 2
+    gain_tol: float | None = None
     mask: np.ndarray | None = None
     cache_model: bool = False
 
     def __post_init__(self):
+        if self.gain_tol is not None and not self.gain_tol > 0:
+            raise ValueError("CalibrationParameters.gain_tol must be None or > 0")
         if isinstance(self.mask, dict):
             raise TypeError("CalibrationParameters.mask is the mask of the gains (one map); "
                             "the templates have their own, Template.mask")
@@ -712,8 +728,16 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                local={k: None for k, t in tmpls.items() if t.period_s is not None},
                mask_gain=mask_gain, masks=masks,
                cache={} if calibration is not None and calibration.cache_model else None)
+    n_cal = 0
     for _ in range(1 if calibration is None else calibration.n_iter):
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
+        n_cal += 1
+        if calibration is not None:
+            dg = fit.dg_max if comm is None else max(comm.allgather(fit.dg_max))
+            if verbose and (comm is None or comm.rank == 0):
+                print(f"calibration iteration {n_cal}: max |dg| = {dg:.3e}")
+            if calibration.gain_tol is not None and dg < calibration.gain_tol:
+                break
     cov = None
     if template_covariance and index:
         p = GLSParameters() if params is None else params
@@ -731,6 +755,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
             out[k] = {n: float(fit.amp[index[k, n]]) for n in names[k]}
     res.templates = out or None
     res.template_covariance = cov
+    res.calibration_iterations = None if calibration is None else n_cal
     return res
 
 
@@ -749,6 +774,7 @@ class _Fit:
     mask_gain: np.ndarray | None
     masks: dict  # name -> mask of the template, or None
     gains: list | None = None  # current gains, one array per DetectorData
+    dg_max: float = 0.0  # largest |dg| of the last iteration on this rank
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
@@ -988,7 +1014,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         if fit.fit:
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
             if cal is not None:
-                gains = [g * (1 + info["amplitudes"][o : o + g.size]) for g, o in zip(gains, offsets)]
+                dg = [info["amplitudes"][o : o + g.size] for g, o in zip(gains, offsets)]
+                fit.dg_max = max((float(np.abs(x).max()) for x in dg if x.size), default=0.0)
+                gains = [g * (1 + x) for g, x in zip(gains, dg)]
             for k, amps in local.items():
                 fit.local[k] = [a + info["amplitudes"][o : o + a.size] for a, o in amps]
             if fit.index:

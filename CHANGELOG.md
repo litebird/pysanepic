@@ -4,6 +4,11 @@
 
 Changes on `main` that are not in a release yet.
 
+- `CalibrationParameters(gain_tol=...)`: stop the calibration iterations
+  when the largest gain correction |dg| (all detectors, periods and MPI
+  processes) is below it, `n_iter` being the maximum; the number done is in
+  `MapResult.calibration_iterations`. With `verbose`, max |dg| is printed
+  at each iteration.
 - **Breaking change**: one interface for the templates fitted with the maps,
   `make_maps(templates={name: Template(...)})`, which replaces
   `bandpass_templates` and `bandpass_common`; `MapResult.templates` replaces

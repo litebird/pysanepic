@@ -417,7 +417,14 @@ def test_calibration_noiseless():
         err = r.maps[:, seen] - sky[:, seen]
         err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
         assert np.abs(err).max() < 1e-7 * np.abs(sky).max()
+    # gain_tol: stops when the corrections are below it, before n_iter
+    r = make_maps(data, nside, coordinates="E", params=params,
+                  calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=10, gain_tol=1e-12))
+    assert r.calibration_iterations < 10
+    assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
     assert make_maps(data[:1], nside, coordinates="E", params=params).gains is None
+    with pytest.raises(ValueError, match="gain_tol"):
+        CalibrationParameters(gain_tol=0.0)
     with pytest.raises(ValueError, match="dipole"):
         make_maps([dataclasses.replace(data[0], dipole=None)], nside, calibration=CalibrationParameters())
     with pytest.raises(ValueError, match="mask"):
