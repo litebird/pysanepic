@@ -8,12 +8,15 @@ Data layout: data come as *chunks*. Pass a 2D array (nchunk, ns) for chunks of
 the same length, or a list of 1D chunks and/or 2D blocks. Noise weights have
 one row of length ns//2+1 per chunk, defined so that the filter is
 irfft(rfft(t) * w). Chunks are used as views (no copies) and processed one at a
-time, so the memory per sample is the TOD plus 8 bytes (int32 pixel and
-float32 2a; 12 bytes with angle_dtype=np.float64). gamma cos 2a and
-gamma sin 2a are recomputed for each chunk when it is used.
+time (with several threads, one per thread), so the memory per sample is the
+TOD plus 8 bytes (int32 pixel and float32 2a; 12 bytes with
+angle_dtype=np.float64). gamma cos 2a and gamma sin 2a are recomputed for each
+chunk when it is used.
 """
 
 import os
+import types
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import ducc0
@@ -188,7 +191,7 @@ def _add_template(t, values, labels, amp):
         t[i] += values[i] * amp[labels[i]]
 
 
-@numba.njit(cache=True)
+@numba.njit(nogil=True, cache=True)
 def _template_dot(values, labels, f, out):
     """out[labels] += values * f: T^T f for one template of a chunk."""
     # ponytail: serial (a scatter to few amplitudes); ~ms per day of data
@@ -203,7 +206,7 @@ def _add_scaled(t, values, a):
         t[i] += values[i] * a
 
 
-@numba.njit(cache=True)
+@numba.njit(nogil=True, cache=True)
 def _dot(values, f):
     s = 0.0
     for i in range(f.size):
@@ -211,12 +214,13 @@ def _dot(values, f):
     return s
 
 
-def _template_add(t, values, labels, amp):
-    """t += values * amp[labels], labels an array or one int (see GLS templates)."""
+def _template_add(t, values, labels, amp, serial=False):
+    """t += values * amp[labels], labels an array or one int (see GLS templates);
+    `serial`: the single-threaded kernels of the chunk workers."""
     if np.ndim(labels) == 0:
-        _add_scaled(t, values, amp[labels])
+        (_add_scaled_1 if serial else _add_scaled)(t, values, amp[labels])
     else:
-        _add_template(t, values, labels, amp)
+        (_add_template_1 if serial else _add_template)(t, values, labels, amp)
 
 
 def _template_transpose(values, labels, f, out):
@@ -254,6 +258,20 @@ def _cos_sin(a2, gamma, c2, s2, tc, ts):
         sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
         c2[i] = g * (tc[k] * cd - ts[k] * sd)
         s2[i] = g * (ts[k] * cd + tc[k] * sd)
+
+
+def _serial(kernel):
+    """A copy of the parallel numba kernel `kernel` compiled single-threaded
+    and without the GIL (prange runs as range), for the chunk workers of
+    GLS._apply: each runs on its own chunk, and numba's default threading
+    layer cannot run parallel kernels from several threads at once."""
+    f = kernel.py_func
+    g = types.FunctionType(f.__code__, f.__globals__, f.__name__ + "_1", f.__defaults__, f.__closure__)
+    g.__qualname__ = f.__qualname__ + "_1"  # its own entry in numba's cache
+    return numba.njit(nogil=True, cache=True)(g)
+
+
+_project_1, _add_template_1, _add_scaled_1, _cos_sin_1 = map(_serial, (_project, _add_template, _add_scaled, _cos_sin))
 
 
 @numba.njit(cache=True)
@@ -504,6 +522,8 @@ class GLS:
         self.template_dtype = template_dtype
         self._w32 = {}  # weights in float32, by id of the (shared) float64 arrays
         self._fftbuf = {}  # FFT work buffers, reused over chunks and iterations
+        self._slots = []  # work buffers of the chunk workers (see _apply_chunks)
+        self._pool = None
         fl = [p.size for p in self.ip] if fft_lengths is None else np.broadcast_to(fft_lengths, (len(self.ip),)).tolist()
         self._nfft = [int(m) for m in fl]
         for p, w, m in zip(self.ip, self.weights, self._nfft):
@@ -713,12 +733,15 @@ class GLS:
             a[g] -= a[g].mean()
         return a
 
-    def _template_back(self, k, f):
-        """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf and _shbuf."""
+    def _template_back(self, k, f, loc=None, sh=None, serial=False):
+        """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf and
+        _shbuf (or in `loc` and `sh`, those of a chunk worker)."""
+        loc = self._locbuf[self.nflag :] if loc is None else loc
+        sh = self._shbuf if sh is None else sh
         for values, labels in self._tmpl[k]:
-            _template_transpose(values, labels, f, self._locbuf[self.nflag :])
+            _template_transpose(values, labels, f, loc)
         for values, labels in self._shared[k]:
-            _template_transpose(values, labels, f, self._shbuf)
+            _template_transpose(values, labels, f, sh)
 
     def _set_coarse(self, coarse):
         """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
@@ -822,41 +845,46 @@ class GLS:
         d = np.vdot(a, b)
         return d if self.comm is None else self.comm.allreduce(d)
 
-    def _pol_arrays(self, k):
+    def _pol_arrays(self, k, slot=None):
         """(pol, gamma cos 2a, gamma sin 2a) of chunk k, computed into buffers
-        that the next call overwrites."""
+        that the next call overwrites (those of a chunk worker's `slot`, if given)."""
         if not self.pol:
             return False, self._dummy, self._dummy
         n = self.ip[k].size
+        if slot is not None:
+            c2, s2 = slot["c2"][:n], slot["s2"][:n]
+            _cos_sin_1(self.angle2[k], self.gamma[k], c2, s2, _TRIG_COS, _TRIG_SIN)
+            return True, c2, s2
         c2, s2 = self._c2[:n], self._s2[:n]
         with numba_threads(self.nthreads):
             _cos_sin(self.angle2[k], self.gamma[k], c2, s2, _TRIG_COS, _TRIG_SIN)
         return True, c2, s2
 
-    def _filter(self, t, k, single):
+    def _filter(self, t, k, single, slot=None):
         """N^-1 t for chunk k: irfft(rfft(t) * w) on an FFT of length m >= t.size
         (t zero-extended, the result truncated), in float32 if `single`. The
         work buffers are allocated once (for the longest FFT) and reused: the
-        result is overwritten by the next call. ducc0 parallelizes a single 1D
-        FFT; batching chunks gave nothing on a full node (memory bound)."""
+        result is overwritten by the next call. With a chunk worker's `slot`,
+        its buffers and its share of the threads (see _apply_chunks)."""
         m, n, w = self._nfft[k], t.size, self.weights[k]
         real, cplx = (np.float32, np.complex64) if single else (np.float64, np.complex128)
-        if real not in self._fftbuf:
+        bufs, nthreads = (self._fftbuf, self.nthreads) if slot is None else (slot["fft"], slot["nthreads"])
+        if real not in bufs:
             mmax = max(self._nfft)
-            self._fftbuf[real] = (np.empty(mmax, real), np.empty(mmax // 2 + 1, cplx), np.empty(mmax, real))
-        tin, f, out = (b[:size] for b, size in zip(self._fftbuf[real], (m, m // 2 + 1, m)))
+            bufs[real] = (np.empty(mmax, real), np.empty(mmax // 2 + 1, cplx), np.empty(mmax, real))
+        tin, f, out = (b[:size] for b, size in zip(bufs[real], (m, m // 2 + 1, m)))
         if m == n and not single and t.flags.c_contiguous:
             tin = t
         else:
             tin[:n] = t
             tin[n:] = 0.0
-        ducc0.fft.r2c(tin, out=f, nthreads=self.nthreads)
+        ducc0.fft.r2c(tin, out=f, nthreads=nthreads)
         if single:
             if id(w) not in self._w32:
                 self._w32[id(w)] = np.asarray(w, dtype=np.float32)
             w = self._w32[id(w)]
         f *= w
-        ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, out=out, nthreads=self.nthreads)
+        ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, out=out, nthreads=nthreads)
         return out[:n]
 
     def _apply(self, v=None, tod=None, exact=False):
@@ -882,34 +910,75 @@ class GLS:
         self._locbuf[:] = 0.0
         self._shbuf = np.zeros(self.nshared)
         with numba_threads(self.nthreads):
-            for k, ip in enumerate(self.ip):
-                if self._grouped[k]:
-                    continue
-                pol, c2, s2 = self._pol_arrays(k)
-                t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
-                f = self._filter(t, k, single)
-                _backproject(ip, f, c2, s2, pol, self._edges, buf, self._locbuf)
-                self._template_back(k, f)
+            free = [k for k in range(len(self.ip)) if not self._grouped[k]]
+            if min(self.nthreads, len(free)) > 1:
+                self._apply_chunks(free, v, tod, loc, single, buf)
+            else:
+                for k in free:
+                    pol, c2, s2 = self._pol_arrays(k)
+                    t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
+                    f = self._filter(t, k, single)
+                    _backproject(self.ip[k], f, c2, s2, pol, self._edges, buf, self._locbuf)
+                    self._template_back(k, f)
             for chunks, U, M in self._groups:
                 self._apply_group(chunks, U, M, v, tod, loc, buf)
         sh = self._shbuf if self.comm is None or not self.nshared else self.comm.allreduce(self._shbuf)
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf,
                                self._project_shared(sh)[: self._nsh_loc]])
 
-    def _chunk_tod(self, k, v, tod, loc, c2, s2, pol):
-        """P v on chunk k (v given), or the TOD of chunk k (flagged samples set to 0)."""
+    def _apply_chunks(self, ks, v, tod, loc, single, buf):
+        """P^T N^-1 P v (or P^T N^-1 tod) on the chunks `ks`, in parallel: in
+        batches of one chunk per worker thread, each worker computes N^-1 P v
+        of its chunk and T^T of it in its own buffers (`slot`), with the serial
+        numba kernels and single-threaded FFTs: the chunks are long and their
+        FFTs memory bound, so one FFT on many threads scales poorly (2-4x on
+        48 cores of G100) and one FFT per thread well (15x in float64, 25x in
+        float32). Then all the threads add P^T of each chunk to the map, by
+        pixel ranges as without workers. Each worker keeps ~40 bytes per
+        sample of the longest chunk."""
+        nw = min(self.nthreads, len(ks))
+        if self._pool is None or self._pool._max_workers < nw:
+            self._pool = ThreadPoolExecutor(nw, thread_name_prefix="pysanepic")
+        while len(self._slots) < nw:
+            nmax = max(ip.size for ip in self.ip)
+            c2, s2 = (np.empty(nmax, self._c2.dtype), np.empty(nmax, self._c2.dtype)) if self.pol else (None, None)
+            self._slots.append(dict(c2=c2, s2=s2, t=np.empty(nmax), fft={}))
+        slots = self._slots[:nw]
+        for slot in slots:
+            slot["nthreads"] = max(1, self.nthreads // nw)
+            slot["loc"], slot["sh"] = np.zeros(self.namp), np.zeros(self.nshared)
+
+        def work(k, slot):
+            pol, c2, s2 = self._pol_arrays(k, slot)
+            t = self._chunk_tod(k, v, tod, loc, c2, s2, pol, slot)
+            f = self._filter(t, k, single, slot)
+            self._template_back(k, f, slot["loc"], slot["sh"], serial=True)
+            return pol, c2, s2, f
+
+        for i in range(0, len(ks), nw):
+            batch = ks[i : i + nw]
+            for k, (pol, c2, s2, f) in zip(batch, self._pool.map(work, batch, slots)):
+                _backproject(self.ip[k], f, c2, s2, pol, self._edges, buf, self._locbuf)
+        for slot in slots:
+            self._locbuf[self.nflag :] += slot["loc"]
+            self._shbuf += slot["sh"]
+
+    def _chunk_tod(self, k, v, tod, loc, c2, s2, pol, slot=None):
+        """P v on chunk k (v given), or the TOD of chunk k (flagged samples set
+        to 0); with a chunk worker's `slot`, in its buffer and single-threaded."""
         ip = self.ip[k]
         if v is None:
             t = np.asarray(tod[k], dtype=float)
             if self.nflag:  # the TOD of flagged samples is not used (it may be NaN)
                 t = np.where(ip >= self.nobs, 0.0, t)
             return t
-        t = np.empty(ip.size)
-        _project(ip, self._full, c2, s2, pol, loc, t)
+        t = np.empty(ip.size) if slot is None else slot["t"][: ip.size]
+        (_project if slot is None else _project_1)(ip, self._full, c2, s2, pol, loc, t)
+        serial = slot is not None
         for values, labels in self._tmpl[k]:
-            _template_add(t, values, labels, loc[self.nflag : self.nflag + self.namp])
+            _template_add(t, values, labels, loc[self.nflag : self.nflag + self.namp], serial)
         for values, labels in self._shared[k]:
-            _template_add(t, values, labels, self._shv)
+            _template_add(t, values, labels, self._shv, serial)
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
@@ -1017,6 +1086,7 @@ class GLS:
         """Free the work maps and FFT buffers (allocated again when needed)."""
         self._full = self._buf = self._locbuf = None
         self._fftbuf = {}
+        self._slots = []
 
     def _pcg(self, b, x, start, tol, maxiter, recompute_every, verbose):
         """PCG on A x = b from x (`start`: x is not 0); returns (x, iterations,
