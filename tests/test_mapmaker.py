@@ -432,6 +432,23 @@ def test_calibration_noiseless():
         make_maps(data, nside, calibration=CalibrationParameters(mask=band[:10]))
 
 
+def test_calibration_unsolved_pol():
+    """Few detectors, Q/U not solved in most pixels (default min_pol_rcond):
+    their samples are flagged from the second iteration, so the iterations
+    converge as with every pixel solved (without, ~2x per iteration: 6e-3
+    after 10), and the final maps have I there."""
+    from pysanepic import CalibrationParameters
+
+    nside = 16
+    data, true, _ = _calibration_data(nside, 60_000, 10.0, 12_000)
+    data = data[:3]
+    r = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
+                  calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=4))
+    assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-8
+    seen_i, seen_qu = r.maps[0] != hp.UNSEEN, r.maps[1] != hp.UNSEEN
+    assert seen_qu.sum() < seen_i.sum() / 2 and np.array_equal(seen_i, r.hit_map > 0)
+
+
 def test_sky_model_sampling():
     """alm interpolated at the pixel centers equal the alm2map maps sampled in
     the pixel (I and Q/U with the polarization angle and efficiency); a
