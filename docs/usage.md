@@ -270,7 +270,7 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 | `n_iter` | Calibration iterations, each a GLS solve (default 2: enough when the noise dominates; more for noiseless tests). The setup of the GLS is built once and reused, and each solve starts from the previous maps |
 | `gain_tol` | Stop the iterations when the largest absolute gain correction $\delta g$ (all detectors and periods) is below it; `n_iter` is then the maximum, and `MapResult.calibration_iterations` the number done (default `None`: always `n_iter`). The convergence is geometric, slower for periods with a weak dipole and much slower with samples left out of some fits only (a gain mask but templates on the whole sky) |
 | `cache_model` | Keep the TOD of the sky model and of the sky templates in memory between the iterations, instead of computing them again (default `False`; 8 bytes per sample each) |
-| `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the gain fit (e.g. the Galactic plane), as the usual masks; the templates have their own (`Template.mask`, see [below](#masks)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
+| `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the gain fit (e.g. the Galactic plane), as the usual masks; also the mask of the templates without their own (`Template.mask`, see [below](#masks)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
 
 The absolute calibration comes from the orbital dipole: a gain common to all
 periods would otherwise just rescale the map. Signal that the map cannot
@@ -608,12 +608,21 @@ beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
 
 Each fit has its own mask (1 for pixels used, 0 for pixels left out):
 `CalibrationParameters(mask=...)` for the gains and `Template(mask=...)` for
-each template, also without calibration. E.g. `galaxy * sources` for the gains
+each template, also without calibration. A template without a mask has that
+of the gains (with calibration; else all pixels), so that by default each
+sample is in all the fits or in none, the case where the calibration
+converges fastest; for all pixels with calibration, pass a mask of ones.
+Equal masks are kept in memory once. E.g. `galaxy * sources` for the gains
 and `sources` for `Template(sky=dfg_dnu, sum_zero=True, mask=sources)`: the
 bandpass amplitudes are fitted on the Galaxy, where the foreground is bright,
 and point sources missing from the model are left out of everything. Samples
 left out of every fit are flagged during the fit, then one more solve makes
 the maps with all the samples and the fitted values. Samples left out of some
 fits only keep the other templates; with calibration they are calibrated with
-the values of the previous iteration, so the iterations converge slower. See
+the values of the previous iteration, so the iterations converge slower
+(`make_maps` warns; see `CalibrationParameters(gain_tol=...)`). In a 1-year
+test with gains on $|b| > 10°$ and bandpass templates on the whole sky, 4
+iterations left gain errors up to $10^{-3}$ in the periods with a weak dipole;
+with the gain mask for the templates too, the errors were those of the noise,
+and the polarization maps on the Galactic plane were the same. See
 the [notebook](notebooks/sky_model).

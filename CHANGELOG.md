@@ -9,6 +9,15 @@ Changes on `main` that are not in a release yet.
   processes) is below it, `n_iter` being the maximum; the number done is in
   `MapResult.calibration_iterations`. With `verbose`, max |dg| is printed
   at each iteration.
+- **Breaking change**: with calibration, a `Template` without a mask has
+  that of the gains (`CalibrationParameters.mask`) instead of all pixels,
+  so that by default each sample is in all the fits or in none: samples
+  out of the gain fit only are calibrated with the gains of the previous
+  iteration, which converges much slower (in a 1-year test, gain errors
+  up to 1e-3 after 4 iterations, against the noise with equal masks). For
+  all pixels, pass a mask of ones. `make_maps` warns when the masks of
+  gains and templates differ. Equal masks are kept once in memory, and
+  their samples are tested once per mask.
 - **Breaking change**: one interface for the templates fitted with the maps,
   `make_maps(templates={name: Template(...)})`, which replaces
   `bandpass_templates` and `bandpass_common`; `MapResult.templates` replaces

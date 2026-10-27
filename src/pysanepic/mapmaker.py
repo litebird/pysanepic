@@ -9,6 +9,7 @@ resolution and in those coordinates. pysanepic computes polarization angles,
 chunks and noise weights itself, with one set of conventions documented here.
 """
 
+import warnings
 from dataclasses import dataclass
 
 import ducc0
@@ -438,8 +439,10 @@ class CalibrationParameters:
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels used and 0 (False) for pixels left out of the gain fit, as
         the usual masks (combine them with a product), or None: all pixels.
-        The templates have their own (Template.mask). Samples left out of all
-        the active fits (gains and templates) are flagged in the n_iter
+        It is also the mask of the templates that have none (Template.mask),
+        so that by default every sample is in all the fits or in none.
+        Samples left out of all the active fits (gains and templates) are
+        flagged in the n_iter
         iterations (with GLSParameters.flag_method; "offset" takes no memory;
         together with DetectorData.flags), then one more GLS solve makes the
         maps with all the samples and the final values; samples left out of
@@ -449,7 +452,8 @@ class CalibrationParameters:
         the samples flagged). Zeroing a template does not stop signal that is
         not in the model from reaching the fit through the maps and the 1/f
         weights: mask it for every fit (e.g. point sources not in the sky
-        model). E.g. galaxy * sources here and sources in the templates.
+        model). E.g. galaxy * sources here and sources in the templates
+        (make_maps warns when the masks of gains and templates differ).
     cache_model : keep the TOD of the sky model and of the sky templates
         of every detector in memory between the iterations (8 bytes per sample
         each) instead of computing them again (with alm, an interpolation at
@@ -498,9 +502,12 @@ class Template:
         a sky template as maps, whose common part is the map itself.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels where the template is fitted and 0 (False) for pixels left
-        out of its fit, or None (default): all pixels. Samples left out of
-        all the fits (gains included) are flagged in the fit and one more GLS
-        solve makes the maps with all the samples and the fitted amplitudes;
+        out of its fit, or None (default): with calibration, the mask of the
+        gains (CalibrationParameters.mask), else all pixels; all pixels with
+        calibration: a mask of ones. Equal masks are kept once in memory.
+        Samples left out of all the fits (gains included) are flagged in the
+        fit and one more GLS solve makes the maps with all the samples and
+        the fitted amplitudes;
         samples left out of some fits only keep those templates at 0 (see
         CalibrationParameters.mask).
     """
@@ -722,7 +729,19 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     labels = [(k, n) for k, t in tmpls.items() if t.period_s is None for n in names.get(k, [None])]
     index = {x: i for i, x in enumerate(labels)}
     mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
-    masks = {k: _mask(t.mask, nside, f"templates[{k!r}].mask") for k, t in tmpls.items()}
+    # a template without a mask has that of the gains; equal masks are one array (and one test per sample)
+    masks = {k: mask_gain if t.mask is None else _mask(t.mask, nside, f"templates[{k!r}].mask")
+             for k, t in tmpls.items()}
+    distinct = [] if mask_gain is None else [mask_gain]
+    for k, mk in masks.items():
+        same = None if mk is None else next((u for u in distinct if u is mk or np.array_equal(u, mk)), None)
+        if mk is not None and same is None:
+            distinct.append(mk)
+        masks[k] = mk if same is None else same
+    if calibration is not None and any(mk is not mask_gain for mk in masks.values()):
+        warnings.warn("templates with a mask different from that of the gains: their samples are calibrated with "
+                      "the gains of the previous iteration and the calibration converges slower (see "
+                      "CalibrationParameters.mask)", stacklevel=2)
     fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, index=index, amp=np.zeros(len(index)),
                groups=[[index[k, n] for n in names[k]] for k in per_det if tmpls[k].sum_zero],
                local={k: None for k, t in tmpls.items() if t.period_s is not None},
@@ -806,13 +825,14 @@ def _model(x, nside, name):
 
 
 def _mask(mask, nside, name):
-    """A mask of a fit as an array, checked, or None."""
+    """A mask of a fit as an array, checked, or None (also for a mask using
+    every pixel)."""
     if mask is None:
         return None
     mask = np.asarray(mask)
     if mask.shape != (12 * nside * nside,):
         raise ValueError(f"{name} must have 12 nside^2 = {12 * nside * nside} pixels")
-    return mask
+    return None if np.all(mask != 0) else mask
 
 
 def _sample(x, d, pix, angle, loc, nthreads):
@@ -919,11 +939,16 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             active = [(tmpl, fit.mask_gain)] if tmpl is not None else []
             active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
             if any(mk is not None for _, mk in active):
-                out = [(t, np.zeros(len(pix), bool) if mk is None else mk[pix] == 0) for t, mk in active]
-                drop = np.logical_and.reduce([o for _, o in out])
-                for t, o in out:
-                    t[o & ~drop] = 0.0
-                flags = drop if flags is None else flags | drop
+                out = {}  # samples out of each distinct mask
+                for _, mk in active:
+                    if mk is not None and id(mk) not in out:
+                        out[id(mk)] = mk[pix] == 0
+                drop = None if any(mk is None for _, mk in active) else np.logical_and.reduce(list(out.values()))
+                for t, mk in active:
+                    if mk is not None and (drop is None or len(out) > 1):
+                        t[out[id(mk)] if drop is None else out[id(mk)] & ~drop] = 0.0
+                if drop is not None:
+                    flags = drop if flags is None else flags | drop
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
         gap = params.split_gap_s * fs if split else np.inf
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, flags, gap)):
