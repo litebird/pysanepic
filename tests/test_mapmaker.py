@@ -666,6 +666,62 @@ def test_tod_templates():
         dataclasses.replace(flat[0], templates={"hk": np.zeros(10)})
 
 
+def test_pol_angle_template():
+    """Polarization angles off by delta_i: the sky template [0, 2U, -2Q] (alm
+    [0, 2B, -2E]) with sum-zero amplitudes recovers delta_i - mean(delta) to
+    first order, with and without calibration, and the maps are the sky
+    rotated by the mean angle; the error is O(delta^2). With an ideal HWP
+    the angle is psi + 2 chi - pol_angle: the amplitudes are -delta_i."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per = 16, 120_000, 10.0, 12_000
+    data, true, sky = _calibration_data(nside, n, fs, per)
+    # the template as maps and as alm
+    lmax = 2 * nside
+    alm = np.array(hp.map2alm(sky, lmax=lmax))
+    _, q, u = hp.alm2map(np.array([0 * alm[0], 2 * alm[2], -2 * alm[1]]), nside, lmax=lmax)
+    _, q0, u0 = hp.alm2map(alm, nside, lmax=lmax)
+    assert np.allclose(q, 2 * u0) and np.allclose(u, -2 * q0)
+    tmpl = {"pol_angle": Template(sky=np.array([0 * sky[0], 2 * sky[2], -2 * sky[1]]), sum_zero=True)}
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
+    cal = CalibrationParameters(gain_period_s=per / fs, n_iter=4)
+    t = np.arange(n)
+    chi = 2 * np.pi * t / 600.0  # an HWP turning every minute
+
+    def tod(d, delta, hwp):
+        pix = hp.ang2pix(nside, d.pointing.theta, d.pointing.phi)
+        a = d.pointing.psi + (2 * chi - d.pol_angle_rad - delta if hwp else d.pol_angle_rad + delta)
+        return sky[0, pix] + sky[1, pix] * np.cos(2 * a) + sky[2, pix] * np.sin(2 * a)
+
+    # 1e-4 rad: exact to ~delta^2; 1 degree: 0.4% (the second order)
+    for delta, tol in ((np.array([1e-4, -2e-4, 0.5e-4, 1.5e-4]), 1e-8), (np.radians([1.0, -0.5, 0.3, -0.8]), 2e-4)):
+        expect = delta - delta.mean()
+        m = delta.mean()  # the maps are the sky rotated by the mean angle
+        rotated = np.array([sky[0], sky[1] * np.cos(2 * m) + sky[2] * np.sin(2 * m),
+                            -sky[1] * np.sin(2 * m) + sky[2] * np.cos(2 * m)])
+        flat = [dataclasses.replace(d, tod=tod(d, x, False), dipole=None, name=f"d{i}")
+                for i, (d, x) in enumerate(zip(data, delta))]
+        calib = [dataclasses.replace(d, tod=g[t // per] * (tod(d, x, False) + d.dipole), name=f"d{i}")
+                 for i, (d, g, x) in enumerate(zip(data, true, delta))]
+        for dd, c in ((flat, None), (calib, cal)):
+            r = make_maps(dd, nside, coordinates="E", params=params, templates=tmpl, calibration=c)
+            got = np.array([r.templates["pol_angle"][f"d{i}"] for i in range(4)])
+            assert np.abs(got - expect).max() < tol, (c, got - expect)
+            if c is not None:
+                assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 0.2 * np.max(delta**2) + 1e-8
+            seen = r.maps[1] != hp.UNSEEN
+            err = (r.maps - rotated)[:, seen]
+            err[0] -= err[0].mean()
+            assert err.std() < 3 * np.max(delta**2) * sky.std()
+    # with an ideal HWP the sign of the angle is reversed
+    delta = np.array([1e-4, -2e-4, 0.5e-4, 1.5e-4])
+    hwp = [dataclasses.replace(d, tod=tod(d, x, True), dipole=None, name=f"d{i}", hwp_angle=chi)
+           for i, (d, x) in enumerate(zip(data, delta))]
+    r = make_maps(hwp, nside, coordinates="E", params=params, templates=tmpl)
+    got = np.array([r.templates["pol_angle"][f"d{i}"] for i in range(4)])
+    assert np.abs(got + (delta - delta.mean())).max() < 1e-8
+
+
 def test_coarse_preconditioner():
     """The two-level preconditioner (coarse_nside) gives the same maps in
     fewer iterations with a common mode, also with padding (virtual pixels)

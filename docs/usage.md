@@ -452,6 +452,40 @@ Use it when the frequency of the sky model is not known to better than
 $\sim\nu_0/(\beta\cdot\text{required calibration})$; otherwise give the sky model at
 the mean band of the detectors.
 
+### Polarization angles
+
+An error $\delta_i$ on the polarization angle of detector $i$ changes its TOD
+by $\delta_i\,\partial d/\partial\delta = \delta_i\,2\gamma\,(-Q \sin 2a + U \cos 2a)$,
+which is the signal of the sky $(0,\, 2U,\, -2Q)$: a sky template, made from
+the polarization of the sky model, whose amplitudes are the angle errors in
+radians:
+
+```python
+# sky_alm: T, E, B of the sky model (or maps I, Q, U: [0 * I, 2 * U, -2 * Q])
+pol_angle = np.array([0 * sky_alm[0], 2 * sky_alm[2], -2 * sky_alm[1]])  # [0, 2B, -2E]
+result = make_maps(data, nside, params=params, sky_model=sky_alm,
+                   templates={"pol_angle": Template(sky=pol_angle, sum_zero=True)})
+result.templates["pol_angle"]   # {"d0": delta_0 - mean, ...} [rad]
+```
+
+- **Common rotation**: an angle error common to all the detectors rotates
+  the polarization of the map (E into B), and the maps absorb it: the
+  amplitudes sum to zero, and the maps are the sky rotated by the mean
+  error. The absolute angle needs an external
+  calibrator (e.g. Tau A, or EB with an assumed cosmology). As alm the
+  common part is constrained only by the structure below the pixel size,
+  which is not a calibration: keep `sum_zero=True`.
+- **HWP**: with an ideal HWP the angle seen by the sky is
+  $\psi + 2\chi - \theta$, so the amplitudes are $-\delta_i$.
+- **Linearization**: the template is the first order in $\delta$; the
+  error on the fitted angles is $O(\delta^2)$: in a noiseless test,
+  $4\times10^{-9}$ rad for $\delta \sim 10^{-4}$ rad and 0.4% for
+  $\delta \sim 1°$, with the maps right to $\sim 2\,\delta^2$ of the signal:
+  negligible for errors of a few arcminutes.
+- **With the other templates**: angles, gains and bandpass amplitudes can
+  be fitted together; `template_covariance=True` shows how much they are
+  correlated.
+
 ### Masks
 
 Each fit has its own mask (1 for pixels used, 0 for pixels left out):

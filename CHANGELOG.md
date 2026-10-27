@@ -23,6 +23,11 @@ Changes on `main` that are not in a release yet.
   per period, in `MapResult.template_covariance` (one PCG solve per
   amplitude). Low level: `GLS.shared_covariance`. A Monte Carlo
   (`tools/template_covariance_mc.py`) confirms the errors to ~10%. (#44)
+- Docs: polarization angles of the detectors fitted with a sky template,
+  $(0, 2U, -2Q)$ from the sky model, with sum-zero amplitudes (the angle
+  errors; the common rotation goes into the maps); new test
+  `test_pol_angle_template`, also with calibration and with an HWP, where
+  the sign is reversed. (#45)
 
 ## 0.5.2 (2026-10-26)
 
