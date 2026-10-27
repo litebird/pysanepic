@@ -4,6 +4,15 @@
 
 Changes on `main` that are not in a release yet.
 
+- PCG products and template preconditioner: **one chunk per thread** (FFTs
+  single-threaded, $P^T$ in a private map per thread if they fit in 4 GB).
+  A single long FFT scales poorly with threads (memory bound: 2–4x on 48
+  cores of G100), independent FFTs well (15–25x). On one G100 node (96
+  chunks of a day, 48 threads), 10 PCG iterations: 60.4 → 14.6 s with
+  float32 FFTs, 89.6 → 16.9 s with float64, same result. Chunks with
+  common modes keep the previous scheme.
+- `_template_diag` no longer fails on a template that is 0 in a whole
+  chunk (e.g. a chunk in pixels whose Q/U are not solved).
 - `CalibrationParameters(gain_tol=...)`: stop the calibration iterations
   when the largest gain correction |dg| (all detectors, periods and MPI
   processes) is below it, `n_iter` being the maximum; the number done is in

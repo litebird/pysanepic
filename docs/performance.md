@@ -28,14 +28,25 @@ oversubscription when several MPI processes share a node: set
 `OMP_NUM_THREADS = cores per node / processes per node`. Set
 `NUMBA_NUM_THREADS` to at least the same value.
 
-In $P^T$ each thread owns a range of pixels, chosen so that the ranges hold
-the same number of this process's samples. Every thread reads the pixel
-indices of the whole chunk but adds only the samples of its own pixels, so
-the threads share one map without races and without private copies. With
-4–8 threads this was as fast as one private map per thread on a laptop, and
-faster on G100 (3 threads). Since every thread reads all the pixel indices,
-prefer several MPI processes per node with a few threads each over one
-process with many threads.
+With several chunks per process, the products of the PCG and the
+preconditioner of the templates process **one chunk per thread**: each
+thread computes $N^{-1} P v$ of its chunk with single-threaded FFTs and the
+serial numba kernels, in its own buffers (~40 bytes per sample of the
+longest chunk), and adds $P^T$ to a private map, summed at the end. The
+chunks are long and their FFTs memory bound: on G100 (48 cores) one FFT of a
+day of data (3.2 million samples) on 48 threads is only 2–4 times faster than
+on one, while 48 FFTs on one thread each are 15 (float64) to 25 (float32)
+times faster. With 96 chunks of a day, 48 threads and one process, 10 PCG
+iterations took 14.6 s instead of 60.4 s (float32 FFTs), 16.9 s instead of
+89.6 s (float64), with the same result.
+
+The private maps are used if all of them fit in 4 GB (nside 512: 75 MB per
+thread); otherwise, and with one chunk or one thread, each chunk is
+processed by all the threads: in $P^T$ each thread owns a range of pixels,
+chosen so that the ranges hold the same number of this process's samples,
+reads the pixel indices of the whole chunk but adds only the samples of its
+own pixels, so the threads share one map without races. Chunks of a
+`DetectorGroup` (common modes) are always processed this way.
 
 ## Memory
 
