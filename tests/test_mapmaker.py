@@ -303,7 +303,7 @@ def test_templates_exact_gls():
         (3, rng.normal(size=ns), np.full(ns, 3)),  # a second template on chunk 3
     ]
     g = GLS(np.where(flags, -1 - np.arange(ns), pix), psi, w, min_pol_rcond=0.0, angle_dtype=np.float64,
-            common_modes=[([0, 1, 2], U, lam)], templates=templates)
+            common_modes=[([0, 1, 2], U, lam)], templates=templates, template_dtype=np.float64)
     assert g.namp == 4
     x, info = g.solve(np.where(flags, np.nan, tod), tol=1e-26, maxiter=1000)
     assert info["converged"]
@@ -349,7 +349,7 @@ def test_shared_templates_exact_gls():
     shared = [(k, Ps[k] @ B, np.full(ns, det[k])) for k in range(nchunk)]
     shared += [(k, rng.normal(size=ns), np.full(ns, 2 + det[k])) for k in range(nchunk)]  # a second template
     local = [(2, rng.normal(size=ns), np.zeros(ns, int))]
-    g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, templates=local,
+    g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, templates=local, template_dtype=np.float64,
             shared_templates=shared, shared_groups=[[0, 1], [2, 3]])
     x, info = g.solve(tod, tol=1e-26, maxiter=1000)
     assert info["converged"] and info["shared_amplitudes"].shape == (4,)
@@ -1486,10 +1486,44 @@ def test_template_diag_dense():
     npix, ns, nchunk = 6, 128, 2
     pix = rng.integers(0, npix, (nchunk, ns))
     w = one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05)
-    g = GLS(pix, None, np.tile(w, (nchunk, 1)))
+    g = GLS(pix, None, np.tile(w, (nchunk, 1)), template_dtype=np.float64)
     labels = [np.repeat([3, 0, 2, 0, 1], [20, 30, 25, 33, 20]), np.where(rng.random(ns) < 0.2, -1, rng.integers(0, 4, ns))]
     values = rng.normal(size=(nchunk, ns))
     g.set_templates([(k, values[k], labels[k]) for k in range(nchunk)])
     cinv = np.fft.irfft(w, n=ns)[(np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns]
     ref = [sum(t @ cinv @ t for t in (np.where(labels[k] == a, values[k], 0.0) for k in range(nchunk))) for a in range(4)]
     assert np.allclose(g._template_diag(g._tmpl, g.namp), ref, rtol=1e-12, atol=0)
+
+
+def test_template_storage():
+    """Templates with one amplitude per chunk given as one int (no labels array)
+    and the full labels give the same solution; float32 storage (the default)
+    agrees with float64 to its rounding; the caller's arrays are not changed,
+    also where samples are flagged."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(31)
+    npix, ns, nchunk = 8, 200, 3
+    pix = rng.integers(0, npix, (nchunk, ns))
+    pix[1, 50:60] = -1  # flagged
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    values = rng.normal(size=(nchunk, ns))
+    kept = values.copy()
+    tod = rng.normal(size=(nchunk, ns))
+    full = [(k, values[k], np.full(ns, k % 2)) for k in range(nchunk)]
+    one = [(k, values[k], k % 2) for k in range(nchunk)]
+    res = {}
+    for name, tmpl, dt in (("full", full, np.float64), ("one", one, np.float64), ("f32", one, np.float32)):
+        g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, templates=tmpl, template_dtype=dt)
+        assert g.namp == 2 and g._tmpl[0][0][0].dtype == dt
+        x, info = g.solve(tod, tol=1e-26, maxiter=1000)
+        assert info["converged"]
+        res[name] = x, info["amplitudes"]
+    assert np.array_equal(values, kept)
+    assert np.isscalar(g._tmpl[0][0][1])
+    for name, rtol in (("one", 1e-10), ("f32", 1e-5)):
+        assert np.allclose(res[name][0], res["full"][0], rtol=rtol, atol=rtol * np.abs(res["full"][0]).max())
+        assert np.allclose(res[name][1], res["full"][1], rtol=rtol)
+    with pytest.raises(ValueError, match="template_dtype"):
+        GLS(pix, psi, w, template_dtype=np.float16)

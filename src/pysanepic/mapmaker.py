@@ -349,6 +349,10 @@ class GLSParameters:
     fft_dtype : precision of the FFTs applying N^-1 to the PCG search
         directions: np.float64 (default) or np.float32 (~45% faster FFTs; the
         right-hand side and the true residual stay in float64, see GLS).
+    template_dtype : storage of the TOD of the templates fitted with the maps
+        (the gains of the calibration and those of make_maps' `templates`):
+        np.float32 (default, 4 bytes per sample and template, rounded to a
+        relative ~6e-8, far below the noise) or np.float64 (exact, 8 bytes).
     split_gap_s : runs of flagged samples at least this long [s] split the
         chunk, and their samples are dropped: the noise correlations across
         the gap are neglected, but long gaps do not slow down the PCG. inf:
@@ -380,6 +384,7 @@ class GLSParameters:
     split_gap_s: float = 300.0
     fft_dtype: type = np.float64
     coarse_nside: int | None = 0
+    template_dtype: type = np.float32
 
 
 @dataclass(kw_only=True)
@@ -905,19 +910,20 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             nchunk += 1
             tod = tod_all[a:b]  # a view: the TOD is not copied
             if fit is not None:
-                zero, none = np.zeros(m), np.full(m, -1)
+                # values as template_dtype and int32 labels (0 in the margins, where
+                # the values are 0), one int for an amplitude in the whole chunk
+                dt = params.template_dtype
                 if tmpl is not None:
-                    templates.append((k, np.concatenate([zero, tmpl[a:b], zero]), np.concatenate([none, labels[a:b], none])))
+                    templates.append((k, _padded(tmpl, a, b, m, dt), _padded(labels, a, b, m, np.int32)))
                 if fit.fit:
                     for name, t in ttod.items():
-                        values = np.concatenate([zero, t[a:b], zero])
                         if name in tlab:
-                            templates.append((k, values, np.concatenate([none, tlab[name][a:b], none])))
+                            templates.append((k, _padded(t, a, b, m, dt), _padded(tlab[name], a, b, m, np.int32)))
                         else:
                             i = fit.index[name, None if fit.templates[name].common else d.name]
-                            shared.append((k, values, np.concatenate([none, np.full(b - a, i), none])))
-                if fit.sky is not None:
-                    model_c.append(np.concatenate([zero, sky_tod[a:b], zero]))  # the templates are not put back
+                            shared.append((k, _padded(t, a, b, m, dt), i))
+                if fit.sky is not None:  # the templates are not put back
+                    model_c.append(_padded(sky_tod, a, b, m, np.float64))
             flagged = None if flags is None else flags[a:b]
             if m and flagged is not None and flagged.any():  # the padding is built from the chunk: not from flagged samples
                 tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
@@ -1012,6 +1018,15 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     ), gls
 
 
+def _padded(x, a, b, m, dtype):
+    """x[a:b] as `dtype` with m zeros on both sides (a view if m = 0 and x is of dtype)."""
+    if m == 0:
+        return np.asarray(x[a:b], dtype)
+    out = np.zeros(b - a + 2 * m, dtype)
+    out[m : m + b - a] = x[a:b]
+    return out
+
+
 def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit):
     nc = params.coarse_nside
     return GLS(
@@ -1032,6 +1047,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         templates=templates,
         shared_templates=shared,
         shared_groups=fit.groups if fit is not None and fit.fit else None,
+        template_dtype=params.template_dtype,
     )
 
 

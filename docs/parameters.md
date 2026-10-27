@@ -18,6 +18,7 @@ so new options need no change on the litebird_sim side.
 | `flag_method` | `"marginalize"` | Flagged samples (`DetectorData.flags`) in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact) or `"offset"` (one offset per run, samples set to 0) |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
+| `template_dtype` | `np.float32` | Storage of the TODs of the templates fitted with the maps (gains of the calibration, `make_maps(templates=...)`): float32 (4 bytes per sample and template, relative rounding ~6e-8) or `np.float64` (exact, 8 bytes). See [Angle precision](#angle-precision) |
 | `coarse_nside` | 0 | Two-level preconditioner: also solve exactly for the I map at a coarse resolution. 0: the I monopole alone (one PCG iteration of setup); N (a power of 2): the I map at nside N, 1 with common modes; `None`: off (the preconditioner of pysanepic 0.4). See [Preconditioner](#preconditioner) |
 
 The sections below explain how to choose them.
@@ -140,6 +141,15 @@ Twice the polarization angle, 2a, is computed in float64, reduced to
 irrelevant for any application; γ cos 2a and γ sin 2a are recomputed for each
 chunk when it is used. `angle_dtype=np.float64` stores 2a exactly at the cost
 of 4 more bytes per sample.
+
+The same for the templates fitted with the maps (the gains of the calibration
+and `make_maps(templates=...)`): their TODs are stored in float32 by default
+(`template_dtype`), rounded to a relative ~6e-8. The same rounded templates
+are used in $T$ and $T^T$, so the system stays symmetric and the amplitudes
+are exactly those of the rounded templates: e.g. for the calibration
+template (dipole, ~3 mK) the rounding is ~2e-10 K per sample, uncorrelated,
+orders of magnitude below the noise. `template_dtype=np.float64` keeps them
+exact at the cost of 4 more bytes per sample and template.
 
 ## Flagged samples
 

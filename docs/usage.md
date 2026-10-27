@@ -599,7 +599,8 @@ beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
   smaller errors.
 - **Cost**: per detector, 2 syntheses at the pointing for T only, 9 with
   polarization (each like the sampling of `sky_model`); the 4 templates are
-  kept in memory as 4 more TODs per detector. Fit only what is needed
+  kept in memory as 4 more TODs per detector (4 bytes per sample each in the
+  GLS, see `GLSParameters.template_dtype`). Fit only what is needed
   (`beam_templates(..., ellipticity=False)` for the offsets: 1 or 3
   syntheses).
 
