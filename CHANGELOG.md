@@ -63,6 +63,16 @@ Changes on `main` that are not in a release yet.
   `beam_parameters` (offsets and beam axes from the fitted amplitudes, the
   $\rho\rho^T$ of the offsets subtracted); the docs use them instead of the
   recipes. (#47)
+- Memory of the templates fitted with the maps (gains included): their TODs
+  are stored once, in the new `GLSParameters.template_dtype` (default
+  `np.float32`, 4 bytes per sample and template, rounded to a relative
+  ~6e-8, far below the noise; `np.float64` for the exact values), with
+  int32 labels, or one label per chunk for an amplitude per detector. Before,
+  a template took ~28 bytes per sample at the peak of the setup (float64
+  values and int64 labels, copied): a one-year e2e run with calibration and 7
+  templates ran out of memory on G100 (360 GB per detector). With 4
+  templates and calibration, 163 → 47 bytes per sample. Low level:
+  `GLS(template_dtype=...)`, and the labels of a template can be one int.
 
 ## 0.5.2 (2026-10-26)
 

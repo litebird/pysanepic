@@ -64,6 +64,13 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
   On a laptop (nside 1024, 4 processes × 2 threads, little data),
   distributing the PCG state took the peak per process from 324 to 142
   bytes per pixel, before the private maps of the threads were removed.
+- Templates fitted with the maps (the gains of the calibration and
+  `make_maps(templates=...)`): 4 bytes per sample and template in the GLS
+  (`template_dtype`, float32 by default; 8 with float64), labels int32 or one
+  per chunk for an amplitude per detector. The sky model, with calibration,
+  8 bytes per sample more (its binned map is put back). Measured with
+  calibration and 4 TOD templates: 47 bytes per sample at the peak (163
+  before 0.6).
 - Flagged samples with `flag_method="marginalize"`: ~70 bytes per flagged
   sample, on the process that holds it (its share of the PCG vectors);
   negligible with `"offset"` or when the run is split (`split_gap_s`).

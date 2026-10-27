@@ -196,6 +196,37 @@ def _template_dot(values, labels, f, out):
         out[labels[i]] += values[i] * f[i]
 
 
+@numba.njit(parallel=True, cache=True)
+def _add_scaled(t, values, a):
+    """t += values * a: a template with one amplitude in the whole chunk."""
+    for i in numba.prange(t.size):
+        t[i] += values[i] * a
+
+
+@numba.njit(cache=True)
+def _dot(values, f):
+    s = 0.0
+    for i in range(f.size):
+        s += values[i] * f[i]
+    return s
+
+
+def _template_add(t, values, labels, amp):
+    """t += values * amp[labels], labels an array or one int (see GLS templates)."""
+    if np.ndim(labels) == 0:
+        _add_scaled(t, values, amp[labels])
+    else:
+        _add_template(t, values, labels, amp)
+
+
+def _template_transpose(values, labels, f, out):
+    """out[labels] += values * f, labels an array or one int."""
+    if np.ndim(labels) == 0:
+        out[labels] += _dot(values, f)
+    else:
+        _template_dot(values, labels, f, out)
+
+
 # cos and sin on a grid of [-pi, pi), for _cos_sin
 _TRIG_N = 4096
 _TRIG_COS = np.cos(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
@@ -424,7 +455,8 @@ class GLS:
     templates : list of (k, values, labels), or None
         Templates fitted together with the map: the TOD of chunk k is modeled
         as P m + values * a[labels], with `values` and `labels` (int, -1: no
-        template) laid out like the chunk and a the template amplitudes, local
+        template) laid out like the chunk, or `labels` one int (one amplitude
+        in the whole chunk: no array), and a the template amplitudes, local
         to this rank like the unknowns of flagged samples (labels 0, 1, ... of
         this rank; several templates may share an amplitude, e.g. one gain per
         detector and period). Not applied to flagged samples, nor to samples in
@@ -438,6 +470,14 @@ class GLS:
         detector when its chunks are on several ranks); kept on rank 0 and
         broadcast at each product (one small allreduce). solve() returns them
         in info["shared_amplitudes"] on every rank.
+    template_dtype : np.float32 (default) or np.float64
+        Storage of the template values: `values` of this dtype are used
+        without copies (unless some of their samples are not applied, which
+        are set to 0 in a copy), labels as int32 (or one int per chunk). With
+        float32, 4 bytes per sample and template, the templates are rounded
+        to a relative ~6e-8 (the same rounded templates in T and T^T: the
+        system stays symmetric, the amplitudes are those of the rounded
+        templates).
     shared_groups : list of index arrays, or None
         Constraints on the shared amplitudes: those of each group sum to zero
         (imposed by projecting the PCG vectors), e.g. the amplitudes of a sky
@@ -447,7 +487,7 @@ class GLS:
         of copying the chunks that have them (make_maps does, as it owns them).
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32):
         self.comm = comm
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
@@ -459,6 +499,9 @@ class GLS:
         if fft_dtype not in (np.float32, np.float64):
             raise ValueError("fft_dtype must be np.float32 or np.float64")
         self._single = fft_dtype == np.float32
+        if template_dtype not in (np.float32, np.float64):
+            raise ValueError("template_dtype must be np.float32 or np.float64")
+        self.template_dtype = template_dtype
         self._w32 = {}  # weights in float32, by id of the (shared) float64 arrays
         self._fftbuf = {}  # FFT work buffers, reused over chunks and iterations
         fl = [p.size for p in self.ip] if fft_lengths is None else np.broadcast_to(fft_lengths, (len(self.ip),)).tolist()
@@ -589,23 +632,38 @@ class GLS:
                 self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
             for k, ip in enumerate(self.ip):
                 bad = ~self._solved[np.minimum(ip, self.nobs - 1)] & (ip < self.nobs)
-                for values, _ in self._tmpl[k] + self._shared[k]:
-                    values[bad] = 0.0
+                if bad.any():  # copies: the arrays may be the caller's
+                    for tmpl in (self._tmpl[k], self._shared[k]):
+                        tmpl[:] = [(np.where(bad, 0, v).astype(v.dtype, copy=False), lab) for v, lab in tmpl]
         diag = self._template_diag(self._shared, self.nshared)
         diag = diag if comm is None else comm.allreduce(diag)
         self._locprec = np.concatenate([self._flagprec, self._inverse(self._template_diag(self._tmpl, self.namp)),
                                         self._inverse(diag)[: self._nsh_loc]])
 
     def _parse_templates(self, templates):
-        """Per chunk, the (values, labels) of its templates (0 where not applied),
-        and the number of amplitudes."""
+        """Per chunk, the (values, labels) of its templates (0 where not applied;
+        values of template_dtype, labels int32 or one int), and the number of
+        amplitudes. Copies only where needed."""
         out, n = [[] for _ in self.ip], 0
         for k, values, labels in templates or []:
-            labels = np.asarray(labels, dtype=np.int64)
-            used = (labels >= 0) & (self.ip[k] < self.nobs)
-            # ponytail: values kept in float64 (one TOD per template); float32 if memory matters
-            out[k].append((np.where(used, values, 0.0), np.where(used, labels, 0).astype(np.int32)))
-            n = max(n, int(labels.max(initial=-1)) + 1)
+            bad = self.ip[k] >= self.nobs
+            if np.ndim(labels) == 0:
+                labels = int(labels)
+                if labels < 0:
+                    continue
+                n = max(n, labels + 1)
+            else:
+                labels = np.asarray(labels)
+                bad = bad | (labels < 0)
+                n = max(n, int(labels.max(initial=-1)) + 1)
+            values = np.asarray(values, dtype=self.template_dtype)
+            if bad.any():
+                values = np.where(bad, 0, values).astype(self.template_dtype, copy=False)
+                if np.ndim(labels):
+                    labels = np.where(bad, 0, labels)
+            if np.ndim(labels):
+                labels = labels.astype(np.int32, copy=False)
+            out[k].append((values, labels))
         return out, n
 
     def _template_diag(self, tmpls, n):
@@ -626,6 +684,8 @@ class GLS:
                                              forward=False, inorm=2, nthreads=self.nthreads)
             c = kernels[key]
             for values, labels in tmpl:
+                if np.ndim(labels) == 0:  # one amplitude in the whole chunk
+                    labels = np.full(values.size, labels, np.int32)
                 # one pass: the samples of each amplitude, in time order (stable
                 # sort, O(n) when the labels already increase in time)
                 idx = np.flatnonzero(values != 0)
@@ -634,7 +694,7 @@ class GLS:
                 cuts = np.flatnonzero(np.diff(lab)) + 1
                 for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, idx.size]):
                     a, i0, i1 = lab[lo], idx[lo], idx[hi - 1] + 1
-                    v = np.where(labels[i0:i1] == a, values[i0:i1], 0.0)
+                    v = np.where(labels[i0:i1] == a, values[i0:i1].astype(float), 0.0)
                     m = fast_fft_length(2 * v.size)
                     f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=self.nthreads)
                     r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[: v.size]
@@ -654,9 +714,9 @@ class GLS:
     def _template_back(self, k, f):
         """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf and _shbuf."""
         for values, labels in self._tmpl[k]:
-            _template_dot(values, labels, f, self._locbuf[self.nflag :])
+            _template_transpose(values, labels, f, self._locbuf[self.nflag :])
         for values, labels in self._shared[k]:
-            _template_dot(values, labels, f, self._shbuf)
+            _template_transpose(values, labels, f, self._shbuf)
 
     def _set_coarse(self, coarse):
         """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
@@ -845,9 +905,9 @@ class GLS:
         t = np.empty(ip.size)
         _project(ip, self._full, c2, s2, pol, loc, t)
         for values, labels in self._tmpl[k]:
-            _add_template(t, values, labels, loc[self.nflag : self.nflag + self.namp])
+            _template_add(t, values, labels, loc[self.nflag : self.nflag + self.namp])
         for values, labels in self._shared[k]:
-            _add_template(t, values, labels, self._shv)
+            _template_add(t, values, labels, self._shv)
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
