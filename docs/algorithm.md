@@ -165,7 +165,7 @@ not fixed on the sky, the orbital dipole: it sets the absolute calibration.
 In noiseless tests the iterations converge as
 $3\times10^{-4} \to 3\times10^{-8} \to 5\times10^{-15}$.
 
-## Sky model and bandpass templates
+## Sky model and templates
 
 A sky model $S$ is subtracted from the TOD, $d - S(t) = P\,m_\text{res} + n$,
 and the maps are $m_\text{res} + \bar S$, with $\bar S$ the binned map of
@@ -176,17 +176,26 @@ model below the pixel size, which the GLS would otherwise spread through the
 1/f weights. If the model is exact, $m_\text{res}$ is noise only and the maps
 are the binned maps of the signal.
 
-Bandpass templates $B_k(t)$ enter the model as $\sum_k a_{ik} B_k(t)$, with
-one amplitude per template and detector. These amplitudes are *shared*
-unknowns: a detector has `DetectorData` on several processes, so they are
-kept on the first process, broadcast before each product and summed over the
-processes after it (an allreduce of a few numbers per PCG iteration). The
-common part $\sum_i a_{ik}$ multiplies a sky signal and is degenerate with
-the map: the constraint $\sum_i a_{ik} = 0$ is imposed by projecting the
-shared part of the PCG vectors (the operator becomes $\Pi A \Pi$, with $\Pi$
-the projector on the constraint). With calibration all of it is linearized
-together: $d/g - D - S - \sum a B = P\,m_\text{res} + T\,\delta g +
-\sum B\,\delta a + n$, $T = D + S + \sum a B + P\,m_\text{res,prev}$.
+Templates $B_k(t)$ (sky signals sampled at the pointing, or TODs given per
+detector) enter the model as $\sum_k a_{ik} B_k(t)$. Amplitudes per
+`DetectorData` and period are *local* unknowns, like the gains. Amplitudes
+per detector or common to all are *shared* unknowns: a detector has
+`DetectorData` on several processes, so they are kept on the first process,
+broadcast before each product and summed over the processes after it (an
+allreduce of a few numbers per PCG iteration). For a sky template the
+common part $\sum_i a_{ik}$ is degenerate with the map (exactly for a
+template given as maps): with `sum_zero` the constraint $\sum_i a_{ik} = 0$
+is imposed by projecting the shared part of the PCG vectors (the operator
+becomes $\Pi A \Pi$, with $\Pi$ the projector on the constraint). With
+calibration all of it is linearized together: $d/g - D - S - \sum a B =
+P\,m_\text{res} + T\,\delta g + \sum B\,\delta a + n$, $T = D + S + \sum a B
++ P\,m_\text{res,prev}$.
+
+The covariance of the shared amplitudes, marginalized over the maps and the
+local unknowns, is the shared block of $A^{-1}$ (of the pseudo-inverse of
+$\Pi A \Pi$ with constraints): column $j$ is the shared part of the solution
+of $A x = e_j$ ($\Pi e_j$), one PCG solve per shared amplitude
+(`GLS.shared_covariance`).
 
 ## Differences from the C++ SANEPIC
 

@@ -197,6 +197,10 @@ class DetectorData:
     calibration (see :class:`CalibrationParameters`), and then subtracted from
     the calibrated TOD. Ignored without calibration: subtract it from `tod`
     beforehand if it should not be in the maps.
+
+    templates: the TOD of the templates of :func:`make_maps` given per
+    detector, {template name: array like `tod`} (e.g. a thermometer reading),
+    or None. A DetectorData without a template has no amplitude for it.
     """
 
     tod: np.ndarray
@@ -209,10 +213,13 @@ class DetectorData:
     flags: np.ndarray | None = None
     name: str | None = None
     dipole: np.ndarray | None = None
+    templates: dict | None = None
 
     def __post_init__(self):
         if self.dipole is not None and len(self.dipole) != len(self.tod):
             raise ValueError("DetectorData.dipole and tod must have the same length")
+        if any(np.shape(t) != (len(self.tod),) for t in (self.templates or {}).values()):
+            raise ValueError("DetectorData.templates must have one value per sample, like tod")
         if self.flags is not None:
             if not (isinstance(self.flags, np.ndarray) and self.flags.dtype == bool and self.flags.shape == (len(self.tod),)):
                 raise ValueError("DetectorData.flags must be a boolean array with one value per sample (True = flagged)")
@@ -281,10 +288,19 @@ class MapResult:
     gains : with calibration, the gains of the DetectorData of this rank (in
         the order of `data`, groups expanded): one array each, one gain per
         period of gain_period_s from its first sample. None otherwise.
-    bandpass : with bandpass_templates, the amplitude of each template for
-        each detector, {template name: {detector name: amplitude}} (summing to
-        zero over the detectors, unless bandpass_common), on every rank. None
-        otherwise.
+    templates : with templates, the amplitudes of each one, {name:
+        amplitudes}: {detector name: amplitude} (on every rank) for one
+        amplitude per detector, a float for a common one, and for amplitudes
+        per period one array per DetectorData of this rank (in the order of
+        `data`, groups expanded; empty where it has no template), as `gains`.
+        None otherwise.
+    template_covariance : with template_covariance, the covariance of the
+        amplitudes per detector and common, marginalized over the maps and the
+        amplitudes per period (gains included): {"labels": [(template name,
+        detector name or None for a common amplitude), ...], "matrix": (n, n)
+        array}, on every rank. With calibration, that of the last iteration.
+        The amplitudes summing to zero have the covariance of the
+        constrained amplitudes. None otherwise.
     """
 
     maps: np.ndarray
@@ -295,7 +311,8 @@ class MapResult:
     converged: bool
     residuals: np.ndarray
     gains: list | None = None
-    bandpass: dict | None = None
+    templates: dict | None = None
+    template_covariance: dict | None = None
 
 
 @dataclass(kw_only=True)
@@ -371,7 +388,7 @@ class CalibrationParameters:
 
     The TOD is modeled as d = g (P m + D + S + sum_k a_k B_k) + n, with P m the
     I/Q/U signal (as in :class:`DetectorData`), D = DetectorData.dipole, S and
-    B_k the sky model and the bandpass templates of :func:`make_maps` (0 if
+    B_k the sky model and the templates of :func:`make_maps` (0 if
     not given), and one gain g per detector and period. Linearized around the
     current values (g = 1, a = 0 at the start): d / g - D - S - sum a B =
     P m_res + T dg + sum B da + n, with the template T = D + S + sum a B +
@@ -390,7 +407,7 @@ class CalibrationParameters:
     fits (their polarization is not modelled) but are calibrated. Signal not
     described by one sky map for all detectors biases the gains: structure
     below the pixel size (give the sky model as alm) and foregrounds seen
-    through different bandpasses (bandpass_templates); mask what is left.
+    through different bandpasses (a template of the foregrounds); mask what is left.
     The gains are unknowns local to the process of their detector (no MPI
     communication). The pol_efficiency and the polarization angles are not
     calibrated.
@@ -406,22 +423,21 @@ class CalibrationParameters:
         is enough when the noise dominates the second-order terms; increase
         it for noiseless tests or large gain errors.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
-        for pixels used and 0 (False) for pixels left out of the fits, as the
-        usual masks (combine them with a product); or a dict with "gain"
-        and/or "bandpass" for one mask per kind of fit (a single map is used
-        for both). Samples left out of all the active fits are flagged in the
-        n_iter iterations (with GLSParameters.flag_method; "offset" takes no
-        memory; together with DetectorData.flags), then one more GLS solve
-        makes the maps with all the samples and the final values; samples
-        left out of some fits only keep those templates at 0, and the
-        iterations converge slower (they are calibrated with the values of
-        the previous iteration: ~5x per iteration in a noiseless test, against
-        ~10^4 with the samples flagged). Zeroing a
-        template does not stop signal that is not in the model from reaching
-        the fit through the maps and the 1/f weights: mask it for every fit
-        (e.g. point sources not in the sky model). E.g. {"gain": galaxy *
-        sources, "bandpass": sources}. None: all pixels.
-    cache_model : keep the TOD of the sky model and of the bandpass templates
+        for pixels used and 0 (False) for pixels left out of the gain fit, as
+        the usual masks (combine them with a product), or None: all pixels.
+        The templates have their own (Template.mask). Samples left out of all
+        the active fits (gains and templates) are flagged in the n_iter
+        iterations (with GLSParameters.flag_method; "offset" takes no memory;
+        together with DetectorData.flags), then one more GLS solve makes the
+        maps with all the samples and the final values; samples left out of
+        some fits only keep those templates at 0, and the iterations converge
+        slower (they are calibrated with the values of the previous
+        iteration: ~5x per iteration in a noiseless test, against ~10^4 with
+        the samples flagged). Zeroing a template does not stop signal that is
+        not in the model from reaching the fit through the maps and the 1/f
+        weights: mask it for every fit (e.g. point sources not in the sky
+        model). E.g. galaxy * sources here and sources in the templates.
+    cache_model : keep the TOD of the sky model and of the sky templates
         of every detector in memory between the iterations (8 bytes per sample
         each) instead of computing them again (with alm, an interpolation at
         every sample in each iteration).
@@ -429,8 +445,63 @@ class CalibrationParameters:
 
     gain_period_s: float = 3600.0
     n_iter: int = 2
-    mask: np.ndarray | dict | None = None
+    mask: np.ndarray | None = None
     cache_model: bool = False
+
+    def __post_init__(self):
+        if isinstance(self.mask, dict):
+            raise TypeError("CalibrationParameters.mask is the mask of the gains (one map); "
+                            "the templates have their own, Template.mask")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Template:
+    """A template fitted with the maps by :func:`make_maps` (templates=):
+    the TOD is modeled as P m + sum_k a_k T_k(t) + n, with T_k(t) the
+    template and a_k its amplitudes (inside the gain with calibration: the
+    amplitudes are in the units of the calibrated TOD, see
+    :class:`CalibrationParameters`). Templates nearly proportional to each
+    other, or to the sky signal, are not separable: see
+    MapResult.template_covariance.
+
+    Attributes
+    ----------
+    sky : the template as a sky signal (e.g. dF/dnu for bandpass mismatch),
+        maps or alm as make_maps' sky_model, sampled for every detector. None
+        (default): the TOD given per detector in DetectorData.templates, under
+        the name of the template.
+    period_s : None (default): one amplitude per detector (DetectorData.name,
+        shared by its DetectorData, also across MPI processes). A duration
+        [s]: one amplitude per DetectorData and period of this duration,
+        counted from its first sample, as the gains (inf: one per
+        DetectorData); unknowns local to each process, without MPI
+        communication, as many as wanted.
+    common : one amplitude for all the detectors (with period_s None).
+    sum_zero : the amplitudes of the detectors sum to zero (with period_s
+        None): only the differences between detectors are fitted. Needed for
+        a sky template as maps, whose common part is the map itself.
+    mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
+        for pixels where the template is fitted and 0 (False) for pixels left
+        out of its fit, or None (default): all pixels. Samples left out of
+        all the fits (gains included) are flagged in the fit and one more GLS
+        solve makes the maps with all the samples and the fitted amplitudes;
+        samples left out of some fits only keep those templates at 0 (see
+        CalibrationParameters.mask).
+    """
+
+    sky: np.ndarray | None = None
+    period_s: float | None = None
+    common: bool = False
+    sum_zero: bool = False
+    mask: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.period_s is not None and not self.period_s > 0:
+            raise ValueError("Template.period_s must be None or > 0")
+        if self.period_s is not None and (self.common or self.sum_zero):
+            raise ValueError("Template: common and sum_zero need period_s None (one amplitude per detector)")
+        if self.common and self.sum_zero:
+            raise ValueError("Template: a common amplitude summing to zero is 0; use one of common and sum_zero")
 
 
 @numba.njit(parallel=True, cache=True)
@@ -547,7 +618,7 @@ def _coarse_pixels(nside, coarse_nside):
 
 
 def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=None, verbose=False, calibration=None,
-              sky_model=None, bandpass_templates=None, bandpass_common=False):
+              sky_model=None, templates=None, template_covariance=False):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
 
     Parameters
@@ -571,7 +642,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     calibration : CalibrationParameters or None
         Fit the gains on the dipole together with the maps (see
         CalibrationParameters); `data` is then read n_iter times (+ 1 with a
-        mask): a generator is turned into a list first, so the pointings are
+        mask, also of a template): a generator is turned into a list first, so the pointings are
         still computed one detector at a time but the DetectorData are all
         kept. The gains are in MapResult.gains.
     sky_model : array or None
@@ -587,78 +658,79 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         weights (into the gains with calibration); with maps the maps change
         only in pixels whose Q/U are not solved (the model removes their
         polarization, which would leak too), and the calibration template.
-    bandpass_templates : dict or None
-        Templates of the signal that depends on the bandpass, e.g. {"fg": fg}
-        (the foreground scaled per detector) or {"fg_deriv1": dF/dnu} (the
-        first order of its expansion in the shift of the band, around the
-        frequency of the foreground in sky_model; the amplitudes are then the
-        shifts): maps or alm, as sky_model, but not part of it. Each one gets
-        an amplitude per detector (DetectorData.name; shared by the
-        DetectorData of a detector, also across MPI processes), fitted with the
-        maps: in one solve, or in each calibration iteration. By default the
-        amplitudes sum to zero over the detectors: only the differences between
-        detectors are fitted, and the common part (how far the mean band of
-        the detectors is from the frequency of sky_model) is left to the maps.
-        Templates nearly proportional to each other are not separable. The
-        amplitudes are in MapResult.bandpass.
-    bandpass_common : bool
-        Fit also the common part of each bandpass template: the amplitudes are
-        free, not summing to zero (with derivative templates, the band shifts
-        with respect to the frequency of sky_model, not to their mean). Why:
-        with calibration, if the mean band of the detectors is not at the
-        frequency of sky_model, the foreground in the data is the model scaled
-        by kappa = beta * mean shift / nu (for dust); the maps absorb that
-        pixel by pixel, but not below the pixel size, where only the common
-        gain can rescale the signal, so the absolute calibration is biased by
-        ~kappa (4e-4 on G100 for a mean shift of 0.03 GHz at 118 GHz). Fitting
-        the common part removes most of it (10x in a noiseless test). It
-        needs the templates as alm: the common part is constrained only by
-        their structure below the pixel size (as maps it is exactly the map,
-        and a ValueError is raised). Limitation: a common rescaling of the
-        foreground (the common gain) and a common shift of the band are nearly
-        degenerate when the spectral index varies little; they are separated
-        only by the dipole and the CMB, which the gain rescales too, so the
-        absolute calibration keeps an error of up to ~0.1 kappa (none in a
-        noiseless G100 test) and is noisier: with noise the common part is
-        measured only as well as the structure below the pixel size allows
-        (~0.02 GHz with 16 days of 16 detectors), so it pays off for long
-        runs. Without calibration there is no such degeneracy. False
-        (default).
+    templates : dict or None
+        {name: Template}: templates fitted with the maps (in one solve, or in
+        each calibration iteration), e.g. {"fg_deriv1": Template(sky=dF/dnu,
+        sum_zero=True)} for the bandpass mismatch of the foregrounds (dF/dnu
+        around the frequency of the foreground in sky_model, not part of it:
+        the amplitudes are then the shifts of the bands with respect to their
+        mean), or {"thermal": Template(period_s=86400.0)} with the TOD of a
+        thermometer in DetectorData.templates["thermal"]. See
+        :class:`Template` for the amplitudes (per detector, common, summing
+        to zero, or per period), and the documentation for the common part
+        of sky templates with calibration. The amplitudes are in
+        MapResult.templates.
+    template_covariance : bool
+        Also compute the covariance of the amplitudes per detector and common
+        (MapResult.template_covariance), marginalized over the maps and the
+        amplitudes per period: one more PCG solve per amplitude (with
+        calibration, after the last iteration). False (default).
     """
     sky = None if sky_model is None else _model(sky_model, nside, "sky_model")
-    bands = {k: _model(v, nside, f"bandpass_templates[{k!r}]") for k, v in (bandpass_templates or {}).items()}
-    if bandpass_common and any(not np.iscomplexobj(b) for b in bands.values()):
-        raise ValueError("bandpass_common needs the bandpass templates as alm: as maps their common part is the map itself")
-    if calibration is None and sky is None and not bands:
+    tmpls = dict(templates or {})
+    if any(not isinstance(t, Template) for t in tmpls.values()):
+        raise TypeError("templates must be {name: pysanepic.Template}")
+    skies = {k: _model(t.sky, nside, f"templates[{k!r}].sky") for k, t in tmpls.items() if t.sky is not None}
+    for k, x in skies.items():
+        if not np.iscomplexobj(x) and not tmpls[k].sum_zero:
+            raise ValueError(f"templates[{k!r}].sky as maps needs sum_zero=True: the common part of its amplitudes "
+                             "is the map itself (pass alm to fit it)")
+    if calibration is None and sky is None and not tmpls:
         return _make_maps(data, nside, coordinates, params, comm, nthreads, verbose)[0]
     data = list(data)
     dets = [d for x in data for d in (x.detectors if isinstance(x, DetectorGroup) else [x])]
-    alm = [k for k, x in [("sky_model", sky), *((f"bandpass_templates[{k!r}]", b) for k, b in bands.items())]
+    alm = [k for k, x in [("sky_model", sky), *((f"templates[{k!r}].sky", b) for k, b in skies.items())]
            if x is not None and np.iscomplexobj(x)]
     if alm and any(d.pointing.pix is not None for d in dets):
         raise ValueError(f"{', '.join(alm)} as alm are interpolated at the pointing: they need Pointing angles "
                          "(theta, phi), not pixels (or pass them as maps)")
     if calibration is not None and any(d.dipole is None for d in dets):
         raise ValueError("calibration needs DetectorData.dipole")
-    names = []
-    if bands:
-        if any(d.name is None for d in dets):
-            raise ValueError("bandpass_templates need DetectorData.name (one amplitude per detector)")
-        names = sorted({d.name for d in dets})
-        if comm is not None:
-            names = sorted(set().union(*comm.allgather(names)))
-    index = {(k, n): i for i, (k, n) in enumerate((k, n) for k in bands for n in names)}
-    masks = _masks(None if calibration is None else calibration.mask, nside)
-    fit = _Fit(calibration=calibration, sky=sky, bands=bands, index=index, amp=np.zeros(len(index)),
-               groups=[] if bandpass_common else [[index[k, n] for n in names] for k in bands],
-               mask_gain=masks[0], mask_band=masks[1],
+    # shared amplitudes: one per template and detector (with the template), or one per template
+    per_det = [k for k, t in tmpls.items() if t.period_s is None and not t.common]
+    if per_det and any(d.name is None for d in dets):
+        raise ValueError(f"templates {per_det} have one amplitude per detector: they need DetectorData.name")
+    names = {k: sorted({d.name for d in dets if k in skies or k in (d.templates or {})}) for k in per_det}
+    if comm is not None:
+        names = {k: sorted(set().union(*comm.allgather(v))) for k, v in names.items()}
+    labels = [(k, n) for k, t in tmpls.items() if t.period_s is None for n in names.get(k, [None])]
+    index = {x: i for i, x in enumerate(labels)}
+    mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
+    masks = {k: _mask(t.mask, nside, f"templates[{k!r}].mask") for k, t in tmpls.items()}
+    fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, index=index, amp=np.zeros(len(index)),
+               groups=[[index[k, n] for n in names[k]] for k in per_det if tmpls[k].sum_zero],
+               local={k: None for k, t in tmpls.items() if t.period_s is not None},
+               mask_gain=mask_gain, masks=masks,
                cache={} if calibration is not None and calibration.cache_model else None)
     for _ in range(1 if calibration is None else calibration.n_iter):
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
-    if calibration is not None and calibration.mask is not None:  # masked samples may have been left out
+    cov = None
+    if template_covariance and index:
+        p = GLSParameters() if params is None else params
+        cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.tol, maxiter=p.maxiter, verbose=verbose)}
+    if mask_gain is not None or any(m is not None for m in masks.values()):  # masked samples may have been left out
         fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
-    res.bandpass = {k: {n: fit.amp[index[k, n]] for n in names} for k in bands} if bands else None
+    out = {}
+    for k, t in tmpls.items():
+        if t.period_s is not None:
+            out[k] = fit.local[k]
+        elif t.common:
+            out[k] = float(fit.amp[index[k, None]])
+        else:
+            out[k] = {n: float(fit.amp[index[k, n]]) for n in names[k]}
+    res.templates = out or None
+    res.template_covariance = cov
     return res
 
 
@@ -668,23 +740,25 @@ class _Fit:
 
     calibration: "CalibrationParameters | None"  # None: no gains (and no dipole)
     sky: np.ndarray | None  # sky model (maps or alm), subtracted and put back
-    bands: dict  # bandpass templates: name -> map or alm, one amplitude per detector
-    index: dict  # (template name, detector name) -> shared amplitude
-    amp: np.ndarray  # current bandpass amplitudes
-    groups: list  # amplitudes of each template, summing to zero
+    templates: dict  # name -> Template
+    skies: dict  # name -> map or alm of the templates given as a sky signal
+    index: dict  # (template name, detector name or None) -> shared amplitude
+    amp: np.ndarray  # current shared amplitudes
+    groups: list  # shared amplitudes summing to zero
+    local: dict  # name -> current amplitudes per period, one array per DetectorData (None at the start)
     mask_gain: np.ndarray | None
-    mask_band: np.ndarray | None
+    masks: dict  # name -> mask of the template, or None
     gains: list | None = None  # current gains, one array per DetectorData
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
-    cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, bandpass TODs)
+    cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, sky template TODs)
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
     @property
     def alm(self):
         """Some model is alm: the samples need (theta, phi)."""
-        return any(x is not None and np.iscomplexobj(x) for x in (self.sky, *self.bands.values()))
+        return any(x is not None and np.iscomplexobj(x) for x in (self.sky, *self.skies.values()))
 
 
 def _model(x, nside, name):
@@ -705,17 +779,14 @@ def _model(x, nside, name):
     return x
 
 
-def _masks(mask, nside):
-    """(gain mask, bandpass mask) from one mask or a dict with "gain" and/or "bandpass"."""
+def _mask(mask, nside, name):
+    """A mask of a fit as an array, checked, or None."""
     if mask is None:
-        return None, None
-    m = mask if isinstance(mask, dict) else {"gain": mask, "bandpass": mask}
-    if set(m) - {"gain", "bandpass"}:
-        raise ValueError('CalibrationParameters.mask: a map, or a dict with "gain" and/or "bandpass"')
-    out = tuple(None if m.get(k) is None else np.asarray(m[k]) for k in ("gain", "bandpass"))
-    if any(x is not None and x.shape != (12 * nside * nside,) for x in out):
-        raise ValueError(f"CalibrationParameters.mask must have 12 nside^2 = {12 * nside * nside} pixels")
-    return out
+        return None
+    mask = np.asarray(mask)
+    if mask.shape != (12 * nside * nside,):
+        raise ValueError(f"{name} must have 12 nside^2 = {12 * nside * nside} pixels")
+    return mask
 
 
 def _sample(x, d, pix, angle, loc, nthreads):
@@ -755,14 +826,15 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
     common_modes = []
-    templates, shared, model_c = [], [], []  # gain and bandpass templates (chunk, values, labels), sky model TOD
+    templates, shared, model_c = [], [], []  # local and shared templates (chunk, values, labels), sky model TOD
     gains, offsets = [], []  # gains of each DetectorData and their first label
+    local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
     cal = None if fit is None else fit.calibration
-    nchunk = ndata = 0  # chunks and DetectorData so far
+    nchunk = ndata = nlab = 0  # chunks, DetectorData and local amplitudes so far
 
     def add(d, split=True):
         """Chunks of one DetectorData; returns their indices."""
-        nonlocal n_virtual, nchunk, ndata
+        nonlocal n_virtual, nchunk, ndata, nlab
         first = nchunk
         ndata += 1
         sample = fit is not None and (fit.cache is None or ndata not in fit.cache)
@@ -770,37 +842,56 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=sample and fit.alm)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
-        flags, tod_all, tmpl, btmpl = d.flags, d.tod, None, {}
+        flags, tod_all, tmpl, ttod, tlab = d.flags, d.tod, None, {}, {}
         if fit is not None:
             # d = g (P m + D + S + sum_k a_k B_k) + n, linearized around the current g, a:
             # d / g - D - S - sum a B = P m_res + T dg + sum B da + n, T = D + S + sum a B + P m_res_prev
             if not sample:
                 sky_tod, cached = fit.cache[ndata]
-                btmpl = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
+                ttod = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
             else:
                 sky_tod = _sample(fit.sky, d, pix, angle, loc, nthreads)
-                btmpl = {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in fit.bands.items()}
+                ttod = {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in fit.skies.items()}
                 if fit.cache is not None:
-                    fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in btmpl.items()}
+                    fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in ttod.items()}
+            ttod.update({k: np.array(v, dtype=float) for k, v in (d.templates or {}).items()
+                         if k in fit.templates and k not in fit.skies})
+
+            def period(seconds):  # the period of each sample
+                per = int(round(seconds * fs)) if np.isfinite(seconds) else len(d.tod)
+                return np.arange(len(d.tod)) // max(1, per)
+
             known = sky_tod.copy()
-            for k, t in btmpl.items():
-                known += fit.amp[fit.index[k, d.name]] * t
+            for k, t in ttod.items():
+                tp = fit.templates[k]
+                if tp.period_s is None:
+                    known += fit.amp[fit.index[k, None if tp.common else d.name]] * t
             if cal is not None:
-                per = int(round(cal.gain_period_s * fs)) if np.isfinite(cal.gain_period_s) else len(d.tod)
-                period = np.arange(len(d.tod)) // max(1, per)
-                gain = np.ones(period[-1] + 1) if fit.gains is None else fit.gains[len(gains)]
-                offsets.append(sum(x.size for x in gains))
+                p = period(cal.gain_period_s)
+                gain = np.ones(p[-1] + 1) if fit.gains is None else fit.gains[len(gains)]
+                offsets.append(nlab)
+                nlab += gain.size
                 gains.append(gain)
-                tod_all = d.tod / gain[period] - d.dipole
-                labels = offsets[-1] + period
-                if fit.fit:
-                    tmpl = d.dipole + known
-                    if fit.residual is not None:
-                        tmpl = tmpl + _project_maps(fit.residual, pix, angle, d.pol_efficiency)
+                tod_all = d.tod / gain[p] - d.dipole
+                labels = offsets[-1] + p
+            for k, amps in local.items():
+                if k not in ttod:
+                    amps.append((np.zeros(0), nlab))
+                    continue
+                p = period(fit.templates[k].period_s)
+                amp = np.zeros(p[-1] + 1) if fit.local[k] is None else fit.local[k][ndata - 1]
+                known += amp[p] * ttod[k]
+                amps.append((amp, nlab))
+                tlab[k] = nlab + p
+                nlab += amp.size
+            if cal is not None and fit.fit:
+                tmpl = d.dipole + known
+                if fit.residual is not None:
+                    tmpl = tmpl + _project_maps(fit.residual, pix, angle, d.pol_efficiency)
             tod_all = tod_all - known
             # masks: samples out of every active fit are flagged; out of some, their templates are 0
             active = [(tmpl, fit.mask_gain)] if tmpl is not None else []
-            active += [(t, fit.mask_band) for t in btmpl.values()] if fit.fit else []
+            active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
             if any(mk is not None for _, mk in active):
                 out = [(t, np.zeros(len(pix), bool) if mk is None else mk[pix] == 0) for t, mk in active]
                 drop = np.logical_and.reduce([o for _, o in out])
@@ -818,11 +909,15 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 if tmpl is not None:
                     templates.append((k, np.concatenate([zero, tmpl[a:b], zero]), np.concatenate([none, labels[a:b], none])))
                 if fit.fit:
-                    for name, t in btmpl.items():
-                        lab = np.concatenate([none, np.full(b - a, fit.index[name, d.name]), none])
-                        shared.append((k, np.concatenate([zero, t[a:b], zero]), lab))
+                    for name, t in ttod.items():
+                        values = np.concatenate([zero, t[a:b], zero])
+                        if name in tlab:
+                            templates.append((k, values, np.concatenate([none, tlab[name][a:b], none])))
+                        else:
+                            i = fit.index[name, None if fit.templates[name].common else d.name]
+                            shared.append((k, values, np.concatenate([none, np.full(b - a, i), none])))
                 if fit.sky is not None:
-                    model_c.append(np.concatenate([zero, sky_tod[a:b], zero]))  # the bandpass terms are not put back
+                    model_c.append(np.concatenate([zero, sky_tod[a:b], zero]))  # the templates are not put back
             flagged = None if flags is None else flags[a:b]
             if m and flagged is not None and flagged.any():  # the padding is built from the chunk: not from flagged samples
                 tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
@@ -894,7 +989,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
             if cal is not None:
                 gains = [g * (1 + info["amplitudes"][o : o + g.size]) for g, o in zip(gains, offsets)]
-            if fit.bands:
+            for k, amps in local.items():
+                fit.local[k] = [a + info["amplitudes"][o : o + a.size] for a, o in amps]
+            if fit.index:
                 fit.amp = fit.amp + info["shared_amplitudes"]
         fit.gains = gains if cal is not None else None
         if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky

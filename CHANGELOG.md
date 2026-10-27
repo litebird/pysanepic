@@ -4,6 +4,26 @@
 
 Changes on `main` that are not in a release yet.
 
+- **Breaking change**: one interface for the templates fitted with the maps,
+  `make_maps(templates={name: Template(...)})`, which replaces
+  `bandpass_templates` and `bandpass_common`; `MapResult.templates` replaces
+  `MapResult.bandpass`, and `CalibrationParameters.mask` is the mask of the
+  gains only (one map, no dict): each template has its own,
+  `Template(mask=...)`, also without calibration. The bandpass templates of 0.5 are
+  `Template(sky=..., sum_zero=True)` (`sum_zero=False` for
+  `bandpass_common=True`), with the same results. (#44)
+- `Template`: a sky signal (`sky=`, maps or alm) or a TOD given per detector
+  in the new `DetectorData.templates`, with one amplitude per detector
+  (default, or summing to zero with `sum_zero`), one common to all
+  (`common`), or one per `DetectorData` and period (`period_s`, local
+  unknowns like the gains). Fitted in the same PCG as the maps, with
+  calibration too. (#44)
+- `make_maps(template_covariance=True)`: the covariance of the amplitudes
+  per detector and common, marginalized over the maps and the amplitudes
+  per period, in `MapResult.template_covariance` (one PCG solve per
+  amplitude). Low level: `GLS.shared_covariance`. A Monte Carlo
+  (`tools/template_covariance_mc.py`) confirms the errors to ~10%. (#44)
+
 ## 0.5.2 (2026-10-26)
 
 - PCG: two products by $P^T N^{-1} P$ fewer per solve. Without `x0` the

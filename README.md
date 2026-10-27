@@ -18,9 +18,11 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
   (`estimate_noise`).
 - Gain calibration on the dipole, fitted with the maps
   (`CalibrationParameters`), with masks for the Galactic plane.
-- Sky model as alm interpolated at the pointing (no pixelization error) and
-  bandpass templates fitted per detector (`make_maps(sky_model=...,
-  bandpass_templates=...)`).
+- Sky model as alm interpolated at the pointing (no pixelization error)
+  (`make_maps(sky_model=...)`).
+- Templates fitted with the maps, as sky signals (e.g. bandpass mismatch) or
+  TODs, with amplitudes per detector, common, or per period, and their
+  covariance (`make_maps(templates={name: Template(...)})`).
 - Independent of any simulation pipeline: data are passed as plain arrays.
 - Validated against the original C++ code, which is kept in `cpp/`.
 

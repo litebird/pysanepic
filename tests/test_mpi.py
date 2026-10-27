@@ -86,7 +86,7 @@ def test_bandpass_mpi():
     different ranks: the serial result, on every rank."""
     import dataclasses
 
-    from pysanepic import GLSParameters, make_maps
+    from pysanepic import GLSParameters, Template, make_maps
     from test_mapmaker import _bandpass_data
 
     comm = MPI.COMM_WORLD
@@ -100,10 +100,49 @@ def test_bandpass_mpi():
             p = d.pointing
             halves.append(dataclasses.replace(d, tod=flat[sl], dipole=None, pointing=dataclasses.replace(
                 p, theta=p.theta[sl], phi=p.phi[sl], psi=p.psi[sl])))
-    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20), bandpass_templates={"fg": fg})
-    res = make_maps(halves[comm.rank :: comm.size], 16, comm=comm, **kw).bandpass["fg"]
-    ref = make_maps(halves, 16, **kw).bandpass["fg"]
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
+              templates={"fg": Template(sky=fg, sum_zero=True)})
+    res = make_maps(halves[comm.rank :: comm.size], 16, comm=comm, **kw).templates["fg"]
+    ref = make_maps(halves, 16, **kw).templates["fg"]
     assert set(res) == set(ref) and all(abs(res[k] - ref[k]) < 1e-9 for k in ref)
+
+
+def test_tod_templates_mpi():
+    """TOD templates with amplitudes per detector, common and per period, the
+    halves of each detector on different ranks, and the covariance of the
+    shared amplitudes: the serial result, on every rank."""
+    import dataclasses
+
+    from pysanepic import GLSParameters, Template, make_maps
+    from test_mapmaker import _calibration_data
+
+    comm = MPI.COMM_WORLD
+    n, per = 60_000, 12_000
+    data, true, _ = _calibration_data(16, n, 10.0, per)
+    rng = np.random.default_rng(47)
+    t = np.arange(n)
+    halves = []
+    for i, (d, g) in enumerate(zip(data, true)):
+        tt = {"thermal": rng.normal(size=n), "hk": rng.normal(size=n), "drift": (t % 6000) / 6000.0}
+        flat = d.tod / g[t // per] - d.dipole + 1e-3 * (i - 1.5) * tt["thermal"] + 2e-4 * tt["hk"] + 1e-4 * tt["drift"]
+        for sl in (slice(0, n // 2), slice(n // 2, n)):
+            p = d.pointing
+            halves.append(dataclasses.replace(d, tod=flat[sl], dipole=None, name=f"d{i}",
+                                              templates={k: v[sl] for k, v in tt.items()},
+                                              pointing=dataclasses.replace(p, theta=p.theta[sl], phi=p.phi[sl],
+                                                                           psi=p.psi[sl])))
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20), template_covariance=True,
+              templates={"thermal": Template(), "hk": Template(common=True), "drift": Template(period_s=600.0)})
+    res = make_maps(halves[comm.rank :: comm.size], 16, comm=comm, **kw)
+    ref = make_maps(halves, 16, **kw)
+    assert set(res.templates["thermal"]) == set(ref.templates["thermal"])
+    assert all(abs(res.templates["thermal"][k] - v) < 1e-9 for k, v in ref.templates["thermal"].items())
+    assert abs(res.templates["hk"] - ref.templates["hk"]) < 1e-9
+    for a, b in zip(res.templates["drift"], ref.templates["drift"][comm.rank :: comm.size]):
+        assert np.abs(a - b).max() < 1e-9
+    assert res.template_covariance["labels"] == ref.template_covariance["labels"]
+    c, c0 = res.template_covariance["matrix"], ref.template_covariance["matrix"]
+    assert np.abs(c - c0).max() < 1e-6 * np.abs(c0).max()
 
 
 def test_more_ranks_than_pixels():
@@ -236,5 +275,6 @@ if __name__ == "__main__":
     test_estimate_common_modes_mpi()
     test_calibration_mpi()
     test_bandpass_mpi()
+    test_tod_templates_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")
