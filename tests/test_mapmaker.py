@@ -8,6 +8,7 @@ Run with: pytest tests/  (or: python tests/test_mapmaker.py)
 """
 
 import dataclasses
+import warnings
 
 import ducc0
 import healpy as hp
@@ -417,11 +418,35 @@ def test_calibration_noiseless():
         err = r.maps[:, seen] - sky[:, seen]
         err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
         assert np.abs(err).max() < 1e-7 * np.abs(sky).max()
+    # gain_tol: stops when the corrections are below it, before n_iter
+    r = make_maps(data, nside, coordinates="E", params=params,
+                  calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=10, gain_tol=1e-12))
+    assert r.calibration_iterations < 10
+    assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
     assert make_maps(data[:1], nside, coordinates="E", params=params).gains is None
+    with pytest.raises(ValueError, match="gain_tol"):
+        CalibrationParameters(gain_tol=0.0)
     with pytest.raises(ValueError, match="dipole"):
         make_maps([dataclasses.replace(data[0], dipole=None)], nside, calibration=CalibrationParameters())
     with pytest.raises(ValueError, match="mask"):
         make_maps(data, nside, calibration=CalibrationParameters(mask=band[:10]))
+
+
+def test_calibration_unsolved_pol():
+    """Few detectors, Q/U not solved in most pixels (default min_pol_rcond):
+    their samples are flagged from the second iteration, so the iterations
+    converge as with every pixel solved (without, ~2x per iteration: 6e-3
+    after 10), and the final maps have I there."""
+    from pysanepic import CalibrationParameters
+
+    nside = 16
+    data, true, _ = _calibration_data(nside, 60_000, 10.0, 12_000)
+    data = data[:3]
+    r = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
+                  calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=4))
+    assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-8
+    seen_i, seen_qu = r.maps[0] != hp.UNSEEN, r.maps[1] != hp.UNSEEN
+    assert seen_qu.sum() < seen_i.sum() / 2 and np.array_equal(seen_i, r.hit_map > 0)
 
 
 def test_sky_model_sampling():
@@ -550,16 +575,20 @@ def test_bandpass_templates():
     spot = np.ones(12 * nside**2, bool)
     spot[hp.query_disc(nside, hp.ang2vec(1.0, 2.0), np.radians(10))] = False
     # samples out of the gain fit only (band): calibrated with the gains of the
-    # previous iteration, so the iterations converge slower (~5x each)
+    # previous iteration, so the iterations converge slower (~5x each), with a warning
     masked = lambda m: {"fg": Template(sky=fg, sum_zero=True, mask=m)}  # noqa: E731
-    cases = [(CalibrationParameters(gain_period_s=per / fs, n_iter=3), fg_tmpl, 1e-9),
-             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot, n_iter=3, cache_model=True),
-              masked(band * spot), 1e-9),
-             (CalibrationParameters(gain_period_s=per / fs, mask=band * spot, n_iter=10), masked(spot), 1e-8)]
-    cases.append((CalibrationParameters(gain_period_s=per / fs, n_iter=3), fg_tmpl, 1e-9, fg))  # with a sky model too
-    for cal, tmpl, tol, *model in cases:
-        r = make_maps(data, nside, coordinates="E", params=params, templates=tmpl, calibration=cal,
-                      sky_model=model[0] if model else None)
+    cal = lambda mask=None, n_iter=3, **kw: CalibrationParameters(gain_period_s=per / fs, mask=mask,  # noqa: E731
+                                                                  n_iter=n_iter, **kw)
+    cases = [(cal(), fg_tmpl, 1e-9, None, False),
+             (cal(band * spot, cache_model=True), masked(band * spot), 1e-9, None, False),  # equal masks: kept once
+             (cal(band * spot), fg_tmpl, 1e-9, None, False),  # no template mask: that of the gains
+             (cal(band * spot, n_iter=10), masked(spot), 1e-8, None, True),
+             (cal(), fg_tmpl, 1e-9, fg, False)]  # with a sky model too
+    for c, tmpl, tol, model, warn in cases:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            r = make_maps(data, nside, coordinates="E", params=params, templates=tmpl, calibration=c, sky_model=model)
+        assert any("converges slower" in str(x.message) for x in w) == warn
         assert max(abs(r.templates["fg"][k] - v) for k, v in expect.items()) < tol
         assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < tol
         seen = r.maps[1] != hp.UNSEEN

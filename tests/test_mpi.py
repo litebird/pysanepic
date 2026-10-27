@@ -64,7 +64,8 @@ def test_make_maps_mpi_padding():
 def test_calibration_mpi():
     """Calibration with the detectors split across ranks gives the serial gains
     (amplitudes local to each rank; default min_pol_rcond, which drops the
-    templates in pixels without Q/U, a collective step)."""
+    templates in pixels without Q/U, a collective step), and gain_tol stops
+    every rank at the serial iteration (the rank without data too)."""
     from pysanepic import CalibrationParameters, GLSParameters, make_maps
     from test_mapmaker import _calibration_data
 
@@ -72,10 +73,13 @@ def test_calibration_mpi():
     data, _, _ = _calibration_data(16, 60_000, 10.0, 12_000)
     data = data[:3]  # with 4 ranks, one has no data (and no templates)
     kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
-              calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=2))
-    gains = comm.gather(make_maps(data[comm.rank :: comm.size], 16, comm=comm, **kw).gains)
+              calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=10, gain_tol=1e-3))
+    res = make_maps(data[comm.rank :: comm.size], 16, comm=comm, **kw)
+    gains = comm.gather(res.gains)
     if comm.rank == 0:
-        ref = make_maps(data, 16, **kw).gains
+        ref = make_maps(data, 16, **kw)
+        assert res.calibration_iterations == ref.calibration_iterations < 10
+        ref = ref.gains
         for r in range(comm.size):
             for g, g0 in zip(gains[r], ref[r :: comm.size]):
                 assert np.abs(g - g0).max() < 1e-9

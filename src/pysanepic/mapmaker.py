@@ -9,6 +9,7 @@ resolution and in those coordinates. pysanepic computes polarization angles,
 chunks and noise weights itself, with one set of conventions documented here.
 """
 
+import warnings
 from dataclasses import dataclass
 
 import ducc0
@@ -301,6 +302,8 @@ class MapResult:
         array}, on every rank. With calibration, that of the last iteration.
         The amplitudes summing to zero have the covariance of the
         constrained amplitudes. None otherwise.
+    calibration_iterations : with calibration, the number of calibration
+        iterations done (n_iter, or fewer with gain_tol). None otherwise.
     """
 
     maps: np.ndarray
@@ -313,6 +316,7 @@ class MapResult:
     gains: list | None = None
     templates: dict | None = None
     template_covariance: dict | None = None
+    calibration_iterations: int | None = None
 
 
 @dataclass(kw_only=True)
@@ -409,7 +413,9 @@ class CalibrationParameters:
     is not a sky signal (the orbital dipole), so D must include it; the
     solar dipole and the sky give the relative gains. Samples in pixels whose
     Q/U are not solved (see GLSParameters.min_pol_rcond) do not enter the
-    fits (their polarization is not modelled) but are calibrated. Signal not
+    fits (their polarization is not modelled) but are calibrated; from the
+    second iteration they are flagged like those out of every mask (one more
+    GLS setup), otherwise the iterations converge much slower. Signal not
     described by one sky map for all detectors biases the gains: structure
     below the pixel size (give the sky model as alm) and foregrounds seen
     through different bandpasses (a template of the foregrounds); mask what is left.
@@ -426,12 +432,23 @@ class CalibrationParameters:
         the GLS is built once and reused, and each solve starts from the
         maps of the previous one). The first one uses T = D + S. 2 (default)
         is enough when the noise dominates the second-order terms; increase
-        it for noiseless tests or large gain errors.
+        it for noiseless tests or large gain errors. With gain_tol, the
+        maximum number of iterations.
+    gain_tol : None (default): always n_iter iterations. A number: stop
+        after the first iteration whose largest absolute gain correction dg (all
+        detectors and periods, all MPI processes) is below it. The
+        iterations converge geometrically but slower where the gains are
+        less constrained (periods with a weak dipole), and much slower with
+        samples left out of some fits only (see mask): gain_tol stops on the
+        worst period. MapResult.calibration_iterations has the number of
+        iterations done.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels used and 0 (False) for pixels left out of the gain fit, as
         the usual masks (combine them with a product), or None: all pixels.
-        The templates have their own (Template.mask). Samples left out of all
-        the active fits (gains and templates) are flagged in the n_iter
+        It is also the mask of the templates that have none (Template.mask),
+        so that by default every sample is in all the fits or in none.
+        Samples left out of all the active fits (gains and templates) are
+        flagged in the n_iter
         iterations (with GLSParameters.flag_method; "offset" takes no memory;
         together with DetectorData.flags), then one more GLS solve makes the
         maps with all the samples and the final values; samples left out of
@@ -441,7 +458,8 @@ class CalibrationParameters:
         the samples flagged). Zeroing a template does not stop signal that is
         not in the model from reaching the fit through the maps and the 1/f
         weights: mask it for every fit (e.g. point sources not in the sky
-        model). E.g. galaxy * sources here and sources in the templates.
+        model). E.g. galaxy * sources here and sources in the templates
+        (make_maps warns when the masks of gains and templates differ).
     cache_model : keep the TOD of the sky model and of the sky templates
         of every detector in memory between the iterations (8 bytes per sample
         each) instead of computing them again (with alm, an interpolation at
@@ -450,10 +468,13 @@ class CalibrationParameters:
 
     gain_period_s: float = 3600.0
     n_iter: int = 2
+    gain_tol: float | None = None
     mask: np.ndarray | None = None
     cache_model: bool = False
 
     def __post_init__(self):
+        if self.gain_tol is not None and not self.gain_tol > 0:
+            raise ValueError("CalibrationParameters.gain_tol must be None or > 0")
         if isinstance(self.mask, dict):
             raise TypeError("CalibrationParameters.mask is the mask of the gains (one map); "
                             "the templates have their own, Template.mask")
@@ -487,9 +508,12 @@ class Template:
         a sky template as maps, whose common part is the map itself.
     mask : HEALPix map (nside and coordinates of the output maps), 1 (True)
         for pixels where the template is fitted and 0 (False) for pixels left
-        out of its fit, or None (default): all pixels. Samples left out of
-        all the fits (gains included) are flagged in the fit and one more GLS
-        solve makes the maps with all the samples and the fitted amplitudes;
+        out of its fit, or None (default): with calibration, the mask of the
+        gains (CalibrationParameters.mask), else all pixels; all pixels with
+        calibration: a mask of ones. Equal masks are kept once in memory.
+        Samples left out of all the fits (gains included) are flagged in the
+        fit and one more GLS solve makes the maps with all the samples and
+        the fitted amplitudes;
         samples left out of some fits only keep those templates at 0 (see
         CalibrationParameters.mask).
     """
@@ -711,19 +735,41 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     labels = [(k, n) for k, t in tmpls.items() if t.period_s is None for n in names.get(k, [None])]
     index = {x: i for i, x in enumerate(labels)}
     mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
-    masks = {k: _mask(t.mask, nside, f"templates[{k!r}].mask") for k, t in tmpls.items()}
+    # a template without a mask has that of the gains; equal masks are one array (and one test per sample)
+    masks = {k: mask_gain if t.mask is None else _mask(t.mask, nside, f"templates[{k!r}].mask")
+             for k, t in tmpls.items()}
+    distinct = [] if mask_gain is None else [mask_gain]
+    for k, mk in masks.items():
+        same = None if mk is None else next((u for u in distinct if u is mk or np.array_equal(u, mk)), None)
+        if mk is not None and same is None:
+            distinct.append(mk)
+        masks[k] = mk if same is None else same
+    if calibration is not None and any(mk is not mask_gain for mk in masks.values()):
+        warnings.warn("templates with a mask different from that of the gains: their samples are calibrated with "
+                      "the gains of the previous iteration and the calibration converges slower (see "
+                      "CalibrationParameters.mask)", stacklevel=2)
     fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, index=index, amp=np.zeros(len(index)),
                groups=[[index[k, n] for n in names[k]] for k in per_det if tmpls[k].sum_zero],
                local={k: None for k, t in tmpls.items() if t.period_s is not None},
                mask_gain=mask_gain, masks=masks,
                cache={} if calibration is not None and calibration.cache_model else None)
+    n_cal = 0
     for _ in range(1 if calibration is None else calibration.n_iter):
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
+        n_cal += 1
+        if calibration is not None:
+            dg = fit.dg_max if comm is None else max(comm.allgather(fit.dg_max))
+            if verbose and (comm is None or comm.rank == 0):
+                print(f"calibration iteration {n_cal}: max |dg| = {dg:.3e}")
+            if calibration.gain_tol is not None and dg < calibration.gain_tol:
+                break
+            if n_cal == 1 and calibration.n_iter > 1:
+                _mask_unsolved_pol(fit, res, verbose and (comm is None or comm.rank == 0))
     cov = None
     if template_covariance and index:
         p = GLSParameters() if params is None else params
         cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.tol, maxiter=p.maxiter, verbose=verbose)}
-    if mask_gain is not None or any(m is not None for m in masks.values()):  # masked samples may have been left out
+    if fit.mask_gain is not None or any(m is not None for m in fit.masks.values()):  # samples may have been left out
         fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
     out = {}
@@ -736,6 +782,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
             out[k] = {n: float(fit.amp[index[k, n]]) for n in names[k]}
     res.templates = out or None
     res.template_covariance = cov
+    res.calibration_iterations = None if calibration is None else n_cal
     return res
 
 
@@ -754,6 +801,7 @@ class _Fit:
     mask_gain: np.ndarray | None
     masks: dict  # name -> mask of the template, or None
     gains: list | None = None  # current gains, one array per DetectorData
+    dg_max: float = 0.0  # largest |dg| of the last iteration on this rank
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
@@ -785,13 +833,43 @@ def _model(x, nside, name):
 
 
 def _mask(mask, nside, name):
-    """A mask of a fit as an array, checked, or None."""
+    """A mask of a fit as an array, checked, or None (also for a mask using
+    every pixel)."""
     if mask is None:
         return None
     mask = np.asarray(mask)
     if mask.shape != (12 * nside * nside,):
         raise ValueError(f"{name} must have 12 nside^2 = {12 * nside * nside} pixels")
-    return mask
+    return None if np.all(mask != 0) else mask
+
+
+def _mask_unsolved_pol(fit, res, verbose):
+    """After the first calibration iteration: the samples in pixels whose Q/U
+    are not solved are out of every fit (their templates are 0, see
+    GLS.set_templates) but in the maps, calibrated with the gains of the
+    previous iteration, which slows the iterations down as a mask of the gains
+    alone. Leave those pixels out of every mask: the samples are flagged in the
+    next iterations (a new GLS) and back in the final maps. `res` is full on
+    every rank, so all of them take the same decision."""
+    if res.maps.shape[0] == 1:
+        return
+    out = (res.maps[1] == hp.UNSEEN) & (res.hit_map > 0)
+    if not out.any():
+        return
+    if verbose:
+        print(f"calibration: samples in {out.sum()} pixels without Q/U flagged in the next iterations")
+    keep, new = ~out, {}
+
+    def cut(m):  # equal masks stay one array
+        if m is None:
+            return keep
+        if id(m) not in new:
+            new[id(m)] = (m != 0) & keep
+        return new[id(m)]
+
+    fit.mask_gain = cut(fit.mask_gain)
+    fit.masks = {k: cut(m) for k, m in fit.masks.items()}
+    fit.gls = None
 
 
 def _sample(x, d, pix, angle, loc, nthreads):
@@ -898,11 +976,16 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             active = [(tmpl, fit.mask_gain)] if tmpl is not None else []
             active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
             if any(mk is not None for _, mk in active):
-                out = [(t, np.zeros(len(pix), bool) if mk is None else mk[pix] == 0) for t, mk in active]
-                drop = np.logical_and.reduce([o for _, o in out])
-                for t, o in out:
-                    t[o & ~drop] = 0.0
-                flags = drop if flags is None else flags | drop
+                out = {}  # samples out of each distinct mask
+                for _, mk in active:
+                    if mk is not None and id(mk) not in out:
+                        out[id(mk)] = mk[pix] == 0
+                drop = None if any(mk is None for _, mk in active) else np.logical_and.reduce(list(out.values()))
+                for t, mk in active:
+                    if mk is not None and (drop is None or len(out) > 1):
+                        t[out[id(mk)] if drop is None else out[id(mk)] & ~drop] = 0.0
+                if drop is not None:
+                    flags = drop if flags is None else flags | drop
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
         gap = params.split_gap_s * fs if split else np.inf
         for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, flags, gap)):
@@ -994,7 +1077,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         if fit.fit:
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
             if cal is not None:
-                gains = [g * (1 + info["amplitudes"][o : o + g.size]) for g, o in zip(gains, offsets)]
+                dg = [info["amplitudes"][o : o + g.size] for g, o in zip(gains, offsets)]
+                fit.dg_max = max((float(np.abs(x).max()) for x in dg if x.size), default=0.0)
+                gains = [g * (1 + x) for g, x in zip(gains, dg)]
             for k, amps in local.items():
                 fit.local[k] = [a + info["amplitudes"][o : o + a.size] for a, o in amps]
             if fit.index:
