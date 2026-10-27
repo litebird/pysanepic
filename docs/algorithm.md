@@ -164,6 +164,8 @@ degenerate with the scale of the map except through the part of $D$ that is
 not fixed on the sky, the orbital dipole: it sets the absolute calibration.
 In noiseless tests the iterations converge as
 $3\times10^{-4} \to 3\times10^{-8} \to 5\times10^{-15}$.
+`gain_tol` stops the iterations when the largest $|\delta g|$ (a maximum over
+the MPI processes) is below it.
 
 ## Sky model and templates
 
