@@ -427,7 +427,7 @@ class CalibrationParameters:
         it for noiseless tests or large gain errors. With gain_tol, the
         maximum number of iterations.
     gain_tol : None (default): always n_iter iterations. A number: stop
-        after the first iteration whose largest gain correction |dg| (all
+        after the first iteration whose largest absolute gain correction dg (all
         detectors and periods, all MPI processes) is below it. The
         iterations converge geometrically but slower where the gains are
         less constrained (periods with a weak dipole), and much slower with
