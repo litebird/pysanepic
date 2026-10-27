@@ -23,6 +23,9 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
 - Templates fitted with the maps, as sky signals (e.g. bandpass mismatch) or
   TODs, with amplitudes per detector, common, or per period, and their
   covariance (`make_maps(templates={name: Template(...)})`).
+- Helpers for the templates of polarization angles and beams (FWHM,
+  pointing offsets, ellipticity) from the sky model, and the beam parameters
+  from the fitted amplitudes (`pysanepic.templates`).
 - Independent of any simulation pipeline: data are passed as plain arrays.
 - Validated against the original C++ code, which is kept in `cpp/`.
 

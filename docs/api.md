@@ -34,6 +34,16 @@
 .. autoclass:: pysanepic.Template
    :no-members:
 
+.. autofunction:: pysanepic.pol_angle_template
+
+.. autofunction:: pysanepic.fwhm_template
+
+.. autofunction:: pysanepic.beam_templates
+
+.. autofunction:: pysanepic.beam_tods
+
+.. autofunction:: pysanepic.beam_parameters
+
 .. autoclass:: pysanepic.MapResult
    :no-members:
 ```

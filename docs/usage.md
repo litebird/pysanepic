@@ -458,13 +458,15 @@ An error $\delta_i$ on the polarization angle of detector $i$ changes its TOD
 by $\delta_i\,\partial d/\partial\delta = \delta_i\,2\gamma\,(-Q \sin 2a + U \cos 2a)$,
 which is the signal of the sky $(0,\, 2U,\, -2Q)$: a sky template, made from
 the polarization of the sky model, whose amplitudes are the angle errors in
-radians:
+radians. {func}`~pysanepic.pol_angle_template` makes it, as alm
+$(0, 2B, -2E)$ or maps $(0, 2U, -2Q)$, with `sum_zero=True`:
 
 ```python
-# sky_alm: T, E, B of the sky model (or maps I, Q, U: [0 * I, 2 * U, -2 * Q])
-pol_angle = np.array([0 * sky_alm[0], 2 * sky_alm[2], -2 * sky_alm[1]])  # [0, 2B, -2E]
+from pysanepic import pol_angle_template
+
+# sky_alm: T, E, B of the sky model (or maps I, Q, U)
 result = make_maps(data, nside, params=params, sky_model=sky_alm,
-                   templates={"pol_angle": Template(sky=pol_angle, sum_zero=True)})
+                   templates={"pol_angle": pol_angle_template(sky_alm)})
 result.templates["pol_angle"]   # {"d0": delta_0 - mean, ...} [rad]
 ```
 
@@ -531,72 +533,44 @@ angle $a$ of the [signal model](#conventions), so without HWP $x$ is at the
 polarization angle of the detector. A different fixed choice (e.g. $b = \psi$)
 only rotates the amplitudes of each detector.
 
+The helpers:
+
+- {func}`~pysanepic.fwhm_template`: the FWHM template, with `sum_zero=True`;
+- {func}`~pysanepic.beam_templates`: the TODs of offsets and ellipticity
+  for all the `DetectorData` (added to their `templates`), and the
+  `Template` objects for them, with the constraints below;
+  {func}`~pysanepic.beam_tods` computes the TODs of one `DetectorData`, e.g.
+  in a generator that builds the data one detector at a time;
+- {func}`~pysanepic.beam_parameters`: from the fitted amplitudes to the
+  offsets and the shapes of the beams.
+
 ```python
-import ducc0
+from pysanepic import beam_parameters, beam_templates, fwhm_template
 
-def displaced(theta, phi, psi, dx, dy, frame):
-    """The pointing moved by (dx, dy) [rad] along x, y (b = psi + frame), with
-    psi parallel-transported along the geodesic."""
-    st, ct, sp, cp = np.sin(theta), np.cos(theta), np.sin(phi), np.cos(phi)
-    n = np.array([st * cp, st * sp, ct])
-    et, ep = np.array([ct * cp, ct * sp, -st]), np.array([-sp, cp, 0 * sp])
-    rho, b = np.hypot(dx, dy), psi + frame
-    t = (dx * (np.cos(b) * et + np.sin(b) * ep) + dy * (-np.sin(b) * et + np.cos(b) * ep)) / rho
-    w = np.cross(n.T, t.T).T
-    n2, t2 = np.cos(rho) * n + np.sin(rho) * t, -np.sin(rho) * n + np.cos(rho) * t
-    p = np.cos(psi) * et + np.sin(psi) * ep  # the direction of psi, transported
-    p2 = np.sum(p * t, 0) * t2 + np.sum(p * w, 0) * w
-    th2, ph2 = np.arccos(np.clip(n2[2], -1, 1)), np.arctan2(n2[1], n2[0]) % (2 * np.pi)
-    et2 = np.array([np.cos(th2) * np.cos(ph2), np.cos(th2) * np.sin(ph2), -np.sin(th2)])
-    ep2 = np.array([-np.sin(ph2), np.cos(ph2), 0 * ph2])
-    return th2, ph2, np.arctan2(np.sum(p2 * ep2, 0), np.sum(p2 * et2, 0))
-
-def observe(alm, theta, phi, angle, gamma=1.0):
-    """I + gamma (Q cos 2a + U sin 2a) of the alm (T, E, B) at (theta, phi)."""
-    lmax, loc = hp.Alm.getlmax(alm.shape[1]), np.stack([theta, phi], axis=1)
-    i = ducc0.sht.synthesis_general(alm=alm[:1], spin=0, lmax=lmax, loc=loc, epsilon=1e-12)[0]
-    q, u = ducc0.sht.synthesis_general(alm=alm[1:], spin=2, lmax=lmax, loc=loc, epsilon=1e-12)
-    return i + gamma * (q * np.cos(2 * angle) + u * np.sin(2 * angle))
-
-def beam_templates(d, sky_alm, coordinates, eps):
-    """The TOD templates of DetectorData d for the sky model sky_alm (T, E, B,
-    in `coordinates`, those of the maps), with steps eps [rad]."""
-    theta, phi, psi = d.pointing.angles(coordinates)
-    s = {}
-    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
-        th, ph, ps = displaced(theta, phi, psi, dx * eps, dy * eps, d.pol_angle_rad)
-        a = ps + d.pol_angle_rad if d.hwp_angle is None else ps + 2 * d.hwp_angle - d.pol_angle_rad
-        s[dx, dy] = observe(sky_alm, th, ph, a, d.pol_efficiency)
-    return {"offset_x": (s[1, 0] - s[-1, 0]) / (2 * eps),
-            "offset_y": (s[0, 1] - s[0, -1]) / (2 * eps),
-            "ell_plus": (s[1, 0] + s[-1, 0] - s[0, 1] - s[0, -1]) / (2 * eps**2),
-            "ell_cross": (s[1, 1] + s[-1, -1] - s[1, -1] - s[-1, 1]) / (4 * eps**2)}
-
-# sky_alm: T, E, B of the sky model through the mean beam, in Galactic coordinates
-data = [dataclasses.replace(d, templates={**(d.templates or {}), **beam_templates(d, sky_alm, "G", eps=0.1 / lmax)})
-        for d in data]
-ell = np.arange(lmax + 1)
-fwhm = np.array([hp.almxfl(a, -(ell * (ell + 1) - (4.0 if k else 0.0)) / 2) for k, a in enumerate(sky_alm)])
-hwp = data[0].hwp_angle is not None
-result = make_maps(data, nside, coordinates="G", params=params, sky_model=sky_alm, templates={
-    "offset_x": Template(), "offset_y": Template(),                 # rho_x, rho_y [rad]
-    "ell_plus": Template(sum_zero=not hwp), "ell_cross": Template(sum_zero=not hwp),  # c+, cx [rad^2]
-    "fwhm": Template(sky=fwhm, sum_zero=True),                      # delta sigma^2 [rad^2]
-})
+# sky_alm: T, E, B of the sky model through the mean beam (sigma), in Galactic coordinates
+data, templates = beam_templates(data, sky_alm, "G")   # offset_x, offset_y, ell_plus, ell_cross
+templates["fwhm"] = fwhm_template(sky_alm)
+result = make_maps(data, nside, coordinates="G", params=params, sky_model=sky_alm, templates=templates)
+result.templates["offset_x"]["d0"]      # rho_x [rad]
+beams = beam_parameters(result, templates, sigma=sigma)
+beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
+              #  "sigma_major", "sigma_minor", "angle"} [rad, rad^2]
 ```
 
 - **What is fitted**: the second moments are about the nominal pointing, so
   an offset adds $\rho\rho^T$ to them: the amplitudes are
   $c_+ + (\rho_x^2 - \rho_y^2)/2$, $c_\times + \rho_x \rho_y$ and
-  $\delta\sigma^2 + |\rho|^2/2$; subtract the fitted offsets to get the shape
-  of the beam.
+  $\delta\sigma^2 + |\rho|^2/2$. `beam_parameters` subtracts the fitted
+  offsets to get the shape of the beam; values fitted with `sum_zero` are
+  relative to the mean of the detectors, and so are $\sigma_\text{maj}$,
+  $\sigma_\text{min}$ computed from them around the `sigma` of the model.
 - **Common parts**: a FWHM change common to all the detectors is a change
   of the sky, and the maps absorb it (`sum_zero=True`). Without HWP so is a
   common ellipticity (in the frame of each detector, which turns with its
   polarization angle): it leaks the gradients of I into Q/U exactly as a
   polarization map would. With an HWP the polarization turns with
   $2\chi$ and the beam does not: the common ellipticity is measured, no
-  `sum_zero`. The common parts are absorbed by the maps only down to the
+  `sum_zero` (`beam_templates` chooses from the `hwp_angle` of the data). The common parts are absorbed by the maps only down to the
   pixel: the sky model should be smoothed with the mean beam of the
   detectors, or the rest of the structure below the pixel biases the fit (by
   ~1% in the test).
@@ -605,14 +579,15 @@ result = make_maps(data, nside, coordinates="G", params=params, sky_model=sky_al
   2.4°, $\ell \le 47$, offsets of a few arcminutes and ellipticities of a
   few %, with and without HWP), ~1% of the largest value, ~0.1% for 10 times
   smaller errors.
-- **Step**: `eps` small compared to the scales of the model
-  ($\ell_\text{max}\,\varepsilon \ll 1$: the error of the differences is
-  $\sim(\ell\varepsilon)^2/12$), but not so small that the precision of the
-  resampling ($10^{-12}$ relative, divided by $\varepsilon^2$) dominates:
-  e.g. $\varepsilon = 0.1/\ell_\text{max}$.
+- **Step**: `eps` (default $0.1/\ell_\text{max}$) small compared to the
+  scales of the model ($\ell_\text{max}\,\varepsilon \ll 1$: the error of
+  the differences is $\sim(\ell\varepsilon)^2/12$), but not so small that
+  the precision of the resampling ($10^{-10}$, divided by
+  $(\ell\varepsilon)^2$) dominates.
 - **Cost**: 8 resamplings of the model per detector, as many as with
-  `sky_model`; the 4 templates are kept in memory as 4 more TODs per
-  detector. Fit only what is needed (e.g. the offsets).
+  `sky_model` (4 for the offsets only); the 4 templates are kept in memory
+  as 4 more TODs per detector. Fit only what is needed
+  (`beam_templates(..., ellipticity=False)` for the offsets).
 
 ### Masks
 
