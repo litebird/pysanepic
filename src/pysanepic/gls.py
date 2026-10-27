@@ -689,6 +689,8 @@ class GLS:
                 # one pass: the samples of each amplitude, in time order (stable
                 # sort, O(n) when the labels already increase in time)
                 idx = np.flatnonzero(values != 0)
+                if idx.size == 0:  # e.g. a chunk in pixels whose Q/U are not solved
+                    continue
                 idx = idx[np.argsort(labels[idx], kind="stable")]
                 lab = labels[idx]
                 cuts = np.flatnonzero(np.diff(lab)) + 1
