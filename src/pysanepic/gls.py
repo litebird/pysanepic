@@ -290,6 +290,46 @@ def _reduce_maps(maps, buf):
                 maps[w, p, c] = 0.0
 
 
+# PCG vectors: the pixels of this rank, then the unknowns of the flagged samples
+# (~20% of the samples with a Galactic mask in the calibration) and the
+# amplitudes; their updates in parallel. The dot products are summed over a
+# fixed number of blocks: the same result with any number of threads.
+_DOT_BLOCKS = 256
+
+
+@numba.njit(parallel=True, cache=True)
+def _block_dots(a, b, nb):
+    out = np.zeros(nb)
+    n = a.size
+    for j in numba.prange(nb):
+        s = 0.0
+        for i in range(j * n // nb, (j + 1) * n // nb):
+            s += a[i] * b[i]
+        out[j] = s
+    return out
+
+
+@numba.njit(parallel=True, cache=True)
+def _axpy(y, a, x):
+    """y += a x."""
+    for i in numba.prange(y.size):
+        y[i] += a * x[i]
+
+
+@numba.njit(parallel=True, cache=True)
+def _xpby(y, x, b):
+    """y = x + b y."""
+    for i in numba.prange(y.size):
+        y[i] = x[i] + b * y[i]
+
+
+@numba.njit(parallel=True, cache=True)
+def _mul(out, a, b):
+    """out = a b."""
+    for i in numba.prange(out.size):
+        out[i] = a[i] * b[i]
+
+
 @numba.njit(cache=True)
 def _coverage(ip, c2, s2, pol, out):
     """Per pixel: hits, polarized hits (gamma > 0.5, as SANEPIC) and the sums of
@@ -875,7 +915,7 @@ class GLS:
         return np.ascontiguousarray(self._gather(x.T).T)
 
     def _dot(self, a, b):
-        d = np.vdot(a, b)
+        d = float(_block_dots(a, b, _DOT_BLOCKS).sum())
         return d if self.comm is None else self.comm.allreduce(d)
 
     def _pol_arrays(self, k, slot=None):
@@ -970,6 +1010,9 @@ class GLS:
         _PRIVATE_MAPS_BYTES (nside 512: 75 MB each), summed at the end;
         otherwise, in batches of one chunk per worker, all the threads add
         P^T of each chunk to the map by pixel ranges, as without workers.
+        The unknowns of flagged samples belong to one chunk each: the workers
+        add to them in place, without private copies (they can be ~20% of
+        the samples, e.g. a Galactic mask during the calibration).
         Each worker keeps ~40 bytes per sample of the longest chunk."""
         nw = min(self.nthreads, len(ks))
         pool = self._workers(nw)
@@ -981,11 +1024,12 @@ class GLS:
         private = nw * buf.nbytes <= _PRIVATE_MAPS_BYTES
         if private and (self._maps is None or self._maps.shape[0] < nw):
             self._maps = np.zeros((nw, *buf.shape))  # zeroed again by _reduce_maps
+        flag = self._locbuf[: self.nflag]  # disjoint labels for each chunk
         for j, slot in enumerate(slots):
             slot["nthreads"] = max(1, self.nthreads // nw)
             slot["loc"], slot["sh"] = np.zeros(self.namp), np.zeros(self.nshared)
             if private:
-                slot["map"], slot["flag"] = self._maps[j], np.zeros(self.nflag)
+                slot["map"] = self._maps[j]
         free = queue.SimpleQueue()
         for slot in slots:
             free.put(slot)
@@ -1000,7 +1044,7 @@ class GLS:
             self._template_back(k, f, slot["loc"], slot["sh"], serial=True)
             if not private:
                 return pol, c2, s2, f
-            _backproject_1(self.ip[k], f, c2, s2, pol, whole, slot["map"], slot["flag"])
+            _backproject_1(self.ip[k], f, c2, s2, pol, whole, slot["map"], flag)
             free.put(slot)
 
         if private:
@@ -1014,8 +1058,6 @@ class GLS:
         for slot in slots:
             self._locbuf[self.nflag :] += slot["loc"]
             self._shbuf += slot["sh"]
-            if private:
-                self._locbuf[: self.nflag] += slot["flag"]
 
     def _chunk_tod(self, k, v, tod, loc, c2, s2, pol, slot=None):
         """P v on chunk k (v given), or the TOD of chunk k (flagged samples set
@@ -1067,7 +1109,9 @@ class GLS:
 
     def _precond_flat(self, r):
         sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
-        z = np.concatenate([sky.ravel(), r[self._nsky :] * self._locprec])
+        z = np.empty_like(r)
+        z[: self._nsky] = sky.ravel()
+        _mul(z[self._nsky :], r[self._nsky :], self._locprec)
         if self._nsh_loc:
             self._project_shared(z[len(z) - self._nsh_loc :])
         if self._einv is not None:
@@ -1146,6 +1190,10 @@ class GLS:
     def _pcg(self, b, x, start, tol, maxiter, recompute_every, verbose):
         """PCG on A x = b from x (`start`: x is not 0); returns (x, iterations,
         norm(r)^2 / norm(b)^2 at each iteration)."""
+        with numba_threads(self.nthreads):
+            return self._pcg_loop(b, x, start, tol, maxiter, recompute_every, verbose)
+
+    def _pcg_loop(self, b, x, start, tol, maxiter, recompute_every, verbose):
         bb = self._dot(b, b)
         r = b - self._apply(x, exact=True) if start else b.copy()  # A 0 = 0: no product
         z = self._precond_flat(r)
@@ -1158,15 +1206,15 @@ class GLS:
         while it < maxiter and (it == 0 or history[-1] > tol):
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
-            x += alpha * d
+            _axpy(x, alpha, d)
             true_residual = (it + 1) % recompute_every == 0  # after every recompute_every-th step
             if true_residual:
                 r = b - self._apply(x, exact=True)  # true residual, avoids drift
             else:
-                r -= alpha * q
+                _axpy(r, -alpha, q)
             z = self._precond_flat(r)
             delta_new = self._dot(r, z)
-            d = z + (delta_new / delta) * d
+            _xpby(d, z, delta_new / delta)
             delta = delta_new
             history.append(self._dot(r, r) / bb)
             it += 1

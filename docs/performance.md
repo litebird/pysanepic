@@ -40,6 +40,21 @@ times faster. With 96 chunks of a day, 48 threads and one process, 10 PCG
 iterations took 14.6 s instead of 60.4 s (float32 FFTs), 16.9 s instead of
 89.6 s (float64), with the same result.
 
+The unknowns of flagged samples (`flag_method="marginalize"`, one per sample)
+belong to one chunk each, so the threads add $P^T$ to them in place, and the
+updates and dot products of the PCG vectors (pixels, flagged samples,
+amplitudes) are numba kernels on all the threads; the dot products are summed
+over a fixed number of blocks, with the same result for any number of
+threads. With calibration and a Galactic mask (|b| > 10°: 17% of the samples
+flagged during the iterations) these vectors are several times longer than
+the map. On G100, 96 chunks of a day, 48 threads, 8 templates and the gains,
+one PCG iteration took 7.2 s with a private copy of the flagged unknowns per
+thread and serial vector updates, 2.6 s now (2.1 s without flagged samples);
+in a 90-day e2e run with 3 calibration iterations (M1_L, 1 detector per
+process) the PCG went from 990 to 370 s, the GLS from 1470 to 850 s. With
+`verbose`, `make_maps` prints the time of each step of each solve (TOD and
+templates, GLS setup, PCG, maps).
+
 The private maps are used if all of them fit in 4 GB (nside 512: 75 MB per
 thread); otherwise, and with one chunk or one thread, each chunk is
 processed by all the threads: in $P^T$ each thread owns a range of pixels,
