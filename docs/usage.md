@@ -138,7 +138,7 @@ The conventions are the same as litebird_sim:
 | `params` | `GLSParameters()` | Settings of the map-maker, see [Parameters](parameters.md) |
 | `comm` | `None` | mpi4py communicator; each rank passes only its own data |
 | `nthreads` | `None` | Threads per process (FFTs, ducc0, numba); `None`: `OMP_NUM_THREADS` if set, else 1 |
-| `verbose` | `False` | Print the residual at each iteration (rank 0) |
+| `verbose` | `False` | Print the residual at each iteration and the time of each step of each solve (rank 0) |
 
 ## Output
 
