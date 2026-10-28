@@ -1556,3 +1556,33 @@ def test_template_storage():
         assert np.allclose(res[name][1], res["full"][1], rtol=rtol)
     with pytest.raises(ValueError, match="template_dtype"):
         GLS(pix, psi, w, template_dtype=np.float16)
+
+
+@pytest.mark.parametrize("private", [True, False])
+def test_chunk_threads(monkeypatch, private):
+    """Chunks in parallel in the PCG products (one per thread, P^T in private
+    maps or by pixel ranges) give the serial solution: flagged samples, local
+    and shared templates, float32 FFTs."""
+    from pysanepic import gls
+    from pysanepic import GLS, one_over_f_weights
+
+    if not private:
+        monkeypatch.setattr(gls, "_PRIVATE_MAPS_BYTES", 0)
+    rng = np.random.default_rng(41)
+    npix, ns, nchunk = 40, 300, 7
+    pix = rng.integers(0, npix, (nchunk, ns))
+    pix[2, 100:110] = -1 - np.arange(10)  # flagged
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    local = [(k, rng.normal(size=ns), np.arange(ns) // 100 + 3 * k) for k in range(nchunk)]
+    shared = [(k, rng.normal(size=ns), k % 3) for k in range(nchunk)]
+    res = []
+    for nthreads in (1, 4):
+        g = GLS(pix, psi, w, nthreads=nthreads, min_pol_rcond=0.0, fft_dtype=np.float32, templates=local,
+                shared_templates=shared, template_dtype=np.float64)
+        x, info = g.solve(tod, tol=1e-24, maxiter=500)
+        assert info["converged"]
+        res.append((x, info["amplitudes"], info["shared_amplitudes"], g._locprec))  # template preconditioner too
+    for a, b in zip(*res):
+        assert np.allclose(a, b, rtol=1e-8, atol=1e-8 * np.abs(b).max())

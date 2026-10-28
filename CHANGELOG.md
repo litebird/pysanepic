@@ -4,6 +4,27 @@
 
 Changes on `main` that are not in a release yet.
 
+- PCG products and template preconditioner: **one chunk per thread** (FFTs
+  single-threaded, $P^T$ in a private map per thread if they fit in 4 GB).
+  A single long FFT scales poorly with threads (memory bound: 2–4x on 48
+  cores of G100), independent FFTs well (15–25x). On one G100 node (96
+  chunks of a day, 48 threads), 10 PCG iterations: 60.4 → 14.6 s with
+  float32 FFTs, 89.6 → 16.9 s with float64, same result. Chunks with
+  common modes keep the previous scheme.
+- PCG with flagged samples (`flag_method="marginalize"`, e.g. the gain mask
+  during the calibration): the chunk threads add $P^T$ to the unknowns of
+  the flagged samples in place (each belongs to one chunk) instead of a
+  private copy per thread summed serially, and the updates and dot products
+  of the PCG vectors run on all the threads (dot products over fixed
+  blocks: the same result with any number of threads). With 17% of the
+  samples flagged (|b| < 10°), one PCG iteration on one G100 node (96
+  chunks of a day, 48 threads, 8 templates and the gains): 7.2 → 2.6 s; in a
+  90-day e2e run with 3 calibration iterations, PCG 990 → 370 s, GLS 1470 →
+  850 s, same result.
+- With `verbose`, `make_maps` prints the time of each step of each solve:
+  TOD and templates, GLS setup, PCG, maps.
+- `_template_diag` no longer fails on a template that is 0 in a whole
+  chunk (e.g. a chunk in pixels whose Q/U are not solved).
 - `CalibrationParameters(gain_tol=...)`: stop the calibration iterations
   when the largest gain correction |dg| (all detectors, periods and MPI
   processes) is below it, `n_iter` being the maximum; the number done is in

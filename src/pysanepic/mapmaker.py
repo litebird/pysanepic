@@ -9,6 +9,7 @@ resolution and in those coordinates. pysanepic computes polarization angles,
 chunks and noise weights itself, with one set of conventions documented here.
 """
 
+import time
 import warnings
 from dataclasses import dataclass
 
@@ -914,6 +915,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
     cal = None if fit is None else fit.calibration
     nchunk = ndata = nlab = 0  # chunks, DetectorData and local amplitudes so far
+    t0 = time.perf_counter()  # the time of each step, with verbose
 
     def add(d, split=True):
         """Chunks of one DetectorData; returns their indices."""
@@ -1061,6 +1063,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             lam = np.array([1 / np.maximum(w, w.max() * 1e-12) for w in (mode.noise.weights(nfft, fs) for mode in d.modes)])
             common_modes.append((list(chunks), U, lam))
 
+    t1 = time.perf_counter()
     if reuse:
         gls = fit.gls
         gls.set_templates(templates, shared)
@@ -1071,7 +1074,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     del pix_c, a2_c, gamma_c
     # warm start from the previous calibration iteration (if the pixels are the same)
     x0 = None if fit is None or fit.x0 is None or fit.x0.shape != (gls.ncomp, gls.nobs) else fit.x0
+    t2 = time.perf_counter()
     m, info = gls.solve(tod_c, x0=x0, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
+    t3 = time.perf_counter()
     if fit is not None:
         fit.x0 = m
         if fit.fit:
@@ -1091,8 +1096,12 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)
     hit_map[:n] = gls.full(gls.hits)[:n]
+    maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
+    if verbose and rank == 0:
+        print(f"TOD and templates {t1 - t0:.1f} s, GLS setup {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
+              f"({info['iterations']} iterations), maps {time.perf_counter() - t3:.1f} s", flush=True)
     return MapResult(
-        maps=gls.to_healpix(m, nside, fill=hp.UNSEEN),
+        maps=maps,
         hit_map=hit_map,
         nside=nside,
         coordinates=coordinates,
