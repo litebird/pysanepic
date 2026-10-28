@@ -4,13 +4,15 @@
 
 Changes on `main` that are not in a release yet.
 
+## 0.6.0 (2026-10-28)
+
 - PCG products and template preconditioner: **one chunk per thread** (FFTs
   single-threaded, $P^T$ in a private map per thread if they fit in 4 GB).
   A single long FFT scales poorly with threads (memory bound: 2–4x on 48
   cores of G100), independent FFTs well (15–25x). On one G100 node (96
   chunks of a day, 48 threads), 10 PCG iterations: 60.4 → 14.6 s with
   float32 FFTs, 89.6 → 16.9 s with float64, same result. Chunks with
-  common modes keep the previous scheme.
+  common modes keep the previous scheme. (#53)
 - PCG with flagged samples (`flag_method="marginalize"`, e.g. the gain mask
   during the calibration): the chunk threads add $P^T$ to the unknowns of
   the flagged samples in place (each belongs to one chunk) instead of a
@@ -20,16 +22,16 @@ Changes on `main` that are not in a release yet.
   samples flagged (|b| < 10°), one PCG iteration on one G100 node (96
   chunks of a day, 48 threads, 8 templates and the gains): 7.2 → 2.6 s; in a
   90-day e2e run with 3 calibration iterations, PCG 990 → 370 s, GLS 1470 →
-  850 s, same result.
+  850 s, same result. (#53)
 - With `verbose`, `make_maps` prints the time of each step of each solve:
-  TOD and templates, GLS setup, PCG, maps.
+  TOD and templates, GLS setup, PCG, maps. (#53)
 - `_template_diag` no longer fails on a template that is 0 in a whole
-  chunk (e.g. a chunk in pixels whose Q/U are not solved).
+  chunk (e.g. a chunk in pixels whose Q/U are not solved). (#53)
 - `CalibrationParameters(gain_tol=...)`: stop the calibration iterations
   when the largest gain correction |dg| (all detectors, periods and MPI
   processes) is below it, `n_iter` being the maximum; the number done is in
   `MapResult.calibration_iterations`. With `verbose`, max |dg| is printed
-  at each iteration.
+  at each iteration. (#49)
 - **Breaking change**: with calibration, a `Template` without a mask has
   that of the gains (`CalibrationParameters.mask`) instead of all pixels,
   so that by default each sample is in all the fits or in none: samples
@@ -38,14 +40,14 @@ Changes on `main` that are not in a release yet.
   up to 1e-3 after 4 iterations, against the noise with equal masks). For
   all pixels, pass a mask of ones. `make_maps` warns when the masks of
   gains and templates differ. Equal masks are kept once in memory, and
-  their samples are tested once per mask.
+  their samples are tested once per mask. (#51)
 - Calibration: the samples in pixels whose Q/U are not solved (out of every
   fit) are flagged from the second iteration, like those out of every mask,
   and back in the final maps. They were calibrated with the gains of the
   previous iteration and slowed the iterations down to ~2x each (gain errors
   of 6e-3 after 10 iterations with 3 detectors, 1e-9 after 4 now). One more
   GLS setup, only when there are such pixels. New test
-  `test_calibration_unsolved_pol`.
+  `test_calibration_unsolved_pol`. (#52)
 - **Breaking change**: one interface for the templates fitted with the maps,
   `make_maps(templates={name: Template(...)})`, which replaces
   `bandpass_templates` and `bandpass_common`; `MapResult.templates` replaces
@@ -93,7 +95,7 @@ Changes on `main` that are not in a release yet.
   values and int64 labels, copied): a one-year e2e run with calibration and 7
   templates ran out of memory on G100 (360 GB per detector). With 4
   templates and calibration, 163 → 47 bytes per sample. Low level:
-  `GLS(template_dtype=...)`, and the labels of a template can be one int.
+  `GLS(template_dtype=...)`, and the labels of a template can be one int. (#50)
 
 ## 0.5.2 (2026-10-26)
 
