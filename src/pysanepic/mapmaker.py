@@ -548,6 +548,11 @@ class Template:
         the fitted amplitudes;
         samples left out of some fits only keep those templates at 0 (see
         CalibrationParameters.mask).
+    fixed : a known signal, not fitted: the template is in the TOD model with
+        amplitude 1 (times the gain with calibration) and is not put back in
+        the maps, e.g. the beam asymmetries from the beams' alm
+        (:func:`~pysanepic.blm_templates`). Not in MapResult.templates; no
+        period_s, common, sum_zero or mask.
     """
 
     sky: np.ndarray | None = None
@@ -555,8 +560,11 @@ class Template:
     common: bool = False
     sum_zero: bool = False
     mask: np.ndarray | None = None
+    fixed: bool = False
 
     def __post_init__(self):
+        if self.fixed and (self.period_s is not None or self.common or self.sum_zero or self.mask is not None):
+            raise ValueError("Template: a fixed template has no amplitudes: no period_s, common, sum_zero or mask")
         if self.period_s is not None and not self.period_s > 0:
             raise ValueError("Template.period_s must be None or > 0")
         if self.period_s is not None and (self.common or self.sum_zero):
@@ -743,7 +751,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         raise TypeError("templates must be {name: pysanepic.Template}")
     skies = {k: _model(t.sky, nside, f"templates[{k!r}].sky") for k, t in tmpls.items() if t.sky is not None}
     for k, x in skies.items():
-        if not np.iscomplexobj(x) and not tmpls[k].sum_zero:
+        if not np.iscomplexobj(x) and not tmpls[k].sum_zero and not tmpls[k].fixed:
             raise ValueError(f"templates[{k!r}].sky as maps needs sum_zero=True: the common part of its amplitudes "
                              "is the map itself (pass alm to fit it)")
     if calibration is None and sky is None and not tmpls:
@@ -758,18 +766,19 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     if calibration is not None and any(d.dipole is None for d in dets):
         raise ValueError("calibration needs DetectorData.dipole")
     # shared amplitudes: one per template and detector (with the template), or one per template
-    per_det = [k for k, t in tmpls.items() if t.period_s is None and not t.common]
+    fitted = {k: t for k, t in tmpls.items() if not t.fixed}
+    per_det = [k for k, t in fitted.items() if t.period_s is None and not t.common]
     if per_det and any(d.name is None for d in dets):
         raise ValueError(f"templates {per_det} have one amplitude per detector: they need DetectorData.name")
     names = {k: sorted({d.name for d in dets if k in skies or k in (d.templates or {})}) for k in per_det}
     if comm is not None:
         names = {k: sorted(set().union(*comm.allgather(v))) for k, v in names.items()}
-    labels = [(k, n) for k, t in tmpls.items() if t.period_s is None for n in names.get(k, [None])]
+    labels = [(k, n) for k, t in fitted.items() if t.period_s is None for n in names.get(k, [None])]
     index = {x: i for i, x in enumerate(labels)}
     mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
     # a template without a mask has that of the gains; equal masks are one array (and one test per sample)
     masks = {k: mask_gain if t.mask is None else _mask(t.mask, nside, f"templates[{k!r}].mask")
-             for k, t in tmpls.items()}
+             for k, t in fitted.items()}
     distinct = [] if mask_gain is None else [mask_gain]
     for k, mk in masks.items():
         same = None if mk is None else next((u for u in distinct if u is mk or np.array_equal(u, mk)), None)
@@ -807,7 +816,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
     out = {}
-    for k, t in tmpls.items():
+    for k, t in fitted.items():
         if t.period_s is not None:
             out[k] = fit.local[k]
         elif t.common:
@@ -1006,8 +1015,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         m = int(round(params.pad_s * fs))
         flags, tod_all, tmpl, ttod, tlab = d.flags, d.tod, None, {}, {}
         if fit is not None:
-            # d = g (P m + D + S + sum_k a_k B_k) + n, linearized around the current g, a:
-            # d / g - D - S - sum a B = P m_res + T dg + sum B da + n, T = D + S + sum a B + P m_res_prev
+            # d = g (P m + D + S + F + sum_k a_k B_k) + n (F: the fixed templates), linearized around the
+            # current g, a: d / g - D - S - F - sum a B = P m_res + T dg + sum B da + n,
+            # T = D + S + F + sum a B + P m_res_prev
             if not sample:
                 sky_tod, cached = fit.cache[ndata]
                 ttod = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
@@ -1029,6 +1039,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
 
             known = np.array(sky_tod, dtype=float)
             with numba_threads(nthreads):
+                for k in [k for k in ttod if fit.templates[k].fixed]:
+                    _axpy(known, 1.0, ttod.pop(k))
                 for k, t in ttod.items():
                     tp = fit.templates[k]
                     if tp.period_s is None:

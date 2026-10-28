@@ -44,6 +44,10 @@
 
 .. autofunction:: pysanepic.beam_parameters
 
+.. autofunction:: pysanepic.blm_templates
+
+.. autofunction:: pysanepic.blm_tods
+
 .. autoclass:: pysanepic.MapResult
    :no-members:
 ```

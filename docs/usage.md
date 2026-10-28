@@ -640,6 +640,58 @@ beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
   (`beam_templates(..., ellipticity=False)` for the offsets: 1 or 3
   syntheses).
 
+### Beams as alm: a fixed template
+
+Without HWP the ellipticity common to the detectors is degenerate with Q/U
+(see above): no fit can remove its leakage of I into Q/U, which needs the
+beams known from elsewhere. With the beams as alm (as in litebird_sim:
+`gauss_beam_to_alm` for elliptical Gaussians, or GRASP), the TOD of their
+asymmetries enters the model as a **fixed template**, `Template(fixed=True)`:
+amplitude 1, times the gain with calibration, not fitted and not put back in
+the maps:
+
+$$
+d = g\,(P m + D + S + F + \textstyle\sum_k a_k B_k) + n,\qquad
+F = \text{sky} \circledast (B - B_\text{sym}).
+$$
+
+$B_\text{sym}$ is the part of the beam symmetric about its axis, the beam of
+the maps: $m = 0$ for T and, for Q/U, the co-rotating part at $m = 2$,
+$(b^E_{\ell 2} - i b^B_{\ell 2})/2$, the only one a circular beam has. Each
+detector has its own $B_\text{sym}$: different FWHMs are left to
+{func}`~pysanepic.fwhm_template`. The convolution is
+`ducc0.totalconvolve.Interpolator` with $k_\text{max} = m_\text{max}$ of the
+beam, as in litebird_sim, so the conventions are those of the simulation:
+`blm` in the frame of the detector, with its polarization angle in it
+(`psi_pol_rad`), $\psi$ of the pointing as in litebird_sim.
+
+```python
+from pysanepic import blm_templates
+
+# sky_alm: T, E, B of the sky, NOT convolved with a beam; blms: {detector name: blm}
+data, templates = blm_templates(data, sky_alm, blms, "G")   # {"beam": Template(fixed=True)}
+result = make_maps(data, nside, coordinates="G", params=params, templates=templates)
+```
+
+- **Sky model**: the template needs the sky itself, not through a beam,
+  with the lmax of the beams; an external model is enough, since the error
+  is the product of the beam asymmetry and the error of the model, and I
+  (bright, well known) dominates the leakage into Q/U.
+- **Check**: for a slightly elliptical Gaussian it is the first order of
+  `ell_plus`, `ell_cross` of {func}`~pysanepic.beam_tods`, with the major
+  axis at `psi_ell - pol_angle` from $x$ (`test_blm_tods`; the LevelS formula
+  is a flat-sky expansion, off by ~0.1% at $\ell \sim 80$, more at low $\ell$).
+  With it, the maps of elliptical beams are those of their symmetric parts,
+  and so are the gains (`test_blm_fixed_template`).
+- **HWP**: not yet. The polarization turns with $2\chi$ and the beam does
+  not, so the beam needs the Mueller formalism (litebird_sim's
+  `MuellerConvolver`); with an HWP the leakage of a common ellipticity is
+  modulated away anyway.
+- **Cost**: one `Interpolator` per detector (its cube, of size
+  $\sim (2\ell_\text{max})(4\ell_\text{max})(2k_\text{max}+1)$ per
+  component, is built and freed in turn) and one more TOD per detector,
+  kept in float64 in the model (it is not a GLS template).
+
 ### Masks
 
 Each fit has its own mask (1 for pixels used, 0 for pixels left out):
