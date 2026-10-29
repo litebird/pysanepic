@@ -76,8 +76,9 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
 
 - Pass the data as a generator of `DetectorData`: then the pointings of only
   one detector are in memory at a time (litebird_sim does this).
-- Maps: the PCG vectors and the 3×3 preconditioner (~300 bytes per pixel)
-  are divided among the processes. Each process keeps in full only the search
+- Maps: the PCG vectors, the 3×3 preconditioner and the coverage, kept for
+  the binned map of the sky model (~350 bytes per pixel), are divided among
+  the processes. Each process keeps in full only the search
   direction for $P$ and the map accumulating $P^T$ (24 bytes per pixel each,
   I/Q/U in float64, whatever the number of threads), plus during the setup
   the coverage and the preconditioner blocks (56 and 48 bytes per pixel, one

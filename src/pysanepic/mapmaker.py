@@ -19,6 +19,7 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
+from .gls import _TRIG_COS, _TRIG_SIN, _axpy, _calibrated, _project_iqu
 
 
 _COORDINATES = ("E", "G", "C")
@@ -344,6 +345,11 @@ class GLSParameters:
         coverage gives a reciprocal condition number >= this value (0: no
         check, as SANEPIC).
     tol, maxiter : PCG stops when norm(r)^2 / norm(b)^2 < tol or after maxiter iterations.
+    covariance_tol : tol of the PCG solves of make_maps(template_covariance=True),
+        one per amplitude. 1e-6 (default) gives sigma and correlations to
+        ~1e-4 (in a test with calibration, bandpass, angle and FWHM templates:
+        sigma to 4e-5, correlations to 8e-4 against 1e-10), with ~1/3 fewer
+        iterations than 1e-10.
     angle_dtype : storage of twice the polarization angle: np.float32 (4 bytes
         per sample, angle error ~1e-7 rad) or np.float64 (exact).
     flag_method : how runs of flagged samples (DetectorData.flags) shorter than
@@ -383,6 +389,7 @@ class GLSParameters:
     preconditioner: str = "block"
     min_pol_rcond: float = 1e-2
     tol: float = 1e-12
+    covariance_tol: float = 1e-6
     maxiter: int = 2000
     angle_dtype: type = np.float32
     flag_method: str = "marginalize"
@@ -769,7 +776,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     cov = None
     if template_covariance and index:
         p = GLSParameters() if params is None else params
-        cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.tol, maxiter=p.maxiter, verbose=verbose)}
+        cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.covariance_tol, maxiter=p.maxiter, verbose=verbose)}
     if fit.mask_gain is not None or any(m is not None for m in fit.masks.values()):  # samples may have been left out
         fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
@@ -880,7 +887,7 @@ def _sample(x, d, pix, angle, loc, nthreads):
     if x is None:
         return np.zeros(len(pix))
     if not np.iscomplexobj(x):
-        return _project_maps(x, pix, angle, d.pol_efficiency)
+        return _project_maps(x, pix, angle, d.pol_efficiency, nthreads)
     lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
     eps = 1e-6 if x.dtype == np.complex64 else 1e-10
     tod = ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
@@ -946,18 +953,19 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 per = int(round(seconds * fs)) if np.isfinite(seconds) else len(d.tod)
                 return np.arange(len(d.tod)) // max(1, per)
 
-            known = sky_tod.copy()
-            for k, t in ttod.items():
-                tp = fit.templates[k]
-                if tp.period_s is None:
-                    known += fit.amp[fit.index[k, None if tp.common else d.name]] * t
+            known = np.array(sky_tod, dtype=float)
+            with numba_threads(nthreads):
+                for k, t in ttod.items():
+                    tp = fit.templates[k]
+                    if tp.period_s is None:
+                        _axpy(known, float(fit.amp[fit.index[k, None if tp.common else d.name]]), t)
             if cal is not None:
                 p = period(cal.gain_period_s)
                 gain = np.ones(p[-1] + 1) if fit.gains is None else fit.gains[len(gains)]
                 offsets.append(nlab)
                 nlab += gain.size
                 gains.append(gain)
-                tod_all = d.tod / gain[p] - d.dipole
+                gain_period = p
                 labels = offsets[-1] + p
             for k, amps in local.items():
                 if k not in ttod:
@@ -972,8 +980,14 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             if cal is not None and fit.fit:
                 tmpl = d.dipole + known
                 if fit.residual is not None:
-                    tmpl = tmpl + _project_maps(fit.residual, pix, angle, d.pol_efficiency)
-            tod_all = tod_all - known
+                    with numba_threads(nthreads):
+                        _axpy(tmpl, 1.0, _project_maps(fit.residual, pix, angle, d.pol_efficiency, nthreads))
+            if cal is not None:
+                tod_all = np.empty(len(d.tod))
+                with numba_threads(nthreads):
+                    _calibrated(d.tod, gain, gain_period, d.dipole, known, tod_all)
+            else:
+                tod_all = tod_all - known
             # masks: samples out of every active fit are flagged; out of some, their templates are 0
             active = [(tmpl, fit.mask_gain)] if tmpl is not None else []
             active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
@@ -1148,16 +1162,16 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
 def _model_tod(d, maps, nside, coordinates, nthreads):
     """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0)."""
     pix, angle, _ = _pixels_and_angles(d, nside, coordinates, nthreads)
-    return _project_maps(maps, pix, angle, d.pol_efficiency)
+    return _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
 
 
-def _project_maps(maps, pix, angle, pol_efficiency):
-    """P m for pixels and polarization angles (UNSEEN taken as 0)."""
-    m = np.where(maps == hp.UNSEEN, 0.0, maps)
-    tod = m[0, pix]
-    if m.shape[0] == 3:
-        tod = tod + pol_efficiency * (m[1, pix] * np.cos(2 * angle) + m[2, pix] * np.sin(2 * angle))
-    return tod
+def _project_maps(maps, pix, angle, pol_efficiency, nthreads=1):
+    """P m for pixels and polarization angles (UNSEEN taken as 0), in parallel."""
+    out = np.empty(len(pix))
+    with numba_threads(nthreads):
+        _project_iqu(np.ascontiguousarray(maps, dtype=float), np.asarray(pix), np.asarray(angle, dtype=float),
+                     float(pol_efficiency), _TRIG_COS, _TRIG_SIN, out)
+    return out
 
 
 def _fit_one_over_f(f, psd, fs, model):

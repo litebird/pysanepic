@@ -135,7 +135,7 @@ def test_tod_templates_mpi():
                                               templates={k: v[sl] for k, v in tt.items()},
                                               pointing=dataclasses.replace(p, theta=p.theta[sl], phi=p.phi[sl],
                                                                            psi=p.psi[sl])))
-    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20), template_covariance=True,
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20, covariance_tol=1e-20), template_covariance=True,
               templates={"thermal": Template(), "hk": Template(common=True), "drift": Template(period_s=600.0)})
     res = make_maps(halves[comm.rank :: comm.size], 16, comm=comm, **kw)
     ref = make_maps(halves, 16, **kw)

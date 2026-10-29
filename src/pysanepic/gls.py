@@ -236,6 +236,7 @@ def _template_transpose(values, labels, f, out):
 _TRIG_N = 4096
 _TRIG_COS = np.cos(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
 _TRIG_SIN = np.sin(-np.pi + 2 * np.pi * np.arange(_TRIG_N) / _TRIG_N)
+_UNSEEN = -1.6375e30  # healpy.UNSEEN
 
 
 @numba.njit(parallel=True, cache=True)
@@ -259,6 +260,40 @@ def _cos_sin(a2, gamma, c2, s2, tc, ts):
         sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
         c2[i] = g * (tc[k] * cd - ts[k] * sd)
         s2[i] = g * (ts[k] * cd + tc[k] * sd)
+
+
+@numba.njit(parallel=True, cache=True)
+def _project_iqu(m, pix, angle, gamma, tc, ts, out):
+    """out = I + gamma (Q cos 2a + U sin 2a) of the maps m (ncomp, npix) in
+    the pixels pix, a = angle (any value); hp.UNSEEN taken as 0. cos and sin
+    as in _cos_sin."""
+    n = tc.size
+    step = 2 * np.pi / n
+    pol = m.shape[0] == 3
+    for i in numba.prange(pix.size):
+        p = pix[i]
+        v = m[0, p]
+        t = 0.0 if v == _UNSEEN else v
+        if pol:
+            x = 2.0 * angle[i] + np.pi
+            x -= 2 * np.pi * np.floor(x / (2 * np.pi))
+            k = min(max(int(x / step), 0), n - 1)
+            d = x - k * step
+            d2 = d * d
+            cd = 1.0 - d2 * (0.5 - d2 / 24.0)
+            sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
+            q, u = m[1, p], m[2, p]
+            q = 0.0 if q == _UNSEEN else q
+            u = 0.0 if u == _UNSEEN else u
+            t += gamma * (q * (tc[k] * cd - ts[k] * sd) + u * (ts[k] * cd + tc[k] * sd))
+        out[i] = t
+
+
+@numba.njit(parallel=True, cache=True)
+def _calibrated(tod, gain, period, dipole, known, out):
+    """out = tod / gain[period] - dipole - known."""
+    for i in numba.prange(tod.size):
+        out[i] = tod[i] / gain[period[i]] - dipole[i] - known[i]
 
 
 def _serial(kernel):
@@ -378,15 +413,29 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
     < nlabels; those >= nobs (unknowns of flagged samples, intensity only) add
     their II block to locout[label - nobs].
     Cost is sum over pixels of hits^2 per chunk; the pixels of a chunk are
-    processed in parallel (each one writes its own row of out).
+    processed in parallel (each one writes its own row of out). The unknowns
+    of a chunk have contiguous labels: they are sorted with the pixels after a
+    shift, so that the sort costs O(ns + nobs + unknowns of the chunk), not of
+    all the unknowns of the rank (`nlabels`; 200 million in a year of data
+    with a Galactic mask).
     """
     # ponytail: O(hits^2) per pixel per chunk; switch to a lag cutoff or the
     # SANEPIC N_[0] shortcut if deep pixels with long chunks become a bottleneck
     nchunk, ns = ip.shape
     nc = c.shape[1]  # FFT length >= ns: c is the first row of an nc x nc circulant
+    nobs = out.shape[0]
     for k in range(nchunk):
-        order = _pixel_order(ip[k], nlabels)
-        sorted_ip = ip[k][order]
+        lo, hi = nlabels, nobs - 1  # labels of the unknowns of this chunk: [lo, hi]
+        for i in range(ns):
+            if ip[k, i] >= nobs:
+                lo = min(lo, ip[k, i])
+                hi = max(hi, ip[k, i])
+        off = lo - nobs if hi >= nobs else 0  # unknown j of the chunk is sorted as nobs + j - lo
+        lab = np.empty(ns, np.int64)
+        for i in range(ns):
+            lab[i] = ip[k, i] - off if ip[k, i] >= nobs else ip[k, i]
+        order = _pixel_order(lab, hi - off + 1 if hi >= nobs else nobs)
+        sorted_ip = lab[order]
         starts = np.flatnonzero(np.diff(sorted_ip)) + 1
         bounds = np.empty(starts.size + 2, np.int64)
         bounds[0] = 0
@@ -396,7 +445,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
             start, stop = bounds[r], bounds[r + 1]
             p = sorted_ip[start]
             n = stop - start
-            local = p >= out.shape[0]  # an unknown of flagged samples: no Q/U
+            local = p >= nobs  # an unknown of flagged samples: no Q/U
             # Contiguous run of samples with no polarization sensitivity (e.g. the
             # padding of a chunk): sum over lags in O(n) instead of O(n^2)
             unpol = True
@@ -410,7 +459,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
                 for lag in range(-(n - 1), n):
                     acc += (n - abs(lag)) * c[k, lag % nc]
                 if local:
-                    locout[p - out.shape[0]] += acc
+                    locout[p - nobs + off] += acc
                 else:
                     out[p, 0] += acc
                 continue
@@ -419,7 +468,7 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
                 for a in range(start, stop):
                     for b in range(start, stop):
                         acc += c[k, (order[a] - order[b]) % nc]
-                locout[p - out.shape[0]] += acc
+                locout[p - nobs + off] += acc
                 continue
             b0 = b1 = b2 = b3 = b4 = b5 = 0.0
             for a in range(start, stop):
@@ -666,7 +715,7 @@ class GLS:
             self.mask[1:] &= cov[:, 1] >= min_pol_hits
             if min_pol_rcond > 0:
                 self.mask[1:] &= self._pol_rcond(cov) >= min_pol_rcond
-        del cov
+        self._cov = cov  # this rank's pixels, kept for binned
 
         blocks = np.zeros((self.nobs, 6))
         last_w = c = None  # consecutive chunks often share their weights array
@@ -749,7 +798,11 @@ class GLS:
         v^T C v = c[0] R[0] + 2 sum_l c[l] R[l], with c the first row of the
         circulant N^-1 of the chunk and R the autocorrelation of v, computed
         with an FFT of length 2L: exact, and ~2 FFTs of the chunk in all
-        instead of one per amplitude. The chunks in parallel, one per thread
+        instead of one per amplitude. An amplitude spanning more than a
+        quarter of the FFT length m of the chunk (e.g. one per detector, the
+        whole chunk) takes instead one FFT of length m: v^T C v = sum_f w_f
+        |V_f|^2 / m, also exact (C is the circulant of length m cut to the
+        chunk), ~4 times cheaper. The chunks in parallel, one per thread
         (see _apply_chunks)."""
         diag = np.zeros(n)
         kernels = {}  # first row of N^-1, by weights array and FFT length
@@ -757,28 +810,45 @@ class GLS:
         for k in ks:
             key = (id(self.weights[k]), self._nfft[k])
             if key not in kernels:
-                kernels[key] = ducc0.fft.c2r(np.asarray(self.weights[k], dtype=complex), lastsize=self._nfft[k],
-                                             forward=False, inorm=2, nthreads=self.nthreads)
+                m = self._nfft[k]
+                wm = np.asarray(self.weights[k], dtype=float) * (2.0 / m)  # rfft bins: twice, but 0 and m / 2
+                wm[0] /= 2
+                if m % 2 == 0:
+                    wm[-1] /= 2
+                kernels[key] = ducc0.fft.c2r(np.asarray(self.weights[k], dtype=complex), lastsize=m,
+                                             forward=False, inorm=2, nthreads=self.nthreads), wm
         nw = min(self.nthreads, len(ks))
         nthreads = self.nthreads if nw <= 1 else max(1, self.nthreads // nw)
 
         def chunk(k):
             """(amplitude, v^T C v) of each amplitude of chunk k."""
-            c, out = kernels[id(self.weights[k]), self._nfft[k]], []
+            (c, wm), out, m_chunk = kernels[id(self.weights[k]), self._nfft[k]], [], self._nfft[k]
             for values, labels in tmpls[k]:
-                if np.ndim(labels) == 0:  # one amplitude in the whole chunk
-                    labels = np.full(values.size, labels, np.int32)
-                # one pass: the samples of each amplitude, in time order (stable
-                # sort, O(n) when the labels already increase in time)
-                idx = np.flatnonzero(values != 0)
-                if idx.size == 0:  # e.g. a chunk in pixels whose Q/U are not solved
-                    continue
-                idx = idx[np.argsort(labels[idx], kind="stable")]
-                lab = labels[idx]
-                cuts = np.flatnonzero(np.diff(lab)) + 1
-                for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, idx.size]):
-                    a, i0, i1 = lab[lo], idx[lo], idx[hi - 1] + 1
-                    v = np.where(labels[i0:i1] == a, values[i0:i1].astype(float), 0.0)
+                if np.ndim(labels) == 0:  # one amplitude in the whole chunk: no sort
+                    nz = np.flatnonzero(values)
+                    if nz.size:
+                        segments = [(int(labels), nz[0], nz[-1] + 1)]
+                        labels = None
+                    else:
+                        continue
+                else:
+                    segments = None
+                if segments is None:
+                    # one pass: the samples of each amplitude, in time order (stable
+                    # sort, O(n) when the labels already increase in time)
+                    idx = np.flatnonzero(values != 0)
+                    if idx.size == 0:  # e.g. a chunk in pixels whose Q/U are not solved
+                        continue
+                    idx = idx[np.argsort(labels[idx], kind="stable")]
+                    lab = labels[idx]
+                    cuts = np.flatnonzero(np.diff(lab)) + 1
+                    segments = [(lab[lo], idx[lo], idx[hi - 1] + 1) for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, idx.size])]
+                for a, i0, i1 in segments:
+                    v = values[i0:i1].astype(float) if labels is None else np.where(labels[i0:i1] == a, values[i0:i1].astype(float), 0.0)
+                    if 4 * v.size > m_chunk:  # v zero-extended to the FFT of the chunk (cyclic shifts: same sum)
+                        f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m_chunk - v.size)]), nthreads=nthreads)
+                        out.append((a, np.dot(wm, f.real**2 + f.imag**2)))
+                        continue
                     m = fast_fft_length(2 * v.size)
                     f = ducc0.fft.r2c(np.concatenate([v, np.zeros(m - v.size)]), nthreads=nthreads)
                     r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=nthreads)[: v.size]
@@ -1235,14 +1305,13 @@ class GLS:
         rank, for timelines laid out like `pix`; I only where Q/U are not
         solved, 0 where not observed; flagged samples are not used. Collective
         with MPI."""
-        cov = np.zeros((self.nobs, 7))
+        cov = self._cov  # the coverage of the setup: the same samples
         rhs = np.zeros((self.nobs, self.ncomp))
+        flag = np.zeros(self.nflag)  # not used
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
                 pol, c2, s2 = self._pol_arrays(k)
-                _coverage(ip, c2, s2, pol, cov)
-                _backproject(ip, np.asarray(tod[k], dtype=float), c2, s2, pol, self._edges, rhs, np.zeros(self.nflag))
-        cov = self._scatter_sum(cov, by_column=True)
+                _backproject(ip, np.asarray(tod[k], dtype=float), c2, s2, pol, self._edges, rhs, flag)
         rhs = self._scatter_sum(rhs)
         out = np.zeros((self.ncomp, self.nloc))
         i_only = self.mask[0] & ~self.mask[-1] if self.pol else self.mask[0]
