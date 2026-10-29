@@ -19,7 +19,7 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
-from .gls import _TRIG_COS, _TRIG_SIN, _axpy, _calibrated, _project_iqu
+from .gls import _TRIG_COS, _TRIG_SIN, _axpy, _calibrated, _fill_columns, _project_iqu
 
 
 _COORDINATES = ("E", "G", "C")
@@ -472,6 +472,13 @@ class CalibrationParameters:
         of every detector in memory between the iterations (8 bytes per sample
         each) instead of computing them again (with alm, an interpolation at
         every sample in each iteration).
+    covariance_fixed_gains : make_maps(template_covariance=True) with the
+        gains fixed at their fitted values instead of marginalized over: the
+        gain amplitudes couple to the sky templates through the sky signal in
+        the gain template and slow down the PCG solves (~2x their iterations).
+        In a test with a gain mask and bandpass, angle and FWHM sky templates,
+        the errors were 0.05-0.13% smaller, with 35% fewer iterations.
+        False (default): marginalized.
     """
 
     gain_period_s: float = 3600.0
@@ -479,6 +486,7 @@ class CalibrationParameters:
     gain_tol: float | None = None
     mask: np.ndarray | None = None
     cache_model: bool = False
+    covariance_fixed_gains: bool = False
 
     def __post_init__(self):
         if self.gain_tol is not None and not self.gain_tol > 0:
@@ -776,6 +784,8 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     cov = None
     if template_covariance and index:
         p = GLSParameters() if params is None else params
+        if calibration is not None and calibration.covariance_fixed_gains and fit.no_gains is not None:
+            fit.gls.set_templates(*fit.no_gains)  # collective
         cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.covariance_tol, maxiter=p.maxiter, verbose=verbose)}
     if fit.mask_gain is not None or any(m is not None for m in fit.masks.values()):  # samples may have been left out
         fit.fit, fit.gls = False, None  # other flags: a new GLS
@@ -814,6 +824,7 @@ class _Fit:
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
     cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, sky template TODs)
+    no_gains: tuple | None = None  # the templates of the GLS but the gains (covariance_fixed_gains)
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
     @property
@@ -922,6 +933,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
     cal = None if fit is None else fit.calibration
     nchunk = ndata = nlab = 0  # chunks, DetectorData and local amplitudes so far
+    gain_ids = set()  # ids of the gain templates in `templates`
     t0 = time.perf_counter()  # the time of each step, with verbose
 
     def add(d, split=True):
@@ -1014,13 +1026,21 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 dt = params.template_dtype
                 if tmpl is not None:
                     templates.append((k, _padded(tmpl, a, b, m, dt), _padded(labels, a, b, m, np.int32)))
+                    gain_ids.add(id(templates[-1]))
                 if fit.fit:
+                    cols = []  # the templates with one amplitude in the chunk: one 2D array, one pass in the PCG
                     for name, t in ttod.items():
                         if name in tlab:
                             templates.append((k, _padded(t, a, b, m, dt), _padded(tlab[name], a, b, m, np.int32)))
                         else:
-                            i = fit.index[name, None if fit.templates[name].common else d.name]
-                            shared.append((k, _padded(t, a, b, m, dt), i))
+                            cols.append((t, fit.index[name, None if fit.templates[name].common else d.name]))
+                    if len(cols) == 1:
+                        shared.append((k, _padded(cols[0][0], a, b, m, dt), cols[0][1]))
+                    elif cols:
+                        values = np.zeros((b - a + 2 * m, len(cols)), dt)
+                        with numba_threads(nthreads):
+                            _fill_columns(values, tuple(np.asarray(t, dtype=float) for t, _ in cols), a, m)
+                        shared.append((k, values, np.array([i for _, i in cols])))
                 if fit.sky is not None:  # the templates are not put back
                     model_c.append(_padded(sky_tod, a, b, m, np.float64))
             flagged = None if flags is None else flags[a:b]
@@ -1078,6 +1098,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             common_modes.append((list(chunks), U, lam))
 
     t1 = time.perf_counter()
+    if fit is not None and fit.fit and cal is not None and cal.covariance_fixed_gains:
+        fit.no_gains = ([t for t in templates if id(t) not in gain_ids], shared)  # the same arrays: no copies
     if reuse:
         gls = fit.gls
         gls.set_templates(templates, shared)

@@ -215,18 +215,55 @@ def _dot(values, f):
     return s
 
 
+@numba.njit(parallel=True, cache=True)
+def _add_columns(t, values, a):
+    """t += values @ a: several templates (columns) with one amplitude each in
+    the chunk, in one pass."""
+    for i in numba.prange(t.size):
+        s = 0.0
+        for j in range(a.size):
+            s += values[i, j] * a[j]
+        t[i] += s
+
+
+@numba.njit(nogil=True, cache=True)
+def _dot_columns(values, f):
+    """values^T f, (ncol,): the T^T of several templates in one pass."""
+    out = np.zeros(values.shape[1])
+    for i in range(f.size):
+        fi = f[i]
+        for j in range(out.size):
+            out[j] += values[i, j] * fi
+    return out
+
+
+@numba.njit(parallel=True, cache=True)
+def _fill_columns(out, cols, a, m):
+    """out[m + i, j] = cols[j][a + i] for i < out.shape[0] - 2 m: the
+    templates of a chunk as the columns of one array (margins untouched)."""
+    for i in numba.prange(out.shape[0] - 2 * m):
+        for j in range(len(cols)):
+            out[m + i, j] = cols[j][a + i]
+
+
 def _template_add(t, values, labels, amp, serial=False):
-    """t += values * amp[labels], labels an array or one int (see GLS templates);
-    `serial`: the single-threaded kernels of the chunk workers."""
-    if np.ndim(labels) == 0:
+    """t += values * amp[labels], labels an array or one int (see GLS templates),
+    or values (n, ncol) and labels (ncol,); `serial`: the single-threaded
+    kernels of the chunk workers."""
+    if np.ndim(values) == 2:
+        (_add_columns_1 if serial else _add_columns)(t, values, amp[labels])
+    elif np.ndim(labels) == 0:
         (_add_scaled_1 if serial else _add_scaled)(t, values, amp[labels])
     else:
         (_add_template_1 if serial else _add_template)(t, values, labels, amp)
 
 
 def _template_transpose(values, labels, f, out):
-    """out[labels] += values * f, labels an array or one int."""
-    if np.ndim(labels) == 0:
+    """out[labels] += values * f, labels an array or one int, or values
+    (n, ncol) and labels (ncol,)."""
+    if np.ndim(values) == 2:
+        np.add.at(out, labels, _dot_columns(values, f))
+    elif np.ndim(labels) == 0:
         out[labels] += _dot(values, f)
     else:
         _template_dot(values, labels, f, out)
@@ -307,8 +344,8 @@ def _serial(kernel):
     return numba.njit(nogil=True, cache=True)(g)
 
 
-_project_1, _add_template_1, _add_scaled_1, _cos_sin_1, _backproject_1 = map(
-    _serial, (_project, _add_template, _add_scaled, _cos_sin, _backproject))
+_project_1, _add_template_1, _add_scaled_1, _add_columns_1, _cos_sin_1, _backproject_1 = map(
+    _serial, (_project, _add_template, _add_scaled, _add_columns, _cos_sin, _backproject))
 
 # ponytail: fixed budget for the private P^T maps of the chunk workers (nside 512
 # x 48 workers: 3.6 GB); above it, P^T by pixel ranges; make it a parameter if needed
@@ -365,11 +402,11 @@ def _mul(out, a, b):
         out[i] = a[i] * b[i]
 
 
-@numba.njit(cache=True)
+@numba.njit(nogil=True, cache=True)
 def _coverage(ip, c2, s2, pol, out):
     """Per pixel: hits, polarized hits (gamma > 0.5, as SANEPIC) and the sums of
-    c2, s2, c2^2, c2 s2, s2^2 (angle-coverage matrix)."""
-    # ponytail: serial, one pass over the data at setup; parallelize if it shows up
+    c2, s2, c2^2, c2 s2, s2^2 (angle-coverage matrix). Serial: the chunks
+    are summed in parallel into private arrays (GLS._chunk_coverage)."""
     for i in range(ip.size):
         p = ip[i]
         if p >= out.shape[0]:  # flagged sample
@@ -592,7 +629,10 @@ class GLS:
         (labels 0, 1, ... with the same meaning on every rank, e.g. one per
         detector when its chunks are on several ranks); kept on rank 0 and
         broadcast at each product (one small allreduce). solve() returns them
-        in info["shared_amplitudes"] on every rank.
+        in info["shared_amplitudes"] on every rank. Several templates with
+        one amplitude each in the chunk can be one entry, `values` (n, ncol)
+        and `labels` (ncol,): applied in one pass over the chunk (P and P^T)
+        instead of one per template.
     template_dtype : np.float32 (default) or np.float64
         Storage of the template values: `values` of this dtype are used
         without copies (unless some of their samples are not applied, which
@@ -698,9 +738,7 @@ class GLS:
         self.nloc = self.hi - self.lo
         self._nsky = self.ncomp * self.nloc
 
-        cov = np.zeros((self.nobs, 7))
-        for k, ip in enumerate(self.ip):
-            _coverage(ip, *self._pol_arrays(k)[1:], self.pol, cov)
+        cov = self._chunk_coverage()
         # P^T: each thread owns a range of pixels holding ~1/nthreads of this
         # rank's samples
         nt = min(self.nthreads, numba.config.NUMBA_NUM_THREADS)
@@ -758,9 +796,10 @@ class GLS:
                 self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
             for k, ip in enumerate(self.ip):
                 bad = ~self._solved[np.minimum(ip, self.nobs - 1)] & (ip < self.nobs)
-                if bad.any():  # copies: the arrays may be the caller's
+                if bad.any():  # copies: the arrays may be the caller's (none if 0 already)
                     for tmpl in (self._tmpl[k], self._shared[k]):
-                        tmpl[:] = [(np.where(bad, 0, v).astype(v.dtype, copy=False), lab) for v, lab in tmpl]
+                        tmpl[:] = [(np.where(bad.reshape(-1, *[1] * (v.ndim - 1)), 0, v).astype(v.dtype, copy=False)
+                                    if np.any(v[bad] != 0) else v, lab) for v, lab in tmpl]
         diag = self._template_diag(self._shared, self.nshared)
         diag = diag if comm is None else comm.allreduce(diag)
         self._locprec = np.concatenate([self._flagprec, self._inverse(self._template_diag(self._tmpl, self.namp)),
@@ -770,26 +809,44 @@ class GLS:
         """Per chunk, the (values, labels) of its templates (0 where not applied;
         values of template_dtype, labels int32 or one int), and the number of
         amplitudes. Copies only where needed."""
-        out, n = [[] for _ in self.ip], 0
-        for k, values, labels in templates or []:
+        templates = list(templates or [])
+
+        def parse(entry):
+            """(k, values, labels, number of amplitudes) of one entry, or None."""
+            k, values, labels = entry
             bad = self.ip[k] >= self.nobs
+            if np.ndim(values) == 2:  # columns with one amplitude each
+                labels = np.asarray(labels, dtype=np.int64)
+                if labels.shape != (np.shape(values)[1],) or np.any(labels < 0):
+                    raise ValueError("2D template values need one label >= 0 per column")
+                values = np.ascontiguousarray(values, dtype=self.template_dtype)
+                if bad.any() and np.any(values[bad] != 0):
+                    values = np.where(bad[:, None], 0, values).astype(self.template_dtype, copy=False)
+                return k, values, labels, int(labels.max(initial=-1)) + 1
             if np.ndim(labels) == 0:
                 labels = int(labels)
                 if labels < 0:
-                    continue
-                n = max(n, labels + 1)
+                    return None
+                n = labels + 1
             else:
                 labels = np.asarray(labels)
                 bad = bad | (labels < 0)
-                n = max(n, int(labels.max(initial=-1)) + 1)
+                n = int(labels.max(initial=-1)) + 1
             values = np.asarray(values, dtype=self.template_dtype)
-            if bad.any():
+            if bad.any() and np.any(values[bad] != 0):  # e.g. a mask of the calibration: 0 already, no copy
                 values = np.where(bad, 0, values).astype(self.template_dtype, copy=False)
                 if np.ndim(labels):
                     labels = np.where(bad, 0, labels)
             if np.ndim(labels):
                 labels = labels.astype(np.int32, copy=False)
-            out[k].append((values, labels))
+            return k, values, labels, n
+
+        nw = min(self.nthreads, len(templates))  # numpy on whole chunks: the threads run in parallel
+        out, n = [[] for _ in self.ip], 0
+        for r in (map(parse, templates) if nw <= 1 else self._workers(nw).map(parse, templates)):
+            if r is not None:
+                out[r[0]].append((r[1], r[2]))
+                n = max(n, r[3])
         return out, n
 
     def _template_diag(self, tmpls, n):
@@ -823,7 +880,8 @@ class GLS:
         def chunk(k):
             """(amplitude, v^T C v) of each amplitude of chunk k."""
             (c, wm), out, m_chunk = kernels[id(self.weights[k]), self._nfft[k]], [], self._nfft[k]
-            for values, labels in tmpls[k]:
+            entries = [(v[:, j], int(lab[j])) for v, lab in tmpls[k] if np.ndim(v) == 2 for j in range(v.shape[1])]
+            for values, labels in [e for e in tmpls[k] if np.ndim(e[0]) == 1] + entries:
                 if np.ndim(labels) == 0:  # one amplitude in the whole chunk: no sort
                     nz = np.flatnonzero(values)
                     if nz.size:
@@ -859,6 +917,27 @@ class GLS:
             for a, x in out:  # in the order of the chunks: the same sums as serial
                 diag[a] += x
         return diag
+
+    def _chunk_coverage(self):
+        """The coverage (nobs, 7) of this rank's chunks (see _coverage): the
+        chunks in parallel, worker j on chunks j, j + nw, ... into its own
+        array, summed in a fixed order (8 workers at most: 56 bytes per pixel
+        each)."""
+        nw = min(self.nthreads, len(self.ip), 8)
+        covs = np.zeros((max(nw, 1), self.nobs, 7))
+        nmax = max((ip.size for ip in self.ip), default=0)
+        dtype = self._c2.dtype if self.pol else np.float32
+
+        def work(j):
+            c2, s2 = (np.empty(nmax, dtype), np.empty(nmax, dtype)) if self.pol else (self._dummy, self._dummy)
+            for k in range(j, len(self.ip), max(nw, 1)):
+                n = self.ip[k].size
+                if self.pol:
+                    _cos_sin_1(self.angle2[k], self.gamma[k], c2[:n], s2[:n], _TRIG_COS, _TRIG_SIN)
+                _coverage(self.ip[k], c2[:n] if self.pol else c2, s2[:n] if self.pol else s2, self.pol, covs[j])
+
+        list(map(work, range(nw)) if nw <= 1 else self._workers(nw).map(work, range(nw)))
+        return covs.sum(axis=0) if nw > 1 else covs[0]
 
     def _workers(self, nw):
         """The thread pool of the chunk workers, with at least `nw` threads."""

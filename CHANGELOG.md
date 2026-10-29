@@ -4,6 +4,29 @@
 
 Changes on `main` that are not in a release yet.
 
+- The shared templates of a chunk with one amplitude each (e.g. the sky and
+  beam templates, one amplitude per detector) are the columns of one array,
+  applied in one pass over the chunk in P and P^T instead of one per
+  template; `make_maps` passes them so, and `GLS` takes them as
+  `(chunk, values (n, ncol), labels (ncol,))`. On one G100 node (96 chunks
+  of a day, 48 threads, 8 templates, the gains, 17% flagged), one PCG
+  iteration: 2.57 → 2.14 s (1.85 s without the templates).
+- `CalibrationParameters(covariance_fixed_gains=True)`: `template_covariance`
+  with the gains fixed at their fitted values instead of marginalized over.
+  The gains couple to the sky templates through the sky signal in the gain
+  template and slow down the solves of the covariance (~2x their
+  iterations); fixed, the errors were 0.05–0.13% smaller in a test. Default
+  `False`.
+- Setup: the coverage of the chunks in parallel (8 private arrays, summed in
+  a fixed order); the templates parsed in parallel, without copies when
+  their flagged samples are already 0 (e.g. with the mask of the gains).
+- 1-year e2e run on G100 (M1_L, 1 detector per process, 48 threads,
+  calibration with a |b| > 10° mask, 3 iterations, 7 templates): GLS 2005 →
+  1561 s (PCG 958 → 667 s, setup 392 → 274 s), same iterations, gains and
+  amplitudes; with `template_covariance`, `covariance_tol=1e-6` and
+  `covariance_fixed_gains=True`, GLS 10683 → 4093 s (the covariance in 324
+  PCG iterations instead of 914), the same errors to the digits printed.
+
 - Steps outside the PCG, measured on a 1-year e2e run on G100 (M1_L, 1
   detector per process, 48 threads, calibration with a |b| > 10° mask, 3
   iterations, 7 templates): GLS 3161 → 2005 s, same iterations, gains and
