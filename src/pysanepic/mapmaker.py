@@ -19,7 +19,7 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
-from .gls import _TRIG_COS, _TRIG_SIN, _axpy, _calibrated, _fill_columns, _project_iqu
+from .gls import _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu
 
 
 _COORDINATES = ("E", "G", "C")
@@ -904,7 +904,8 @@ def _sample(x, d, pix, angle, loc, nthreads):
     tod = ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
     if x.shape[0] == 3:
         q, u = ducc0.sht.synthesis_general(alm=x[1:], spin=2, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)
-        tod += d.pol_efficiency * (q * np.cos(2 * angle) + u * np.sin(2 * angle))
+        with numba_threads(nthreads):  # one parallel pass, cos and sin from a table (numpy: ~10 serial passes)
+            _add_pol(tod, q, u, np.asarray(angle, dtype=float), float(d.pol_efficiency), _TRIG_COS, _TRIG_SIN)
     return tod
 
 
