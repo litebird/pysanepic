@@ -1673,3 +1673,69 @@ def test_project_maps():
     for nthreads in (1, 4):
         assert np.allclose(_project_maps(maps, pix, angle, 0.9, nthreads), want, rtol=0, atol=1e-13)  # 2a up to 40 rad
     assert np.allclose(_project_maps(maps[:1], pix, angle, 0.9), m[0, pix], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("nthreads", [1, 4])
+def test_shared_template_columns(nthreads):
+    """Several shared templates of a chunk as the columns of one 2D array (one
+    pass in the PCG products): the same solution, amplitudes and
+    preconditioner as separate templates, with flagged samples."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(17)
+    npix, ns, nchunk = 40, 300, 6
+    pix = rng.integers(0, npix, (nchunk, ns))
+    pix[1, 50:60] = -1 - np.arange(10)
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    cols = [rng.normal(size=(ns, 3)) for _ in range(nchunk)]
+    labels = [np.array([k % 2, 2 + k % 2, 4]) for k in range(nchunk)]
+    separate = [(k, cols[k][:, j], labels[k][j]) for k in range(nchunk) for j in range(3)]
+    stacked = [(k, cols[k], labels[k]) for k in range(nchunk)]
+    res = []
+    for shared in (separate, stacked):
+        g = GLS(pix, psi, w, nthreads=nthreads, min_pol_rcond=0.0, shared_templates=shared, template_dtype=np.float64,
+                shared_groups=[np.array([0, 1])])
+        x, info = g.solve(tod, tol=1e-24, maxiter=500)
+        assert info["converged"]
+        res.append((x, info["shared_amplitudes"], g._locprec))
+    for a, b in zip(*res):
+        assert np.allclose(a, b, rtol=1e-9, atol=1e-9 * np.abs(b).max())
+
+
+def test_covariance_fixed_gains():
+    """template_covariance with calibration: the gains marginalized (default)
+    or fixed at their fitted values (covariance_fixed_gains): the same
+    labels, errors a little smaller with the gains fixed, the same
+    amplitudes."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per = 8, 60_000, 10.0, 6000
+    rng = np.random.default_rng(23)
+    npix = 12 * nside**2
+    sky = hp.smoothing(rng.normal(0, 1e-4, (3, npix)), fwhm=np.radians(15))
+    fg = hp.smoothing(rng.normal(0, 3e-4, (3, npix)), fwhm=np.radians(15))
+    noise = OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4)
+    t = np.arange(n)
+    data = []
+    for i, pol in enumerate(np.radians([0, 90, 45, 135])):
+        theta, phi, psi = _scan(n, rng)
+        pix, ang = hp.ang2pix(nside, theta, phi), psi + pol
+        proj = lambda m: m[0, pix] + m[1, pix] * np.cos(2 * ang) + m[2, pix] * np.sin(2 * ang)  # noqa: E731
+        vec = np.array(hp.ang2vec(theta, phi)).T
+        dipole = 3.4e-3 * np.array([0.3, -0.5, 0.8]) @ vec + 2.7e-4 * np.sin(2 * np.pi * t / n + i)
+        gain = 1 + 1e-3 * rng.normal(size=n // per)
+        tod = gain[t // per] * (proj(sky) + (i - 1.5) * 0.02 * proj(fg) + dipole) + 1e-6 * rng.normal(size=n)
+        data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                                 sampling_rate_hz=fs, noise=noise, pol_angle_rad=pol, name=f"d{i}", dipole=dipole))
+    out = []
+    for fixed in (False, True):
+        r = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1500.0, tol=1e-14, covariance_tol=1e-12),
+                      templates={"fg": Template(sky=fg, sum_zero=True)}, template_covariance=True,
+                      calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=2, covariance_fixed_gains=fixed))
+        out.append(r)
+    (a, b) = (np.sqrt(np.diag(r.template_covariance["matrix"])) for r in out)
+    assert out[0].template_covariance["labels"] == out[1].template_covariance["labels"]
+    assert np.all(b < a) and np.all(b > 0.9 * a), b / a
+    assert all(out[0].templates["fg"][k] == out[1].templates["fg"][k] for k in out[0].templates["fg"])

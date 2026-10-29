@@ -21,7 +21,10 @@ use `solve`. `common_modes` correlates chunks observed at the same times, and
 with the map (the TOD of the chunk gets `values * a[labels]`, labels -1: none;
 amplitudes local to each process, returned in `info["amplitudes"]`;
 `shared_templates` have amplitudes shared by all the processes, with
-`shared_groups` summing to zero, in `info["shared_amplitudes"]`; see
+`shared_groups` summing to zero, in `info["shared_amplitudes"]`; several
+templates with one amplitude each in a chunk can be given as the columns of
+one array, `(chunk, values (n, ncol), labels (ncol,))`, applied in one pass
+over the chunk instead of one per template; see
 {class}`~pysanepic.GLS`). `apply_A` and `rhs` are not available with templates.
 `shared_covariance()` gives the covariance of the shared amplitudes (one PCG
 solve each), `set_templates` replaces the templates keeping the rest of the setup, and

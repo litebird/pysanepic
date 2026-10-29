@@ -270,6 +270,7 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 | `n_iter` | Calibration iterations, each a GLS solve (default 2: enough when the noise dominates; more for noiseless tests). The setup of the GLS is built once and reused, and each solve starts from the previous maps |
 | `gain_tol` | Stop the iterations when the largest absolute gain correction $\delta g$ (all detectors and periods) is below it; `n_iter` is then the maximum, and `MapResult.calibration_iterations` the number done (default `None`: always `n_iter`). The convergence is geometric, slower for periods with a weak dipole and much slower with samples left out of some fits only (a gain mask but templates on the whole sky) |
 | `cache_model` | Keep the TOD of the sky model and of the sky templates in memory between the iterations, instead of computing them again (default `False`; 8 bytes per sample each) |
+| `covariance_fixed_gains` | With `template_covariance=True`: the covariance with the gains fixed at their fitted values instead of marginalized over (default `False`). The gains couple to the sky templates through the sky signal in the gain template and slow down the solves of the covariance; fixed, the errors were 0.05–0.13% smaller in a test, and the covariance of a 1-year e2e run took 3 times fewer PCG iterations |
 | `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the gain fit (e.g. the Galactic plane), as the usual masks; also the mask of the templates without their own (`Template.mask`, see [below](#masks)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
 
 The absolute calibration comes from the orbital dipole: a gain common to all
@@ -353,7 +354,10 @@ period (and the gains): the corresponding block of the inverse of the GLS
 operator, for the noise model of the data. It costs one more PCG solve per
 amplitude (with calibration, after the last iteration), to
 `GLSParameters.covariance_tol` (default 1e-6: the errors to ~1e-4, with ~1/3
-fewer iterations than the `tol` of the maps). It shows which
+fewer iterations than the `tol` of the maps). With calibration,
+`CalibrationParameters(covariance_fixed_gains=True)` keeps the gains fixed
+instead of marginalizing over them: the errors are ~0.1% smaller, and the
+solves much faster (see [calibration](#calibration)). It shows which
 templates are degenerate: e.g. with the derivatives of the foregrounds to
 first and second order, the two amplitudes of a detector are strongly
 correlated and individually poorly measured, while the maps are not
