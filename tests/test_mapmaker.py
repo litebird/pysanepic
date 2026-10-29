@@ -1739,3 +1739,29 @@ def test_covariance_fixed_gains():
     assert out[0].template_covariance["labels"] == out[1].template_covariance["labels"]
     assert np.all(b < a) and np.all(b > 0.9 * a), b / a
     assert all(out[0].templates["fg"][k] == out[1].templates["fg"][k] for k in out[0].templates["fg"])
+
+
+def test_sample_alm():
+    """A sky model as alm sampled at the pointing: I + gamma (Q cos 2a + U sin 2a)
+    with Q, U from ducc0, combined by the numba kernel, against numpy, for any
+    angle and 1 or 4 threads."""
+    import ducc0
+
+    from pysanepic.mapmaker import _sample
+
+    rng = np.random.default_rng(29)
+    lmax, n = 32, 20_000
+    nalm = (lmax + 1) * (lmax + 2) // 2
+    alm = rng.normal(size=(3, nalm)) + 1j * rng.normal(size=(3, nalm))
+    alm[:, : lmax + 1] = alm[:, : lmax + 1].real
+    loc = np.stack([np.arccos(rng.uniform(-1, 1, n)), rng.uniform(0, 2 * np.pi, n)], axis=1)
+    angle = rng.uniform(-20, 20, n)
+    d = DetectorData(tod=np.zeros(n), pointing=Pointing(theta=loc[:, 0], phi=loc[:, 1], psi=np.zeros(n), coordinates="G"),
+                     sampling_rate_hz=10.0, noise=OneOverFNoise(net_ukrts=40.0), pol_efficiency=0.9)
+    kw = dict(lmax=lmax, loc=loc, epsilon=1e-10)
+    i = ducc0.sht.synthesis_general(alm=alm[:1], spin=0, **kw)[0]
+    q, u = ducc0.sht.synthesis_general(alm=alm[1:], spin=2, **kw)
+    want = i + 0.9 * (q * np.cos(2 * angle) + u * np.sin(2 * angle))
+    for nthreads in (1, 4):
+        got = _sample(alm, d, np.zeros(n, int), angle, loc, nthreads)
+        assert np.allclose(got, want, rtol=0, atol=1e-13 * np.abs(want).max())  # 2a up to 40 rad

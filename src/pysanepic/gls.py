@@ -327,6 +327,24 @@ def _project_iqu(m, pix, angle, gamma, tc, ts, out):
 
 
 @numba.njit(parallel=True, cache=True)
+def _add_pol(tod, q, u, angle, gamma, tc, ts):
+    """tod += gamma (q cos 2a + u sin 2a), a = angle (any value): the
+    polarized part of a sky model sampled at the pointing, in one pass. cos and
+    sin as in _cos_sin."""
+    n = tc.size
+    step = 2 * np.pi / n
+    for i in numba.prange(tod.size):
+        x = 2.0 * angle[i] + np.pi
+        x -= 2 * np.pi * np.floor(x / (2 * np.pi))
+        k = min(max(int(x / step), 0), n - 1)
+        d = x - k * step
+        d2 = d * d
+        cd = 1.0 - d2 * (0.5 - d2 / 24.0)
+        sd = d * (1.0 - d2 * (1.0 / 6.0 - d2 / 120.0))
+        tod[i] += gamma * (q[i] * (tc[k] * cd - ts[k] * sd) + u[i] * (ts[k] * cd + tc[k] * sd))
+
+
+@numba.njit(parallel=True, cache=True)
 def _calibrated(tod, gain, period, dipole, known, out):
     """out = tod / gain[period] - dipole - known."""
     for i in numba.prange(tod.size):

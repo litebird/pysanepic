@@ -4,6 +4,16 @@
 
 Changes on `main` that are not in a release yet.
 
+- Sky model and sky templates given as alm: the polarized part sampled at
+  the pointing, gamma (Q cos 2a + U sin 2a), is combined by a numba kernel
+  on all the threads (cos and sin from the table of the PCG) instead of ~10
+  serial numpy passes with `np.cos` and `np.sin` for each field. On one G100
+  node (48 threads, lmax 1536, one day at 37.5 Hz), the 4 fields of the e2e
+  run (sky model, bandpass, angle and FWHM templates): 1.14 → 0.44 s per
+  day, the rest being `ducc0.sht.synthesis_general`. Once per run with
+  `cache_model`, else at each calibration iteration. New test
+  `test_sample_alm`.
+
 - The shared templates of a chunk with one amplitude each (e.g. the sky and
   beam templates, one amplitude per detector) are the columns of one array,
   applied in one pass over the chunk in P and P^T instead of one per
