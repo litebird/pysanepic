@@ -351,7 +351,9 @@ of the calibrated TOD.
 detector and common, marginalized over the maps and the amplitudes per
 period (and the gains): the corresponding block of the inverse of the GLS
 operator, for the noise model of the data. It costs one more PCG solve per
-amplitude (with calibration, after the last iteration). It shows which
+amplitude (with calibration, after the last iteration), to
+`GLSParameters.covariance_tol` (default 1e-6: the errors to ~1e-4, with ~1/3
+fewer iterations than the `tol` of the maps). It shows which
 templates are degenerate: e.g. with the derivatives of the foregrounds to
 first and second order, the two amplitudes of a detector are strongly
 correlated and individually poorly measured, while the maps are not

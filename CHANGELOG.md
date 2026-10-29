@@ -4,6 +4,33 @@
 
 Changes on `main` that are not in a release yet.
 
+- Steps outside the PCG, measured on a 1-year e2e run on G100 (M1_L, 1
+  detector per process, 48 threads, calibration with a |b| > 10° mask, 3
+  iterations, 7 templates): GLS 3161 → 2005 s, same iterations, gains and
+  amplitudes. Sums over the 4 solves:
+  - the setup of the preconditioner sorted the samples of each chunk over
+    the labels of all the unknowns of flagged samples of the process (200
+    million in a year with the mask), not only those of the chunk: 262 →
+    93 s;
+  - `GLS.binned` (the binned map of the sky model, at each calibration
+    iteration) uses the coverage of the setup, kept (56 bytes per pixel,
+    divided among the processes), instead of computing it again serially,
+    and one buffer for the flagged samples instead of one per chunk: 427 →
+    12 s;
+  - the preconditioner of an amplitude spanning more than a quarter of the
+    FFT of its chunk (e.g. one per detector) takes one FFT of that length
+    instead of two of twice its span, and no sort; exact: 251 → 67 s;
+  - the projection of the residual map for the gain template, and the
+    known part and calibration of the TOD, are numba kernels on all the
+    threads (cos and sin from the table of the PCG) instead of serial
+    numpy: 347 → 52 s.
+  New tests `test_setup_flagged_exact`, `test_template_diag_exact`
+  (the preconditioners against dense matrices) and `test_project_maps`.
+- `GLSParameters.covariance_tol` (default 1e-6): the tolerance of the PCG
+  solves of `template_covariance`, one per amplitude, which used `tol`. In a
+  test with calibration and bandpass, angle and FWHM templates, sigma to
+  4e-5 and correlations to 8e-4 against 1e-10, with 1/3 fewer iterations.
+
 ## 0.6.0 (2026-10-28)
 
 - PCG products and template preconditioner: **one chunk per thread** (FFTs

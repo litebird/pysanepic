@@ -672,7 +672,7 @@ def test_tod_templates():
         dd = dataclasses.replace(d, tod=d.tod + g[t // per] * extra, name=f"d{i}", templates=tt)
         cal_data.append(dd)
         flat.append(dataclasses.replace(dd, tod=dd.tod / g[t // per] - d.dipole, dipole=None))
-    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, covariance_tol=1e-20, min_pol_rcond=0.0, angle_dtype=np.float64)
     cal = CalibrationParameters(gain_period_s=per / fs, n_iter=3)
     for dd, c in ((flat, None), (cal_data, cal)):
         r = make_maps(dd, nside, coordinates="E", params=params, calibration=c, templates=tmpl,
@@ -1586,3 +1586,90 @@ def test_chunk_threads(monkeypatch, private):
         res.append((x, info["amplitudes"], info["shared_amplitudes"], g._locprec))  # template preconditioner too
     for a, b in zip(*res):
         assert np.allclose(a, b, rtol=1e-8, atol=1e-8 * np.abs(b).max())
+
+
+def test_setup_flagged_exact():
+    """Setup with the unknowns of flagged samples in several chunks (one per
+    sample and one per run): the preconditioner of the pixels and of the
+    unknowns is the diagonal of P^T N^-1 P, computed here with dense
+    matrices (N^-1 the circulant of each chunk, cut to the chunk)."""
+    from pysanepic import GLS, one_over_f_weights
+    from pysanepic.gls import fast_fft_length
+
+    rng = np.random.default_rng(5)
+    npix, ns, nchunk = 30, 200, 4
+    m = fast_fft_length(ns + 37)
+    pix = rng.integers(0, npix, (nchunk, ns))
+    pix[0, 10:20] = -1 - np.arange(10)  # one unknown per sample
+    pix[2, 50:80] = -1  # one per run
+    pix[2, 120:125] = -2
+    pix[3, 0:5] = -1 - np.arange(5)
+    w = one_over_f_weights(m, 10.0, 1.0, 0.5, 1.0, 0.05)
+    c = np.fft.irfft(w, n=m)  # first row of the circulant N^-1
+    g = GLS(pix, None, [w] * nchunk, fft_lengths=m)
+    blocks, unknowns = np.zeros(npix), []
+    for k in range(nchunk):
+        lag = np.subtract.outer(np.arange(ns), np.arange(ns)) % m
+        C = c[lag]
+        good = pix[k] >= 0
+        P = np.zeros((ns, npix))
+        P[np.flatnonzero(good), pix[k, good]] = 1.0
+        blocks += np.diag(P.T @ C @ P)
+        for lab in np.unique(pix[k, ~good]):  # the unknowns of a chunk in the order of np.unique
+            u = (pix[k] == lab).astype(float)
+            unknowns.append(u @ C @ u)
+    assert g.nflag == len(unknowns) == 10 + 2 + 5
+    assert np.allclose(1 / g.precond[0], blocks, rtol=1e-10)
+    assert np.allclose(1 / g._flagprec, unknowns, rtol=1e-10)
+
+
+def test_template_diag_exact():
+    """The preconditioner of the template amplitudes is the diagonal of
+    T^T N^-1 T, with N^-1 the circulant of each chunk cut to the chunk:
+    short amplitudes (FFT of twice their span), long ones (one FFT of the
+    chunk), one per chunk (an int label) and with samples left out (0)."""
+    from pysanepic import GLS, one_over_f_weights
+    from pysanepic.gls import fast_fft_length
+
+    rng = np.random.default_rng(9)
+    npix, ns, nchunk = 30, 400, 3
+    m = fast_fft_length(ns + 21)
+    pix = rng.integers(0, npix, (nchunk, ns))
+    w = one_over_f_weights(m, 10.0, 1.0, 0.5, 1.0, 0.05)
+    c = np.fft.irfft(w, n=m)
+    C = c[np.subtract.outer(np.arange(ns), np.arange(ns)) % m]
+    local = []
+    for k in range(nchunk):
+        v = rng.normal(size=ns)
+        v[150:170] = 0.0  # left out
+        local.append((k, v, 5 * k + np.minimum(np.arange(ns) // 40, 4)))  # 4 short amplitudes and a long one
+    shared = [(k, rng.normal(size=ns), k % 2) for k in range(nchunk)]
+    g = GLS(pix, None, [w] * nchunk, fft_lengths=m, templates=local, shared_templates=shared, template_dtype=np.float64)
+    want = np.zeros(5 * nchunk)
+    for k, v, lab in local:
+        for a in np.unique(lab):
+            u = np.where(lab == a, v, 0.0)
+            want[a] += u @ C @ u
+    want_sh = np.zeros(2)
+    for k, v, a in shared:
+        want_sh[a] += v @ C @ v
+    assert np.allclose(1 / g._locprec[g.nflag : g.nflag + g.namp], want, rtol=1e-10)
+    assert np.allclose(1 / g._locprec[g.nflag + g.namp :], want_sh, rtol=1e-10)
+
+
+def test_project_maps():
+    """P m of maps (the gain template and map sky models): the numba kernel
+    against numpy, with UNSEEN pixels (taken as 0) and any angle."""
+    from pysanepic.mapmaker import _project_maps
+
+    rng = np.random.default_rng(3)
+    maps = rng.normal(size=(3, 48))
+    maps[1:, :5] = hp.UNSEEN
+    maps[0, 7] = hp.UNSEEN
+    pix = rng.integers(0, 48, 5000)
+    angle = rng.uniform(-20, 20, 5000)
+    m = np.where(maps == hp.UNSEEN, 0.0, maps)
+    want = m[0, pix] + 0.9 * (m[1, pix] * np.cos(2 * angle) + m[2, pix] * np.sin(2 * angle))
+    for nthreads in (1, 4):
+        assert np.allclose(_project_maps(maps, pix, angle, 0.9, nthreads), want, rtol=0, atol=1e-13)  # 2a up to 40 rad
+    assert np.allclose(_project_maps(maps[:1], pix, angle, 0.9), m[0, pix], rtol=0, atol=0)
