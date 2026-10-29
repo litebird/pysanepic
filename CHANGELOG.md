@@ -4,6 +4,15 @@
 
 Changes on `main` that are not in a release yet.
 
+- `GLSParameters.sample_batch` (default 1): with a sky model or sky
+  templates as alm, the number of `DetectorData` interpolated together, one
+  `ducc0.sht.synthesis_general` call per field, whose fixed cost (a
+  spherical harmonic transform at the lmax of the alm) is then shared. On
+  G100 (lmax 1536, 48 threads) 8 `DetectorData` of a day per call take ~3
+  times less per day; with `DetectorData` of a week or more the cost is
+  amortized already. ~50 bytes per sample of the batch. New docs section
+  "Sampling alm models" (performance) and test `test_sample_batch`.
+
 - Sky model and sky templates given as alm: the polarized part sampled at
   the pointing, gamma (Q cos 2a + U sin 2a), is combined by a numba kernel
   on all the threads (cos and sin from the table of the PCG) instead of ~10

@@ -380,6 +380,21 @@ class GLSParameters:
         N = 1); with common modes 1 halves the iterations (46 -> 21 on G100,
         -33% time). None: no coarse level (the preconditioner of pysanepic
         0.4, where 0 meant this). The maps are the same within the tolerance.
+    sample_batch : with a sky model or sky templates given as alm, the number
+        of DetectorData whose samples are interpolated together, one
+        ducc0.sht.synthesis_general call per field (once with
+        CalibrationParameters.cache_model, else at each calibration
+        iteration). Each call has a fixed cost, a spherical harmonic
+        transform at the lmax of the alm, comparable at lmax 1536 to
+        interpolating one day at 37.5 Hz (G100: 0.04 s spin 0, 0.06 s spin 2,
+        48 threads): 8 DetectorData of a day per call take ~3 times less per
+        day, 32 ~3.5 times. Useful with short DetectorData (e.g. litebird_sim
+        observations of a day); with DetectorData of a week or more the cost
+        is amortized already. 1 (default): one call per DetectorData. Costs
+        ~50 bytes per sample of the batch, and the batch is read from `data`
+        before it is processed (a generator yields `sample_batch` items at
+        a time). The samples are the same within the epsilon of the
+        interpolation (1e-10, or 1e-6 for complex64 alm).
     """
 
     chunk_s: float = 3600.0
@@ -397,6 +412,7 @@ class GLSParameters:
     fft_dtype: type = np.float64
     coarse_nside: int | None = 0
     template_dtype: type = np.float32
+    sample_batch: int = 1
 
 
 @dataclass(kw_only=True)
@@ -899,14 +915,48 @@ def _sample(x, d, pix, angle, loc, nthreads):
         return np.zeros(len(pix))
     if not np.iscomplexobj(x):
         return _project_maps(x, pix, angle, d.pol_efficiency, nthreads)
+    return _combine(_synthesis(x, loc, nthreads), d, angle, nthreads)
+
+
+def _synthesis(x, loc, nthreads):
+    """(I, Q, U) of the alm x (Q, U None for T only) at loc (n, 2)."""
     lmax = (int(np.sqrt(8 * x.shape[1] + 1)) - 3) // 2
     eps = 1e-6 if x.dtype == np.complex64 else 1e-10
-    tod = ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
-    if x.shape[0] == 3:
-        q, u = ducc0.sht.synthesis_general(alm=x[1:], spin=2, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)
+    i = ducc0.sht.synthesis_general(alm=x[:1], spin=0, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)[0]
+    if x.shape[0] < 3:
+        return i, None, None
+    q, u = ducc0.sht.synthesis_general(alm=x[1:], spin=2, lmax=lmax, loc=loc, epsilon=eps, nthreads=nthreads)
+    return i, q, u
+
+
+def _combine(iqu, d, angle, nthreads):
+    """I + gamma (Q cos 2a + U sin 2a) (a new array)."""
+    i, q, u = iqu
+    tod = np.array(i, dtype=float)
+    if q is not None:
         with numba_threads(nthreads):  # one parallel pass, cos and sin from a table (numpy: ~10 serial passes)
             _add_pol(tod, q, u, np.asarray(angle, dtype=float), float(d.pol_efficiency), _TRIG_COS, _TRIG_SIN)
     return tod
+
+
+def _sample_batch(fields, dets, nside, coordinates, nthreads):
+    """The TODs of the sky model and templates `fields` ({key: maps, alm or
+    None}) for several DetectorData, with one synthesis_general call per alm
+    field for all of them; returns, per DetectorData, (pix, angle, {key: TOD})."""
+    geo = [_pixels_and_angles(d, nside, coordinates, nthreads, loc=True) for d in dets]
+    loc = np.concatenate([g[2] for g in geo]) if len(geo) > 1 else geo[0][2]
+    bounds = np.cumsum([0] + [len(g[0]) for g in geo])
+    out = [(pix, angle, {}) for pix, angle, _ in geo]
+    for key, x in fields.items():
+        if x is None or not np.iscomplexobj(x):
+            for d, (pix, angle, tods) in zip(dets, out):
+                tods[key] = _sample(x, d, pix, angle, None, nthreads)
+            continue
+        i, q, u = _synthesis(x, loc, nthreads)
+        for j, (d, (_, angle, tods)) in enumerate(zip(dets, out)):
+            sl = slice(bounds[j], bounds[j + 1])
+            tods[key] = _combine((i[sl], None if q is None else q[sl], None if u is None else u[sl]), d, angle, nthreads)
+    return out
 
 
 def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=None):
@@ -918,6 +968,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     params = GLSParameters() if params is None else params
     if params.flag_method not in ("marginalize", "offset"):
         raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize' or 'offset'")
+    if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
+        raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
     nc = params.coarse_nside
     if nc is not None and (nc < 0 or (nc and (nc & (nc - 1) or nc > nside))):
         raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
@@ -943,8 +995,13 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         first = nchunk
         ndata += 1
         sample = fit is not None and (fit.cache is None or ndata not in fit.cache)
-        # the (theta, phi) only for alm models, not to keep them otherwise
-        pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=sample and fit.alm)
+        batch = presampled.pop(ndata, None)  # from _sample_batch (GLSParameters.sample_batch > 1)
+        if batch is not None:
+            pix, angle, tods = batch
+            loc = None
+        else:
+            # the (theta, phi) only for alm models, not to keep them otherwise
+            pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=sample and fit.alm)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
         flags, tod_all, tmpl, ttod, tlab = d.flags, d.tod, None, {}, {}
@@ -955,8 +1012,12 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 sky_tod, cached = fit.cache[ndata]
                 ttod = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
             else:
-                sky_tod = _sample(fit.sky, d, pix, angle, loc, nthreads)
-                ttod = {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in fit.skies.items()}
+                if batch is not None:
+                    sky_tod = tods.pop(None)
+                    ttod = tods
+                else:
+                    sky_tod = _sample(fit.sky, d, pix, angle, loc, nthreads)
+                    ttod = {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in fit.skies.items()}
                 if fit.cache is not None:
                     fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in ttod.items()}
             ttod.update({k: np.array(v, dtype=float) for k, v in (d.templates or {}).items()
@@ -1082,7 +1143,32 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         del pix, angle
         return list(range(first, nchunk))
 
-    for d in data:  # one detector (or group) at a time: only its pointings are in memory
+    presampled = {}  # DetectorData index -> (pix, angle, {None: sky model TOD, key: sky template TOD})
+    batching = fit is not None and fit.alm and params.sample_batch > 1
+
+    def batches():
+        """The items of `data`, sample_batch DetectorData at a time when the
+        alm models are sampled in this pass (their TODs then in `presampled`)."""
+        if not batching or (fit.cache is not None and fit.cache):  # sampled already (cache_model)
+            yield from data
+            return
+        it, first = iter(data), ndata + 1
+        while True:
+            items, dets = [], []
+            for d in it:
+                items.append(d)
+                dets += d.detectors if isinstance(d, DetectorGroup) else [d]
+                if len(dets) >= params.sample_batch:
+                    break
+            if not items:
+                return
+            fields = {None: fit.sky, **fit.skies}
+            for j, r in enumerate(_sample_batch(fields, dets, nside, coordinates, nthreads)):
+                presampled[first + j] = r
+            first += len(dets)
+            yield from items
+
+    for d in batches():  # one detector (or group) at a time: only its pointings are in memory (but a batch)
         if not isinstance(d, DetectorGroup):
             add(d)
             continue

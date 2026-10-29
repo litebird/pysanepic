@@ -289,7 +289,9 @@ channel), I or I/Q/U in K in the coordinates of the maps, as one array:
 
 - **alm** (complex, healpy order, mmax = lmax): interpolated at the exact
   pointing of each sample with `ducc0.sht.synthesis_general` (the `Pointing`
-  needs angles);
+  needs angles), one call per `DetectorData` and field, or per
+  `GLSParameters.sample_batch` `DetectorData` (see
+  [performance](performance.md#sampling-alm-models));
 - **HEALPix maps** at the output nside: sampled in the pixel.
 
 Its TOD is subtracted from the data and its binned map is put back in the
