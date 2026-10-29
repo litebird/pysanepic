@@ -556,7 +556,8 @@ only rotates the amplitudes of each detector.
 
 The helpers:
 
-- {func}`~pysanepic.fwhm_template`: the FWHM template, with `sum_zero=True`;
+- {func}`~pysanepic.fwhm_template`: the FWHM template, with `sum_zero=True`
+  (`sum_zero=False` with pointing offsets, see below);
 - {func}`~pysanepic.beam_templates`: the TODs of offsets and ellipticity
   for all the `DetectorData` (added to their `templates`), and the
   `Template` objects for them, with the constraints below;
@@ -595,6 +596,32 @@ beams["d0"]   # {"offset_x", "offset_y", "c_plus", "c_cross", "delta_sigma2",
   The common parts are absorbed by the maps only down to the pixel: the sky model should be smoothed with the mean beam of the
   detectors, or the rest of the structure below the pixel biases the fit (by
   ~1% in the test).
+- **Pointing offsets and calibration**: to second order an offset $\rho$
+  adds $\tfrac12 \rho^T \nabla\nabla^T s$ to the TOD, whose common part
+  (the mean over the detectors, and over the orientations given by the scan)
+  is a smoothing of the sky, $\delta\sigma^2 = \langle|\rho|^2\rangle/2$:
+  with `sum_zero=True` it is not in the model, and with calibration the
+  common gain absorbs it through the structure of `sky_model` below the
+  pixel. The bias grows as $\rho^2$. Give `fwhm_template(sky_alm)` with
+  `sum_zero=False` (`dataclasses.replace(t, sum_zero=False)`) when the
+  offsets are fitted: the FWHM amplitudes are then
+  $\delta\sigma^2_i + |\rho_i|^2/2$ with respect to `sky_model`, and
+  `beam_parameters` subtracts $|\rho_i|^2/2$. On G100 (litebird_sim, 4
+  detectors at 94 GHz, 1 year, beams, bands, polarization angles and gain
+  drifts all perturbed, 1/f noise, `sky_model` with the mean beam), the
+  common gain divided by the true one:
+
+  | pointing offsets (per axis) | FWHM `sum_zero=True` | FWHM `sum_zero=False` |
+  |---|---|---|
+  | none (offsets still fitted) | $1.000037$ | – |
+  | 10″ | $0.999875$ | $1.000013$ |
+  | 1′ | $0.99422$ | $0.999994$ |
+
+  (gain errors $1.6\times10^{-5}$ rms). With the free FWHM amplitudes their
+  mean is $1.20\times10^{-7}$ rad² for $\langle|\rho|^2\rangle/2 =
+  1.22\times10^{-7}$ rad² (1′), and the dipole left in the I map by the
+  wrong calibration drops from 19 µK to 0.02 µK (10″: from 0.41 to 0.04 µK);
+  Q/U and the fitted offsets do not change.
 - **Linearization**: the error on the fitted values is of second order. In
   a noiseless test (`tests/test_mapmaker.py::test_beam_templates`: FWHM
   2.4°, $\ell \le 47$, offsets of a few arcminutes and ellipticities of a
