@@ -1765,3 +1765,44 @@ def test_sample_alm():
     for nthreads in (1, 4):
         got = _sample(alm, d, np.zeros(n, int), angle, loc, nthreads)
         assert np.allclose(got, want, rtol=0, atol=1e-13 * np.abs(want).max())  # 2a up to 40 rad
+
+
+@pytest.mark.parametrize("calibrate", [False, True])
+def test_sample_batch(monkeypatch, calibrate):
+    """GLSParameters.sample_batch: the alm sky model and sky template of
+    several DetectorData interpolated in one synthesis_general call give the
+    same maps and amplitudes as one call per DetectorData (with calibration
+    and cache_model too, where the samples are kept)."""
+    from pysanepic import CalibrationParameters, mapmaker
+
+    calls = []
+    synthesis = mapmaker._synthesis
+    monkeypatch.setattr(mapmaker, "_synthesis", lambda *a: calls.append(len(a[1])) or synthesis(*a))
+    nside, n, fs, per = 16, 60_000, 10.0, 6000
+    if calibrate:
+        data, _, _ = _calibration_data(nside, n, fs, per)
+    else:
+        data, _ = _subpixel_data(nside, n, fs)
+    data = [dataclasses.replace(d, name=f"d{i}") for i, d in enumerate(data)]
+    lmax = 3 * nside - 1
+    rng = np.random.default_rng(31)
+    sky = hp.map2alm(hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(5)), lmax=lmax)
+    fg = 0.1 * hp.map2alm(hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(5)), lmax=lmax)
+    cal = CalibrationParameters(gain_period_s=per / fs, n_iter=2, cache_model=True) if calibrate else None
+    out = []
+    ncalls = []
+    for batch in (1, 3):  # 4 DetectorData: batches of 3 and 1
+        calls.clear()
+        params = GLSParameters(chunk_s=1200.0, tol=1e-20, angle_dtype=np.float64, sample_batch=batch)
+        out.append(make_maps(data, nside, coordinates="E", params=params, sky_model=sky, calibration=cal,
+                             templates={"fg": Template(sky=fg, sum_zero=True)}))
+        ncalls.append(len(calls))
+    assert ncalls == [8, 4], ncalls  # 2 fields x (4 DetectorData, or batches of 3 and 1), once with cache_model
+    a, b = out
+    seen = a.maps != hp.UNSEEN
+    assert np.allclose(a.maps[seen], b.maps[seen], rtol=0, atol=1e-9 * np.abs(a.maps[seen]).max())
+    assert all(abs(a.templates["fg"][k] - b.templates["fg"][k]) < 1e-8 for k in a.templates["fg"])
+    if calibrate:
+        assert max(np.abs(g - h).max() for g, h in zip(a.gains, b.gains)) < 1e-10
+    with pytest.raises(ValueError, match="sample_batch"):
+        make_maps(data, nside, coordinates="E", params=GLSParameters(sample_batch=0), sky_model=sky)

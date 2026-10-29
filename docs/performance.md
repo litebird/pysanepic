@@ -63,6 +63,33 @@ reads the pixel indices of the whole chunk but adds only the samples of its
 own pixels, so the threads share one map without races. Chunks of a
 `DetectorGroup` (common modes) are always processed this way.
 
+## Sampling alm models
+
+A sky model or sky templates given as alm are interpolated at the pointing
+with `ducc0.sht.synthesis_general`, once per run with
+`CalibrationParameters(cache_model=True)`, else at each calibration
+iteration. Each call has a fixed cost, a spherical harmonic transform at the
+lmax of the alm, before the interpolation proper, whose cost grows with the
+samples. On one G100 node (48 threads, lmax 1536):
+
+| samples per call | spin 0 | spin 2 |
+|---|---|---|
+| 1000 | 0.020 s | 0.036 s |
+| 1 day at 37.5 Hz | 0.041 s | 0.058 s |
+| 8 days, per day | 0.015 s | 0.019 s |
+| 32 days, per day | 0.012 s | 0.016 s |
+
+`make_maps` calls it once per `DetectorData` and field. With `DetectorData`
+of a day (e.g. litebird_sim observations of a day), `GLSParameters(
+sample_batch=8)` interpolates 8 of them in one call per field: ~3 times less
+per day, for ~50 bytes per sample of the batch (the batch is read from
+`data` before it is processed). With `DetectorData` of a week or more the
+fixed cost is amortized already, and longer litebird_sim observations do the
+same without the memory of the batch. The default is 1. The epsilon of the
+interpolation (1e-10, 1e-6 for complex64 alm) changes the time by ~10% only.
+The polarized part, gamma (Q cos 2a + U sin 2a), is combined in a numba
+kernel (cos and sin from the table of the PCG).
+
 ## Memory
 
 The TODs are used without copies, and $P$, $N^{-1}$ and $P^T$ are applied one
