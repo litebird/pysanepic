@@ -995,7 +995,7 @@ def test_blm_tods():
         t = beam_tods(d, _symmetric_sky(sky, b, pol), "E", offsets=False)
         h = fwhm**2 / (8 * np.log(2)) * (e - 1 / e) / 2
         pred = h * (np.cos(2 * (0.4 - pol)) * t["ell_plus"] + np.sin(2 * (0.4 - pol)) * t["ell_cross"])
-        got = blm_tods(d, sky, b, "E")
+        got = blm_tods(d, sky, b, "E", epsilon=1e-12)
         assert np.std(got - pred) < 1e-2 * np.std(got), e
         assert np.allclose(got + _convolve(sky, b - _asymmetric(b, lmax, mmax), d), _convolve(sky, b, d), atol=1e-12)
 
@@ -1031,7 +1031,7 @@ def test_blm_fixed_template():
     # model: an exact model, without the signal below the pixel size
     model = _symmetric_sky(sky, blms["d0"], 0.0)
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, angle_dtype=np.float64)
-    data, templates = blm_templates(full, sky, blms, "E")
+    data, templates = blm_templates(full, sky, blms, "E", epsilon=1e-12)
     assert templates == {"beam": Template(fixed=True)}
     ref = make_maps(sym, nside, "E", params, sky_model=model)
     r = make_maps(data, nside, "E", params, templates=templates, sky_model=model)
@@ -1045,10 +1045,48 @@ def test_blm_fixed_template():
     cal = CalibrationParameters(gain_period_s=n / 5 / fs, n_iter=3)
     t = np.arange(n) * 5 // n
     data, templates = blm_templates([dataclasses.replace(d, tod=g[t] * (d.tod + d.dipole)) for d, g in zip(full, gains)],
-                                    sky, blms, "E")
+                                    sky, blms, "E", epsilon=1e-12)
     r = make_maps(data, nside, "E", params, calibration=cal, templates=templates, sky_model=model)
     assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, gains)) < 1e-10
     assert np.abs(r.maps[1:, seen] - ref.maps[1:, seen]).max() < 1e-7 * scale
+
+
+def test_blm_kmax(monkeypatch):
+    """blm_tods with a beam of mmax = lmax (as generate_gauss_beam_alms): kmax
+    from the asymmetries, a few m, the TOD as with kmax = mmax to epsilon;
+    blm_templates: one Interpolator per detector for all its DetectorData."""
+    from pysanepic import blm_templates, blm_tods
+
+    rng = np.random.default_rng(3)
+    lmax, fwhm = 64, np.radians(3.0)
+    ell = np.arange(lmax + 1)
+    sky = np.array([hp.synalm(1 / (ell + 5.0) ** 2, lmax=lmax) for _ in range(3)])
+    b = _gauss_blm(lmax, lmax, fwhm, ellipticity=1.1, psi_ell=0.4, pol_angle=0.3)
+    built = []
+    interpolator = ducc0.totalconvolve.Interpolator
+
+    def counted(**kw):
+        built.append(kw["kmax"])
+        return interpolator(**kw)
+
+    monkeypatch.setattr(ducc0.totalconvolve, "Interpolator", counted)
+    data = []
+    for name in ("d0", "d0", "d1"):
+        theta, phi, psi = _scan(5000, rng)
+        data.append(DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                                 sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3,
+                                 name=name))
+    exact = blm_tods(data[0], sky, b, "E", kmax=lmax, epsilon=1e-12)
+    got = blm_tods(data[0], sky, b, "E")
+    assert built[1] < 12
+    assert np.std(got - exact) < 1e-5 * np.std(exact)
+    built.clear()
+    out, _ = blm_templates(data, sky, {"d0": b, "d1": b}, "E")
+    assert len(built) == 2 and [d.name for d in out] == ["d0", "d0", "d1"]
+    for d, o in zip(data, out):
+        assert np.array_equal(o.templates["beam"], blm_tods(d, sky, b, "E"))
+    with pytest.raises(ValueError, match="kmax"):
+        blm_tods(data[0], sky, b[:, :3 * (lmax + 1) - 3], "E", kmax=3)
 
 
 def test_template_helpers_errors():

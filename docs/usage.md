@@ -660,8 +660,7 @@ the maps: $m = 0$ for T and, for Q/U, the co-rotating part at $m = 2$,
 $(b^E_{\ell 2} - i b^B_{\ell 2})/2$, the only one a circular beam has. Each
 detector has its own $B_\text{sym}$: different FWHMs are left to
 {func}`~pysanepic.fwhm_template`. The convolution is
-`ducc0.totalconvolve.Interpolator` with $k_\text{max} = m_\text{max}$ of the
-beam, as in litebird_sim, so the conventions are those of the simulation:
+`ducc0.totalconvolve.Interpolator`, as in litebird_sim, so the conventions are those of the simulation:
 `blm` in the frame of the detector, with its polarization angle in it
 (`psi_pol_rad`), $\psi$ of the pointing as in litebird_sim.
 
@@ -687,10 +686,18 @@ result = make_maps(data, nside, coordinates="G", params=params, templates=templa
   not, so the beam needs the Mueller formalism (litebird_sim's
   `MuellerConvolver`); with an HWP the leakage of a common ellipticity is
   modulated away anyway.
-- **Cost**: one `Interpolator` per detector (its cube, of size
+- **Cost**: one `Interpolator` per detector, for all its `DetectorData`
+  (its cube, of size
   $\sim (2\ell_\text{max})(4\ell_\text{max})(2k_\text{max}+1)$ per
   component, is built and freed in turn) and one more TOD per detector,
-  kept in float64 in the model (it is not a GLS template).
+  kept in float64 in the model (it is not a GLS template). Building it and
+  interpolating both grow with $2k_\text{max}+1$: by default `kmax` is the
+  largest $m$ where the asymmetries have a coefficient above `epsilon`
+  (default 1e-6, the accuracy of the convolution) times their largest, a
+  few $m$ for an elliptical Gaussian ($m = 2k \sim e^k$), 10-15 for
+  ellipticities 1.05-1.2 at 30' and $\ell_\text{max}$ 1024, while
+  `generate_gauss_beam_alms` gives $m_\text{max} = \ell_\text{max}$. Pass
+  `kmax` to choose it.
 
 ### Masks
 
