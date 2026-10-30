@@ -24,6 +24,15 @@ Changes on `main` that are not in a release yet.
   removes the leakage of I into Q/U of an ellipticity common to the
   detectors, which no fit can separate from Q/U without HWP. No HWP yet.
   New tests `test_blm_tods`, `test_blm_fixed_template`. (#55)
+- `blm_tods` / `blm_templates`: `mmax` of the convolution (as litebird_sim's
+  `BeamConvolutionParameters.mmax`; default: the largest m where the
+  beam asymmetries are above `epsilon` of their largest coefficient, 10-15
+  for elliptical Gaussians, instead of all the m of the beam, up to lmax
+  with `generate_gauss_beam_alms`) and `epsilon` (default 1e-6, was 1e-10);
+  `blm_templates` builds one `Interpolator` per detector for all its
+  `DetectorData`. On a laptop (lmax 1024, 30' beams, beam mmax 20, 2M
+  samples) 2-25 times faster, 1e-7 off the exact template. New test
+  `test_blm_mmax`.
 - `blm_templates` / `blm_tods(model_bl=...)`: the window of the circular
   beam of the sky model (healpy's `gauss_beam(fwhm, pol=True)`); the fixed
   template is then the sky through each beam minus that circular beam, so
