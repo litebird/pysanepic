@@ -13,6 +13,7 @@ import functools
 import time
 import warnings
 from dataclasses import dataclass
+from enum import Enum
 
 import ducc0
 import healpy as hp
@@ -23,9 +24,31 @@ from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_we
 from .gls import _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu
 
 
-_COORDINATES = ("E", "G", "C")
+class Coordinates(str, Enum):
+    """Coordinate system of the pointings and of the maps, with the healpy
+    letters as values. It is a str: "E", "G" and "C" can be passed instead,
+    and compare equal to the members."""
+
+    Ecliptic = "E"
+    Galactic = "G"
+    Equatorial = "C"
+
+    def __str__(self):
+        return self.value
+
+
+def _coordinates(x, what):
+    """`x` ("E", "G", "C" or a Coordinates) as a Coordinates; ValueError otherwise."""
+    try:
+        return Coordinates(x)
+    except ValueError:
+        raise ValueError(f"{what} must be one of {[c.value for c in Coordinates]} (or a pysanepic.Coordinates), "
+                         f"not {x!r}") from None
+
+
 # astropy frames, as litebird_sim (ecliptic: BarycentricMeanEcliptic, equatorial: ICRS)
-_ASTROPY_FRAMES = {"E": "barycentricmeanecliptic", "G": "galactic", "C": "icrs"}
+_ASTROPY_FRAMES = {Coordinates.Ecliptic: "barycentricmeanecliptic", Coordinates.Galactic: "galactic",
+                   Coordinates.Equatorial: "icrs"}
 
 
 @functools.lru_cache
@@ -52,13 +75,14 @@ class Pointing:
       them as int32 to avoid a copy.
 
     `psi` is the orientation angle of the detector frame [rad] in
-    `coordinates`; `coordinates` is "E" (ecliptic), "G" (galactic) or "C"
-    (equatorial), with the astropy frames of litebird_sim
+    `coordinates`; `coordinates` is a :class:`Coordinates` or its value, "E"
+    (ecliptic), "G" (galactic) or "C" (equatorial), stored as a
+    :class:`Coordinates`, with the astropy frames of litebird_sim
     (BarycentricMeanEcliptic, Galactic, ICRS). The arrays are checked when the object is created.
     """
 
     psi: np.ndarray
-    coordinates: str
+    coordinates: Coordinates
     theta: np.ndarray | None = None
     phi: np.ndarray | None = None
     pix: np.ndarray | None = None
@@ -66,8 +90,7 @@ class Pointing:
     ordering: str = "RING"
 
     def __post_init__(self):
-        if self.coordinates not in _COORDINATES:
-            raise ValueError(f"Pointing.coordinates must be one of {_COORDINATES}, not {self.coordinates!r}")
+        object.__setattr__(self, "coordinates", _coordinates(self.coordinates, "Pointing.coordinates"))
         n = np.shape(self.psi)
         if len(n) != 1:
             raise ValueError("Pointing.psi must be a 1D array")
@@ -100,6 +123,7 @@ class Pointing:
         """(theta, phi, psi) in `coordinates`, phi in [0, 2 pi); needs angles, not pixels."""
         if self.pix is not None:
             raise ValueError("this needs a Pointing with angles (theta, phi), not pixels")
+        coordinates = _coordinates(coordinates, "coordinates")
         theta, phi, psi = self.theta, self.phi, self.psi
         if self.coordinates != coordinates:
             R = _rotation_matrix(self.coordinates, coordinates)
@@ -116,6 +140,7 @@ class Pointing:
     def _pixels_psi_loc(self, nside, coordinates, nthreads=1):
         """pixels_and_psi and the (theta, phi) of the samples, (n, 2), in
         `coordinates` (None for pixels): the angles are rotated only once."""
+        coordinates = _coordinates(coordinates, "coordinates")
         if self.pix is not None:
             if self.nside != nside or self.coordinates != coordinates:
                 raise ValueError(
@@ -326,7 +351,7 @@ class MapResult:
     maps: np.ndarray
     hit_map: np.ndarray
     nside: int
-    coordinates: str
+    coordinates: Coordinates
     iterations: int
     converged: bool
     residuals: np.ndarray
@@ -713,8 +738,9 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         local to this rank (possibly empty).
     nside : int
         HEALPix resolution of the output maps (RING ordering).
-    coordinates : str
-        Coordinate system of the output maps ("G", "E" or "C").
+    coordinates : Coordinates or str
+        Coordinate system of the output maps: a :class:`Coordinates` or "G",
+        "E" or "C" (MapResult.coordinates is a Coordinates).
     params : GLSParameters or None
         Settings of the map-maker; None: the defaults.
     comm : mpi4py communicator or None
@@ -760,8 +786,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         amplitudes per period: one more PCG solve per amplitude (with
         calibration, after the last iteration). False (default).
     """
-    if coordinates not in _COORDINATES:
-        raise ValueError(f"make_maps: coordinates must be one of {_COORDINATES}, not {coordinates!r}")
+    coordinates = _coordinates(coordinates, "make_maps: coordinates")
     sky = None if sky_model is None else _model(sky_model, nside, "sky_model")
     tmpls = dict(templates or {})
     if any(not isinstance(t, Template) for t in tmpls.values()):
