@@ -4,6 +4,8 @@
 
 Changes on `main` that are not in a release yet.
 
+- `make_maps` checks `coordinates` ("E", "G" or "C") instead of failing
+  later in healpy.
 - `Template(fixed=True)`: a known signal in the TOD model with amplitude 1
   (times the gain with calibration), not fitted and not put back in the
   maps; not in `MapResult.templates`.

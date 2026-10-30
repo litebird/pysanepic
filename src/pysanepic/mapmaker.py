@@ -745,6 +745,8 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         amplitudes per period: one more PCG solve per amplitude (with
         calibration, after the last iteration). False (default).
     """
+    if coordinates not in _COORDINATES:
+        raise ValueError(f"make_maps: coordinates must be one of {_COORDINATES}, not {coordinates!r}")
     sky = None if sky_model is None else _model(sky_model, nside, "sky_model")
     tmpls = dict(templates or {})
     if any(not isinstance(t, Template) for t in tmpls.values()):
