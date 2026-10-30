@@ -676,7 +676,7 @@ the only one a circular beam has. Which one is set by `model_bl`:
   with beams of the same symmetric part, or nearly circular ones.
 
 The convolution is `ducc0.totalconvolve.Interpolator`, as in litebird_sim
-(with $k_\text{max}$ from the asymmetries, see the cost below), so the
+(with $m_\text{max}$ from the asymmetries, see the cost below), so the
 conventions are those of the simulation: `blm` in the frame of the detector,
 with its polarization angle in it (`psi_pol_rad` = `DetectorData.pol_angle_rad`,
 which also orients the polarization of $B_\text{ref}$), $\psi$ of the pointing
@@ -721,16 +721,17 @@ result = make_maps(data, nside, coordinates="G", params=params, templates=templa
   modulated away anyway.
 - **Cost**: one `Interpolator` per detector, for all its `DetectorData`
   (its cube, of size
-  $\sim (2\ell_\text{max})(4\ell_\text{max})(2k_\text{max}+1)$ per
+  $\sim (2\ell_\text{max})(4\ell_\text{max})(2m_\text{max}+1)$ per
   component, is built and freed in turn) and one more TOD per detector,
   kept in float64 in the model (it is not a GLS template). Building it and
-  interpolating both grow with $2k_\text{max}+1$: by default `kmax` is the
+  interpolating both grow with $2m_\text{max}+1$: by default `mmax` is the
   largest $m$ where the asymmetries have a coefficient above `epsilon`
   (default 1e-6, the accuracy of the convolution) times their largest, a
   few $m$ for an elliptical Gaussian ($m = 2k \sim e^k$), 10-15 for
   ellipticities 1.05-1.2 at 30' and $\ell_\text{max}$ 1024, while
-  `generate_gauss_beam_alms` gives $m_\text{max} = \ell_\text{max}$. Pass
-  `kmax` to choose it.
+  `generate_gauss_beam_alms` gives the beam up to $m = \ell_\text{max}$.
+  Pass `mmax` to choose it (as litebird_sim's
+  `BeamConvolutionParameters.mmax`; `kmax` in ducc0).
 
 ### Masks
 

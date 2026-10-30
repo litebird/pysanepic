@@ -1056,9 +1056,10 @@ def test_blm_fixed_template():
     assert np.abs(r.maps[1:, seen] - ref.maps[1:, seen]).max() < 1e-7 * scale
 
 
-def test_blm_kmax(monkeypatch):
-    """blm_tods with a beam of mmax = lmax (as generate_gauss_beam_alms): kmax
-    from the asymmetries, a few m, the TOD as with kmax = mmax to epsilon;
+def test_blm_mmax(monkeypatch):
+    """blm_tods with a beam of mmax = lmax (as generate_gauss_beam_alms): mmax
+    of the convolution from the asymmetries, a few m, the TOD as with the
+    whole beam to epsilon;
     blm_templates: one Interpolator per detector for all its DetectorData."""
     from pysanepic import blm_templates, blm_tods
 
@@ -1081,7 +1082,7 @@ def test_blm_kmax(monkeypatch):
         data.append(DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                                  sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3,
                                  name=name))
-    exact = blm_tods(data[0], sky, b, "E", kmax=lmax, epsilon=1e-12)
+    exact = blm_tods(data[0], sky, b, "E", mmax=lmax, epsilon=1e-12)
     got = blm_tods(data[0], sky, b, "E")
     assert built[1] < 12
     assert np.std(got - exact) < 1e-5 * np.std(exact)
@@ -1090,8 +1091,8 @@ def test_blm_kmax(monkeypatch):
     assert len(built) == 2 and [d.name for d in out] == ["d0", "d0", "d1"]
     for d, o in zip(data, out):
         assert np.array_equal(o.templates["beam"], blm_tods(d, sky, b, "E"))
-    with pytest.raises(ValueError, match="kmax"):
-        blm_tods(data[0], sky, b[:, :3 * (lmax + 1) - 3], "E", kmax=3)
+    with pytest.raises(ValueError, match="mmax must be"):
+        blm_tods(data[0], sky, b[:, :3 * (lmax + 1) - 3], "E", mmax=3)
 
 
 def test_blm_tods_model_bl():
