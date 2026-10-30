@@ -4,6 +4,16 @@
 
 Changes on `main` that are not in a release yet.
 
+- `Coordinates(str, Enum)` (`Ecliptic = "E"`, `Galactic = "G"`,
+  `Equatorial = "C"`): `Pointing.coordinates` and `MapResult.coordinates`
+  are `Coordinates`; the strings "E", "G", "C" are still accepted
+  everywhere and compare equal to the members.
+- Pointings rotated between coordinates with the rotation matrices of
+  astropy (BarycentricMeanEcliptic, Galactic, ICRS), as litebird_sim,
+  instead of `healpy.Rotator`; astropy is a new dependency. E <-> G is the
+  same matrix as before to 1e-15; C differs from healpy's by ~0.03 arcsec. (#64)
+- `make_maps` checks `coordinates` ("E", "G" or "C") instead of failing
+  later in healpy.
 - `Template(fixed=True)`: a known signal in the TOD model with amplitude 1
   (times the gain with calibration), not fitted and not put back in the
   maps; not in `MapResult.templates`.
@@ -22,6 +32,16 @@ Changes on `main` that are not in a release yet.
   `DetectorData`. On a laptop (lmax 1024, 30' beams, beam mmax 20, 2M
   samples) 2-25 times faster, 1e-7 off the exact template. New test
   `test_blm_kmax`.
+- `blm_templates` / `blm_tods(model_bl=...)`: the window of the circular
+  beam of the sky model (healpy's `gauss_beam(fwhm, pol=True)`); the fixed
+  template is then the sky through each beam minus that circular beam, so
+  that sky model + template is the sky through the true beams. Without it
+  (the default, as before) each beam minus its own symmetric part: the
+  symmetric parts beyond a Gaussian (order l^4, ~(e - 1)^2 for an elliptical
+  beam) are in no template and bias the absolute calibration, by
+  ~-0.08 <(e - 1)^2> in an e2e test (-1e-3 with 16 detectors of ellipticity
+  up to 1.19, -4e-6 with model_bl); see docs/validation.md. New tests
+  `test_blm_tods_model_bl`, `test_blm_fixed_template_model_bl`.
 
 ## 0.6.1 (2026-10-30)
 

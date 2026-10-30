@@ -185,10 +185,38 @@ def _asymmetric(blm, lmax, mmax):
     return out
 
 
-def _blm_interpolator(sky_alm, blm, kmax, epsilon, nthreads):
-    """The ducc0 Interpolator of the sky through the asymmetries of `blm`,
-    with kmax (None: the largest m of the asymmetries above epsilon of their
-    largest coefficient)."""
+def _reference_blm(model_bl, lmax, mmax, ncomp, pol_angle):
+    """The blm of the circular beam with window `model_bl` (as healpy's
+    gauss_beam: (lmax+1,) for T, or (lmax+1, >= 3) with the columns T, E, B)
+    in the frame of a detector at polarization angle `pol_angle`, with the
+    conventions of litebird_sim's gauss_beam_to_alm: T at m = 0,
+    sqrt((2l+1)/4pi) b_l, and the co-rotating polarization at m = 2,
+    (E - iB)/2 = -sqrt(2) sqrt((2l+1)/32pi) b_l e^{-2i pol_angle} (E + iB = 0)."""
+    bl = np.asarray(model_bl, dtype=float)
+    if bl.ndim == 1:
+        bl = bl[:, None]
+    if bl.shape[0] < lmax + 1:
+        raise ValueError(f"blm_tods: model_bl needs l up to the lmax of sky_alm ({lmax})")
+    if ncomp == 3 and (bl.shape[1] < 3 or not np.allclose(bl[: lmax + 1, 1], bl[: lmax + 1, 2])):
+        raise ValueError("blm_tods: with polarization, model_bl needs the columns T, E, B, with E = B (a circular beam)")
+    if ncomp == 3 and mmax < 2:
+        raise ValueError("blm_tods: with polarization and model_bl, the beam needs mmax >= 2")
+    ell = np.arange(lmax + 1)
+    out = np.zeros((ncomp, (mmax + 1) * (lmax + 1) - mmax * (mmax + 1) // 2), complex)
+    out[0, : lmax + 1] = np.sqrt((2 * ell + 1) / (4 * np.pi)) * bl[: lmax + 1, 0]  # m = 0 comes first
+    if ncomp == 3:
+        i = 2 * (2 * lmax - 1) // 2 + ell[2:]  # m = 2, l >= 2
+        sym = -np.sqrt(2) * np.sqrt((2 * ell[2:] + 1) / (32 * np.pi)) * bl[2 : lmax + 1, 1] * np.exp(-2j * pol_angle)
+        out[1, i] = sym
+        out[2, i] = 1j * sym
+    return out
+
+
+def _blm_interpolator(sky_alm, blm, kmax, epsilon, nthreads, model_bl=None, pol_angle=0.0):
+    """The ducc0 Interpolator of the sky through the asymmetries of `blm` (minus
+    its symmetric part, or with model_bl minus the circular beam of the model
+    at `pol_angle`), with kmax (None: the largest m of the asymmetries above
+    epsilon of their largest coefficient)."""
     if not np.iscomplexobj(sky_alm):
         raise ValueError("blm_tods: the sky model as alm (complex), not maps")
     x = _model(sky_alm, 0, "blm_tods")
@@ -203,7 +231,10 @@ def _blm_interpolator(sky_alm, blm, kmax, epsilon, nthreads):
                          f"lmax of sky_alm ({lmax})")
     if kmax is not None and not 0 <= kmax <= mmax:
         raise ValueError(f"blm_tods: kmax must be in [0, mmax of the beam = {mmax}]")
-    beam = _asymmetric(blm, lmax, mmax)
+    if model_bl is None:
+        beam = _asymmetric(blm, lmax, mmax)
+    else:
+        beam = blm - _reference_blm(model_bl, lmax, mmax, x.shape[0], pol_angle)
     if kmax is None:  # the largest |b_lm| of each m (healpy order: m by m)
         start = np.array([m * (2 * lmax + 1 - m) // 2 for m in range(mmax + 1)])
         peak = np.maximum.reduceat(np.abs(beam).max(axis=0), start)
@@ -224,12 +255,21 @@ def _blm_interpol(inter, d, coordinates, nthreads):
     return inter.interpol(np.stack([theta, phi, psi], axis=1))[0]
 
 
-def blm_tods(d, sky_alm, blm, coordinates, *, kmax=None, epsilon=1e-6, nthreads=1):
+def blm_tods(d, sky_alm, blm, coordinates, *, model_bl=None, kmax=None, epsilon=1e-6, nthreads=1):
     """The TOD of the asymmetries of the beam of one DetectorData, from its
-    alm: the sky convolved with the beam minus its symmetric part (T at m = 0,
-    and the co-rotating polarization at m = 2), which is in the maps. For a
-    fixed template (Template(fixed=True)): the T -> P leakage of the
-    ellipticity that a fit cannot separate from Q/U.
+    alm, for a fixed template (Template(fixed=True)): the T -> P leakage of
+    the ellipticity that a fit cannot separate from Q/U.
+
+    With `model_bl`, the window b_l of the circular beam the sky model was
+    smoothed with (as healpy's gauss_beam: (lmax+1,) for T, or (lmax+1, >= 3)
+    with the columns T, E, B), the sky convolved with the beam minus that
+    circular beam: with the sky model, the sky through the true beam of each
+    detector. Without, the sky convolved with the beam minus its own
+    symmetric part (T at m = 0, the co-rotating polarization at m = 2): the
+    symmetric parts that differ between the detectors are then left to
+    fwhm_template, which follows them to order l^2 only. The ellipticity
+    changes the symmetric part beyond that (order l^4, ~(e - 1)^2), and the
+    rest biases the absolute calibration: use model_bl when the beams differ.
 
     d: a DetectorData with a Pointing as angles, without HWP (with an HWP
     the beam needs the Mueller formalism). sky_alm: the sky model (not
@@ -250,18 +290,23 @@ def blm_tods(d, sky_alm, blm, coordinates, *, kmax=None, epsilon=1e-6, nthreads=
     Returns the TOD, an array like d.tod.
     """
     _no_hwp(d)
-    return _blm_interpol(_blm_interpolator(sky_alm, blm, kmax, epsilon, nthreads), d, coordinates, nthreads)
+    inter = _blm_interpolator(sky_alm, blm, kmax, epsilon, nthreads, model_bl, float(d.pol_angle_rad))
+    return _blm_interpol(inter, d, coordinates, nthreads)
 
 
-def blm_templates(data, sky_alm, blms, coordinates, *, name="beam", kmax=None, epsilon=1e-6, nthreads=1):
+def blm_templates(data, sky_alm, blms, coordinates, *, model_bl=None, name="beam", kmax=None, epsilon=1e-6,
+                  nthreads=1):
     """The beam asymmetries of all the DetectorData from the beams' alm, as a
     fixed template (see :func:`blm_tods`, also for kmax and epsilon).
 
     blms: {DetectorData.name: blm}, as litebird_sim's generate_gauss_beam_alms.
+    model_bl: the window of the beam of the sky model (see blm_tods), the
+    same for all the detectors.
     Returns (data, templates): the DetectorData as a list, with the TOD in
     their `templates` under `name`, and {name: Template(fixed=True)} for
-    make_maps. One convolution (ducc0 Interpolator) per detector, for all its
-    DetectorData, freed before the next. All the TODs are computed here and
+    make_maps. One convolution (ducc0 Interpolator) per detector (and
+    polarization angle, with model_bl), for all its DetectorData, freed
+    before the next. All the TODs are computed here and
     kept in memory: with a generator, use blm_tods.
     """
     data = list(data)
@@ -272,9 +317,11 @@ def blm_templates(data, sky_alm, blms, coordinates, *, name="beam", kmax=None, e
             raise ValueError(f"blm_templates: DetectorData.templates already has {name!r}")
         _no_hwp(d)
     tods = {}
-    for det in dict.fromkeys(d.name for d in data):
-        inter = _blm_interpolator(sky_alm, blms[det], kmax, epsilon, nthreads)
-        tods.update({i: _blm_interpol(inter, d, coordinates, nthreads) for i, d in enumerate(data) if d.name == det})
+    # with model_bl the reference beam has the polarization angle of the DetectorData
+    key = [(d.name, None if model_bl is None else float(d.pol_angle_rad)) for d in data]
+    for det, pol in dict.fromkeys(key):
+        inter = _blm_interpolator(sky_alm, blms[det], kmax, epsilon, nthreads, model_bl, pol or 0.0)
+        tods.update({i: _blm_interpol(inter, d, coordinates, nthreads) for i, d in enumerate(data) if key[i] == (det, pol)})
         del inter
     out = [dataclasses.replace(d, templates={**(d.templates or {}), name: tods[i]}) for i, d in enumerate(data)]
     return out, {name: Template(fixed=True)}

@@ -11,6 +11,9 @@
 .. autoclass:: pysanepic.Pointing
    :members: pixels_and_psi
 
+.. autoclass:: pysanepic.Coordinates
+   :no-members:
+
 .. autoclass:: pysanepic.OneOverFNoise
    :members: weights
 

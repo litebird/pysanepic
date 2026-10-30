@@ -82,7 +82,7 @@ as alm (its `pointing_form`), so pysanepic does not rotate them.
 | `theta`, `phi` | Colatitude and longitude [rad] |
 | `pix`, `nside`, `ordering` | HEALPix pixel of each sample, its resolution and ordering (`"RING"` or `"NESTED"`) |
 | `psi` | Orientation of the detector frame [rad] |
-| `coordinates` | Coordinate system of the angles or pixels and of `psi`: `"E"`, `"G"` or `"C"` |
+| `coordinates` | Coordinate system of the angles or pixels and of `psi`: a {class}`~pysanepic.Coordinates` (`Ecliptic`, `Galactic`, `Equatorial`) or its value `"E"`, `"G"` or `"C"`; stored as a `Coordinates` |
 
 The arrays are checked when the object is created: one form only, same
 lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
@@ -134,7 +134,7 @@ The conventions are the same as litebird_sim:
 |---|---|---|
 | `data` | | Iterable of `DetectorData` local to this process |
 | `nside` | | HEALPix resolution of the output maps (RING) |
-| `coordinates` | `"G"` | Coordinate system of the output maps |
+| `coordinates` | `"G"` | Coordinate system of the output maps, a `Coordinates` or `"E"`, `"G"`, `"C"` |
 | `params` | `GLSParameters()` | Settings of the map-maker, see [Parameters](parameters.md) |
 | `comm` | `None` | mpi4py communicator; each rank passes only its own data |
 | `nthreads` | `None` | Threads per process (FFTs, ducc0, numba); `None`: `OMP_NUM_THREADS` if set, else 1 |
@@ -652,25 +652,55 @@ the maps:
 
 $$
 d = g\,(P m + D + S + F + \textstyle\sum_k a_k B_k) + n,\qquad
-F = \text{sky} \circledast (B - B_\text{sym}).
+F = \text{sky} \circledast (B - B_\text{ref}).
 $$
 
-$B_\text{sym}$ is the part of the beam symmetric about its axis, the beam of
-the maps: $m = 0$ for T and, for Q/U, the co-rotating part at $m = 2$,
-$(b^E_{\ell 2} - i b^B_{\ell 2})/2$, the only one a circular beam has. Each
-detector has its own $B_\text{sym}$: different FWHMs are left to
-{func}`~pysanepic.fwhm_template`. The convolution is
-`ducc0.totalconvolve.Interpolator`, as in litebird_sim, so the conventions are those of the simulation:
-`blm` in the frame of the detector, with its polarization angle in it
-(`psi_pol_rad`), $\psi$ of the pointing as in litebird_sim.
+$B_\text{ref}$ is a beam symmetric about its axis: T at $m = 0$ and, for
+Q/U, the co-rotating part at $m = 2$, $(b^E_{\ell 2} - i b^B_{\ell 2})/2$,
+the only one a circular beam has. Which one is set by `model_bl`:
+
+- **`model_bl` given** (recommended): the circular beam the sky model `S` was
+  smoothed with, as its window $b_\ell$ (healpy's `gauss_beam(fwhm,
+  pol=True)`, or `(lmax+1,)` for T only). Then $S + F$ is the sky through
+  the true beam of each detector: exact, whatever the beams.
+- **without** (default, as before): each beam minus its own symmetric part,
+  $B_\text{sym}$. The symmetric parts that differ between the detectors (the
+  maps have one beam) are left to {func}`~pysanepic.fwhm_template`, which
+  follows them to order $\ell^2$ only, $\delta\sigma^2\,\ell(\ell+1)/2$. An
+  elliptical beam is not a Gaussian in its symmetric part: with
+  $\sigma^2_\text{major} = \sigma^2 e$, $\sigma^2_\text{minor} = \sigma^2/e$,
+  their mean $\bar\sigma^2$ and difference $\Delta$, its $m = 0$ part is
+  $e^{-\ell^2 \bar\sigma^2/2} I_0(\ell^2 \Delta/4)$, with terms of order
+  $\ell^4$ that grow as $(e - 1)^2$. What is left of them biases the
+  absolute calibration (see [calibration and beam ellipticity](validation.md#calibration-and-beam-ellipticity)): use this only
+  with beams of the same symmetric part, or nearly circular ones.
+
+The convolution is `ducc0.totalconvolve.Interpolator`, as in litebird_sim
+(with $k_\text{max}$ from the asymmetries, see the cost below), so the
+conventions are those of the simulation: `blm` in the frame of the detector,
+with its polarization angle in it (`psi_pol_rad` = `DetectorData.pol_angle_rad`,
+which also orients the polarization of $B_\text{ref}$), $\psi$ of the pointing
+as in litebird_sim, and the polarization normalized as `gauss_beam_to_alm`
+($-\sqrt{2}$ and Challinor's $e^{2\sigma^2}$): a circular `gauss_beam_to_alm`
+beam minus `model_bl = hp.gauss_beam(fwhm, pol=True)` of the same FWHM is 0
+(`test_blm_tods_model_bl`).
 
 ```python
+import healpy as hp
 from pysanepic import blm_templates
 
 # sky_alm: T, E, B of the sky, NOT convolved with a beam; blms: {detector name: blm}
-data, templates = blm_templates(data, sky_alm, blms, "G")   # {"beam": Template(fixed=True)}
-result = make_maps(data, nside, coordinates="G", params=params, templates=templates)
+# sky_model: sky_alm through the circular beam of window bl (the mean beam of the detectors)
+bl = hp.gauss_beam(fwhm_model, lmax=lmax, pol=True)
+data, templates = blm_templates(data, sky_alm, blms, "G", model_bl=bl)   # {"beam": Template(fixed=True)}
+result = make_maps(data, nside, coordinates="G", params=params, templates=templates, sky_model=sky_model)
 ```
+
+- **With {func}`~pysanepic.fwhm_template`**: with `model_bl` the FWHM
+  differences are in the fixed template, so the fitted `fwhm` amplitudes are
+  what the beams are not: the second moment $\langle|\rho|^2\rangle/2$ of
+  pointing offsets (see {func}`~pysanepic.beam_parameters`), or errors of
+  the beams given. The template can stay (`sum_zero=False` too) as a check.
 
 - **Sky model**: the template needs the sky itself, not through a beam,
   with the lmax of the beams; an external model is enough, since the error
@@ -681,7 +711,10 @@ result = make_maps(data, nside, coordinates="G", params=params, templates=templa
   axis at `psi_ell - pol_angle` from $x$ (`test_blm_tods`; the LevelS formula
   is a flat-sky expansion, off by ~0.1% at $\ell \sim 80$, more at low $\ell$).
   With it, the maps of elliptical beams are those of their symmetric parts,
-  and so are the gains (`test_blm_fixed_template`).
+  and so are the gains (`test_blm_fixed_template`). With `model_bl` and
+  beams of different ellipticities, the gains are exact (7e-13) and the
+  maps those of the circular beam of the model; without, the gains are off
+  by 3e-3 (`test_blm_fixed_template_model_bl`).
 - **HWP**: not yet. The polarization turns with $2\chi$ and the beam does
   not, so the beam needs the Mueller formalism (litebird_sim's
   `MuellerConvolver`); with an HWP the leakage of a common ellipticity is
