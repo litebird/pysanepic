@@ -1,4 +1,4 @@
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from .gls import GLS, fast_fft_length, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 from .mapmaker import CalibrationParameters, CommonMode, Coordinates, DetectorData, DetectorGroup, GLSParameters, MapResult, OneOverFNoise, Pointing, TabulatedNoise, Template, estimate_noise, make_maps
