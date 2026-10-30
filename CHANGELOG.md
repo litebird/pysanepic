@@ -4,6 +4,10 @@
 
 Changes on `main` that are not in a release yet.
 
+- `Coordinates(str, Enum)` (`Ecliptic = "E"`, `Galactic = "G"`,
+  `Equatorial = "C"`): `Pointing.coordinates` and `MapResult.coordinates`
+  are `Coordinates`; the strings "E", "G", "C" are still accepted
+  everywhere and compare equal to the members.
 - Pointings rotated between coordinates with the rotation matrices of
   astropy (BarycentricMeanEcliptic, Galactic, ICRS), as litebird_sim,
   instead of `healpy.Rotator`; astropy is a new dependency. E <-> G is the

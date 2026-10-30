@@ -82,7 +82,7 @@ as alm (its `pointing_form`), so pysanepic does not rotate them.
 | `theta`, `phi` | Colatitude and longitude [rad] |
 | `pix`, `nside`, `ordering` | HEALPix pixel of each sample, its resolution and ordering (`"RING"` or `"NESTED"`) |
 | `psi` | Orientation of the detector frame [rad] |
-| `coordinates` | Coordinate system of the angles or pixels and of `psi`: `"E"`, `"G"` or `"C"` |
+| `coordinates` | Coordinate system of the angles or pixels and of `psi`: a {class}`~pysanepic.Coordinates` (`Ecliptic`, `Galactic`, `Equatorial`) or its value `"E"`, `"G"` or `"C"`; stored as a `Coordinates` |
 
 The arrays are checked when the object is created: one form only, same
 lengths, integer pixels within $[0, 12\,n_\text{side}^2)$, valid `nside` and
@@ -134,7 +134,7 @@ The conventions are the same as litebird_sim:
 |---|---|---|
 | `data` | | Iterable of `DetectorData` local to this process |
 | `nside` | | HEALPix resolution of the output maps (RING) |
-| `coordinates` | `"G"` | Coordinate system of the output maps |
+| `coordinates` | `"G"` | Coordinate system of the output maps, a `Coordinates` or `"E"`, `"G"`, `"C"` |
 | `params` | `GLSParameters()` | Settings of the map-maker, see [Parameters](parameters.md) |
 | `comm` | `None` | mpi4py communicator; each rank passes only its own data |
 | `nthreads` | `None` | Threads per process (FFTs, ducc0, numba); `None`: `OMP_NUM_THREADS` if set, else 1 |

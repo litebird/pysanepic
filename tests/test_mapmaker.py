@@ -15,7 +15,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
+from pysanepic import Coordinates, DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
 
 
 def _scan(n, rng):
@@ -163,6 +163,9 @@ def test_pointing_checks():
         DetectorData(tod=np.zeros(11), pointing=p, sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0))
     with pytest.raises(ValueError, match="coordinates"):
         make_maps([], 16, coordinates="gal")
+    # strings and members are the same coordinates
+    assert Pointing(pix=np.zeros(n, int), nside=16, psi=psi, coordinates=Coordinates.Ecliptic).coordinates is Coordinates.Ecliptic
+    assert p.coordinates is Coordinates.Ecliptic and p.coordinates == "E" and f"{p.coordinates}" == "E"
     with pytest.raises(TypeError):
         DetectorData(tod=np.zeros(n), pointing=None, sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0))
 
