@@ -4,6 +4,17 @@
 
 Changes on `main` that are not in a release yet.
 
+- `Template(fixed=True)`: a known signal in the TOD model with amplitude 1
+  (times the gain with calibration), not fitted and not put back in the
+  maps; not in `MapResult.templates`.
+- `blm_templates` / `blm_tods`: the asymmetries of beams given as alm (as in
+  litebird_sim, e.g. `gauss_beam_to_alm` or GRASP), as a fixed template:
+  the sky convolved (`ducc0.totalconvolve`, as litebird_sim) with the beam
+  minus its symmetric part (T at m = 0, the co-rotating Q/U at m = 2). It
+  removes the leakage of I into Q/U of an ellipticity common to the
+  detectors, which no fit can separate from Q/U without HWP. No HWP yet.
+  New tests `test_blm_tods`, `test_blm_fixed_template`. (#55)
+
 ## 0.6.1 (2026-10-30)
 
 - `GLSParameters.sample_batch` (default 1): with a sky model or sky
