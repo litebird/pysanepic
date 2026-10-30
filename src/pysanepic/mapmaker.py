@@ -9,6 +9,7 @@ resolution and in those coordinates. pysanepic computes polarization angles,
 chunks and noise weights itself, with one set of conventions documented here.
 """
 
+import functools
 import time
 import warnings
 from dataclasses import dataclass
@@ -23,6 +24,19 @@ from .gls import _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_colum
 
 
 _COORDINATES = ("E", "G", "C")
+# astropy frames, as litebird_sim (ecliptic: BarycentricMeanEcliptic, equatorial: ICRS)
+_ASTROPY_FRAMES = {"E": "barycentricmeanecliptic", "G": "galactic", "C": "icrs"}
+
+
+@functools.lru_cache
+def _rotation_matrix(coord_in, coord_out):
+    """3x3 matrix from `coord_in` to `coord_out` ("E", "G" or "C"), with astropy
+    as litebird_sim's ECL_TO_GAL_ROT_MATRIX: its columns are the axes of
+    `coord_in` expressed in `coord_out`."""
+    from astropy.coordinates import CartesianRepresentation, SkyCoord
+
+    axes = SkyCoord(CartesianRepresentation(np.eye(3)), frame=_ASTROPY_FRAMES[coord_in])
+    return np.ascontiguousarray(axes.transform_to(_ASTROPY_FRAMES[coord_out]).cartesian.xyz.value)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -39,7 +53,8 @@ class Pointing:
 
     `psi` is the orientation angle of the detector frame [rad] in
     `coordinates`; `coordinates` is "E" (ecliptic), "G" (galactic) or "C"
-    (equatorial). The arrays are checked when the object is created.
+    (equatorial), with the astropy frames of litebird_sim
+    (BarycentricMeanEcliptic, Galactic, ICRS). The arrays are checked when the object is created.
     """
 
     psi: np.ndarray
@@ -87,7 +102,7 @@ class Pointing:
             raise ValueError("this needs a Pointing with angles (theta, phi), not pixels")
         theta, phi, psi = self.theta, self.phi, self.psi
         if self.coordinates != coordinates:
-            R = hp.Rotator(coord=[self.coordinates, coordinates]).mat
+            R = _rotation_matrix(self.coordinates, coordinates)
             out = np.empty((3, len(psi)))
             with numba_threads(nthreads):
                 _rotate(np.ascontiguousarray(theta), np.ascontiguousarray(phi), np.ascontiguousarray(psi), R, out)

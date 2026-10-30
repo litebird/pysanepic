@@ -1967,3 +1967,14 @@ def test_sample_batch(monkeypatch, calibrate):
         assert max(np.abs(g - h).max() for g, h in zip(a.gains, b.gains)) < 1e-10
     with pytest.raises(ValueError, match="sample_batch"):
         make_maps(data, nside, coordinates="E", params=GLSParameters(sample_batch=0), sky_model=sky)
+
+
+def test_rotation_matrix_astropy():
+    """The astropy matrices (as litebird_sim) agree with healpy's: E <-> G to
+    rounding, C (ICRS) to ~0.03 arcsec."""
+    from pysanepic.mapmaker import _rotation_matrix
+
+    for a, b, tol in [("E", "G", 1e-12), ("G", "E", 1e-12), ("E", "C", 1e-6), ("G", "C", 1e-6), ("C", "G", 1e-6)]:
+        R = _rotation_matrix(a, b)
+        assert np.allclose(R @ R.T, np.eye(3), atol=1e-12)
+        assert np.abs(R - hp.Rotator(coord=[a, b]).mat).max() < tol

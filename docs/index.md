@@ -31,7 +31,7 @@ pip install "pysanepic[mpi]"                # with MPI
 pip install git+https://github.com/litebird/pysanepic   # development version
 ```
 
-Requirements: Python ≥ 3.10, numpy, healpy, numba, ducc0 (and mpi4py
+Requirements: Python ≥ 3.10, numpy, healpy, numba, ducc0, astropy (and mpi4py
 for MPI).
 
 ```{toctree}

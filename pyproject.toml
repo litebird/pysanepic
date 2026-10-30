@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
     "Topic :: Scientific/Engineering :: Physics",
 ]
-dependencies = ["numpy", "healpy", "numba", "ducc0"]
+dependencies = ["numpy", "healpy", "numba", "ducc0", "astropy"]
 
 [project.optional-dependencies]
 mpi = ["mpi4py"]
