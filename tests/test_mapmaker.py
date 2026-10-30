@@ -161,6 +161,8 @@ def test_pointing_checks():
     p = Pointing(pix=np.zeros(n, int), nside=16, **ok)
     with pytest.raises(ValueError, match="11 samples"):
         DetectorData(tod=np.zeros(11), pointing=p, sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0))
+    with pytest.raises(ValueError, match="coordinates"):
+        make_maps([], 16, coordinates="gal")
     with pytest.raises(TypeError):
         DetectorData(tod=np.zeros(n), pointing=None, sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0))
 
