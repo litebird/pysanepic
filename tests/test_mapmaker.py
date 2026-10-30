@@ -1056,6 +1056,79 @@ def test_blm_fixed_template():
     assert np.abs(r.maps[1:, seen] - ref.maps[1:, seen]).max() < 1e-7 * scale
 
 
+def test_blm_tods_model_bl():
+    """blm_tods with model_bl, the window of the beam of the sky model: 0 for
+    the circular beam of that window (the conventions of litebird_sim's
+    gauss_beam_to_alm, as _gauss_blm, and healpy's gauss_beam agree), and for an elliptical
+    beam the sky through it minus the sky through that circular beam."""
+    from pysanepic import blm_tods
+
+    rng = np.random.default_rng(3)
+    lmax, mmax, fwhm, pol = 128, 4, np.radians(3.0), 0.3
+    ell = np.arange(lmax + 1)
+    sky = np.array([hp.synalm(1 / (ell + 5.0) ** 2, lmax=lmax) for _ in range(3)])
+    theta, phi, psi = _scan(20000, rng)
+    d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                     sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=pol)
+    bl = hp.gauss_beam(fwhm, lmax=lmax, pol=True)
+    circ = _gauss_blm(lmax, mmax, fwhm, pol_angle=pol)
+    scale = np.abs(_convolve(sky, circ, d)).max()
+    assert np.abs(blm_tods(d, sky, circ, "E", model_bl=bl)).max() < 1e-12 * scale
+    assert np.abs(blm_tods(d, sky[:1], circ[:1], "E", model_bl=bl[:, 0])).max() < 1e-12 * scale
+    b = _gauss_blm(lmax, mmax, fwhm * 1.01, ellipticity=1.2, psi_ell=0.4, pol_angle=pol)
+    assert np.allclose(blm_tods(d, sky, b, "E", model_bl=bl) + _convolve(sky, circ, d), _convolve(sky, b, d), atol=1e-12)
+    with pytest.raises(ValueError, match="E = B"):
+        blm_tods(d, sky, b, "E", model_bl=bl[:, 0])
+
+
+def test_blm_fixed_template_model_bl():
+    """Four detectors with different ellipticities (as different FWHMs, their
+    symmetric parts differ), no HWP, noiseless, with calibration on the
+    dipole and the sky model through a circular beam: with model_bl the
+    fixed template makes the model exact, gains and maps; with the beams
+    minus their own symmetric parts, the part of the symmetric beams beyond
+    the mean (order l^4 of the ellipticity, ~(e - 1)^2) biases the gains."""
+    from pysanepic import CalibrationParameters, blm_templates
+
+    rng = np.random.default_rng(11)
+    nside, lmax, mmax, n, fs, fwhm = 16, 40, 4, 60_000, 10.0, np.radians(4.0)
+    ell = np.arange(lmax + 1)
+    sky = np.array([hp.synalm(1e-8 / (ell + 3.0) ** 2, lmax=lmax) for _ in range(3)])
+    sky[0] *= 10  # T brighter than Q/U
+    bl = hp.gauss_beam(fwhm, lmax=lmax, pol=True)
+    model = np.array([hp.almxfl(a, bl[:, k]) for k, a in enumerate(sky)])
+    solar = 3.36e-3 * np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
+    data, blms, gains = [], {}, []
+    t = np.arange(n) * 5 // n
+    for i, (pol, e) in enumerate(zip([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8], [1.0, 1.1, 1.2, 1.3])):
+        theta, phi, psi = _scan(n, rng)
+        nvec = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)])
+        d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                         sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
+                         pol_angle_rad=pol, name=f"d{i}", dipole=solar @ nvec)
+        b = _gauss_blm(lmax, mmax, fwhm, ellipticity=e, psi_ell=0.3 * i + 0.2, pol_angle=pol)
+        blms[d.name] = b
+        gains.append(1 + 0.01 * rng.normal(size=5))
+        data.append(dataclasses.replace(d, tod=gains[-1][t] * (_convolve(sky, b, d) + d.dipole)))
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, angle_dtype=np.float64)
+    cal = CalibrationParameters(gain_period_s=n / 5 / fs, n_iter=4)
+
+    def gain_error(**kw):
+        dd, templates = blm_templates(data, sky, blms, "E", **kw)
+        r = make_maps(dd, nside, "E", params, calibration=cal, templates=templates, sky_model=model)
+        return max(np.abs(g / g0 - 1).max() for g, g0 in zip(r.gains, gains)), r
+
+    err, r = gain_error(model_bl=bl)
+    assert err < 1e-9
+    # the maps of the same detectors with the circular beam of the model
+    circ = [dataclasses.replace(d, tod=_convolve(sky, _gauss_blm(lmax, mmax, fwhm, pol_angle=d.pol_angle_rad), d))
+            for d in data]
+    ref = make_maps(circ, nside, "E", params, sky_model=model)
+    seen = ref.maps[1] != hp.UNSEEN
+    assert np.abs(r.maps[:, seen] - ref.maps[:, seen]).max() < 1e-7 * np.std(ref.maps[1:, seen])
+    assert gain_error()[0] > 1e3 * err
+
+
 def test_template_helpers_errors():
     """The checks of the template helpers."""
     from pysanepic import beam_parameters, beam_templates, beam_tods, fwhm_template

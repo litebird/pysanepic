@@ -24,6 +24,16 @@ Changes on `main` that are not in a release yet.
   removes the leakage of I into Q/U of an ellipticity common to the
   detectors, which no fit can separate from Q/U without HWP. No HWP yet.
   New tests `test_blm_tods`, `test_blm_fixed_template`. (#55)
+- `blm_templates` / `blm_tods(model_bl=...)`: the window of the circular
+  beam of the sky model (healpy's `gauss_beam(fwhm, pol=True)`); the fixed
+  template is then the sky through each beam minus that circular beam, so
+  that sky model + template is the sky through the true beams. Without it
+  (the default, as before) each beam minus its own symmetric part: the
+  symmetric parts beyond a Gaussian (order l^4, ~(e - 1)^2 for an elliptical
+  beam) are in no template and bias the absolute calibration, by
+  ~-0.08 <(e - 1)^2> in an e2e test (-1e-3 with 16 detectors of ellipticity
+  up to 1.19, -4e-6 with model_bl); see docs/validation.md. New tests
+  `test_blm_tods_model_bl`, `test_blm_fixed_template_model_bl`.
 
 ## 0.6.1 (2026-10-30)
 

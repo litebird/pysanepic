@@ -185,12 +185,48 @@ def _asymmetric(blm, lmax, mmax):
     return out
 
 
-def blm_tods(d, sky_alm, blm, coordinates, *, nthreads=1):
+def _reference_blm(model_bl, lmax, mmax, ncomp, pol_angle):
+    """The blm of the circular beam with window `model_bl` (as healpy's
+    gauss_beam: (lmax+1,) for T, or (lmax+1, >= 3) with the columns T, E, B)
+    in the frame of a detector at polarization angle `pol_angle`, with the
+    conventions of litebird_sim's gauss_beam_to_alm: T at m = 0,
+    sqrt((2l+1)/4pi) b_l, and the co-rotating polarization at m = 2,
+    (E - iB)/2 = -sqrt(2) sqrt((2l+1)/32pi) b_l e^{-2i pol_angle} (E + iB = 0)."""
+    bl = np.asarray(model_bl, dtype=float)
+    if bl.ndim == 1:
+        bl = bl[:, None]
+    if bl.shape[0] < lmax + 1:
+        raise ValueError(f"blm_tods: model_bl needs l up to the lmax of sky_alm ({lmax})")
+    if ncomp == 3 and (bl.shape[1] < 3 or not np.allclose(bl[: lmax + 1, 1], bl[: lmax + 1, 2])):
+        raise ValueError("blm_tods: with polarization, model_bl needs the columns T, E, B, with E = B (a circular beam)")
+    if ncomp == 3 and mmax < 2:
+        raise ValueError("blm_tods: with polarization and model_bl, the beam needs mmax >= 2")
+    ell = np.arange(lmax + 1)
+    out = np.zeros((ncomp, (mmax + 1) * (lmax + 1) - mmax * (mmax + 1) // 2), complex)
+    out[0, : lmax + 1] = np.sqrt((2 * ell + 1) / (4 * np.pi)) * bl[: lmax + 1, 0]  # m = 0 comes first
+    if ncomp == 3:
+        i = 2 * (2 * lmax - 1) // 2 + ell[2:]  # m = 2, l >= 2
+        sym = -np.sqrt(2) * np.sqrt((2 * ell[2:] + 1) / (32 * np.pi)) * bl[2 : lmax + 1, 1] * np.exp(-2j * pol_angle)
+        out[1, i] = sym
+        out[2, i] = 1j * sym
+    return out
+
+
+def blm_tods(d, sky_alm, blm, coordinates, *, model_bl=None, nthreads=1):
     """The TOD of the asymmetries of the beam of one DetectorData, from its
-    alm: the sky convolved with the beam minus its symmetric part (T at m = 0,
-    and the co-rotating polarization at m = 2), which is in the maps. For a
-    fixed template (Template(fixed=True)): the T -> P leakage of the
-    ellipticity that a fit cannot separate from Q/U.
+    alm, for a fixed template (Template(fixed=True)): the T -> P leakage of
+    the ellipticity that a fit cannot separate from Q/U.
+
+    With `model_bl`, the window b_l of the circular beam the sky model was
+    smoothed with (as healpy's gauss_beam: (lmax+1,) for T, or (lmax+1, >= 3)
+    with the columns T, E, B), the sky convolved with the beam minus that
+    circular beam: with the sky model, the sky through the true beam of each
+    detector. Without, the sky convolved with the beam minus its own
+    symmetric part (T at m = 0, the co-rotating polarization at m = 2): the
+    symmetric parts that differ between the detectors are then left to
+    fwhm_template, which follows them to order l^2 only. The ellipticity
+    changes the symmetric part beyond that (order l^4, ~(e - 1)^2), and the
+    rest biases the absolute calibration: use model_bl when the beams differ.
 
     d: a DetectorData with a Pointing as angles, without HWP (with an HWP
     the beam needs the Mueller formalism). sky_alm: the sky model (not
@@ -220,16 +256,22 @@ def blm_tods(d, sky_alm, blm, coordinates, *, nthreads=1):
         raise ValueError(f"blm_tods: the beam must have (mmax+1)(lmax+1) - mmax(mmax+1)/2 coefficients with the "
                          f"lmax of sky_alm ({lmax})")
     theta, phi, psi = d.pointing.angles(coordinates, nthreads)
-    inter = ducc0.totalconvolve.Interpolator(sky=np.asarray(x, dtype=np.complex128), beam=_asymmetric(blm, lmax, mmax),
+    if model_bl is None:
+        beam = _asymmetric(blm, lmax, mmax)
+    else:
+        beam = blm - _reference_blm(model_bl, lmax, mmax, x.shape[0], float(d.pol_angle_rad))
+    inter = ducc0.totalconvolve.Interpolator(sky=np.asarray(x, dtype=np.complex128), beam=beam,
                                              separate=False, lmax=lmax, kmax=mmax, epsilon=1e-10, nthreads=nthreads)
     return inter.interpol(np.stack([theta, phi, psi], axis=1))[0]
 
 
-def blm_templates(data, sky_alm, blms, coordinates, *, name="beam", nthreads=1):
+def blm_templates(data, sky_alm, blms, coordinates, *, model_bl=None, name="beam", nthreads=1):
     """The beam asymmetries of all the DetectorData from the beams' alm, as a
     fixed template (see :func:`blm_tods`).
 
     blms: {DetectorData.name: blm}, as litebird_sim's generate_gauss_beam_alms.
+    model_bl: the window of the beam of the sky model (see blm_tods), the
+    same for all the detectors.
     Returns (data, templates): the DetectorData as a list, with the TOD in
     their `templates` under `name`, and {name: Template(fixed=True)} for
     make_maps. All the TODs are computed here and kept in memory: with a
@@ -242,7 +284,7 @@ def blm_templates(data, sky_alm, blms, coordinates, *, name="beam", nthreads=1):
         old = d.templates or {}
         if name in old:
             raise ValueError(f"blm_templates: DetectorData.templates already has {name!r}")
-        tod = blm_tods(d, sky_alm, blms[d.name], coordinates, nthreads=nthreads)
+        tod = blm_tods(d, sky_alm, blms[d.name], coordinates, model_bl=model_bl, nthreads=nthreads)
         out.append(dataclasses.replace(d, templates={**old, name: tod}))
     return out, {name: Template(fixed=True)}
 
