@@ -4,13 +4,14 @@
 
 Changes on `main` that are not in a release yet.
 
-- `gap_fill="conditional"` / `"conditional_mean"` with
+- `gap_fill="constrained"` / `"conditional_mean"` with
   `flag_method="sanepic"`: Gaussian noise conditional on valid residuals
   after subtracting the required `sky_model`. Includes joint DetectorGroup
   conditioning and unobserved padding, matching GLS precision and FFT
   extension. `flag_seed`, `gap_fill_tol` and `gap_fill_maxiter` control the
   draw/solve; nonconvergence raises RuntimeError. Public
-  `conditional_gap_fill` returns filled residuals and solve diagnostics.
+  `conditional_gap_fill` returns filled residuals and solve diagnostics;
+  `MapResult.gap_fill_iterations` has the largest CG iteration count.
   This freezes a conditional fill, not an exact GLS or Gibbs map algorithm;
   the default remains `gap_fill="local_white"`.
 
@@ -19,6 +20,10 @@ Changes on `main` that are not in a release yet.
   `(lengths_samples, fs_hz)` chooses positive integer counts. Counts are
   capped at the gap length; 1 recovers offsets, full counts recover exact
   marginalization. Invalid counts and callable output shapes are rejected.
+  Options of another flag method raise ValueError (`act_ncoeff` or
+  `flag_sampling_rate_hz` without `"act"`, `gap_fill_tol`/`gap_fill_maxiter`
+  without a conditional fill); a non-zero `flag_seed` without random
+  filling warns.
 
 - `GLSParameters.flag_method="act"`: the compressed Legendre cut model of
   Naess et al. (2025), Sect. 3.3.3, with the published coefficient counts.

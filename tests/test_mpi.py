@@ -237,6 +237,7 @@ def test_conditional_fill_mpi():
             ref = make_maps(data, 1, coordinates="E", params=params, sky_model=sky)
             assert np.array_equal(result.hit_map, ref.hit_map)
             assert np.allclose(result.maps, ref.maps, rtol=1e-10, atol=1e-10)
+            assert result.gap_fill_iterations == ref.gap_fill_iterations > 0  # maximum over the ranks
 
 
 

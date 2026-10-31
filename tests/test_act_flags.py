@@ -140,15 +140,16 @@ def test_act_make_maps(pad_s, ncoeff):
     params = GLSParameters(flag_method="act", act_ncoeff=ncoeff, chunk_s=50., split_gap_s=4., pad_s=pad_s,
                            angle_dtype=np.float64, min_pol_rcond=0, tol=1e-24)
     a = make_maps([d], nside, coordinates="E", params=params)
-    b = make_maps([dataclasses.replace(d, tod=np.where(flags, 1e30, tod))], nside, coordinates="E",
-                  params=dataclasses.replace(params, flag_seed=19), nthreads=2)
+    with pytest.warns(UserWarning, match="flag_seed has no effect"):
+        b = make_maps([dataclasses.replace(d, tod=np.where(flags, 1e30, tod))], nside, coordinates="E",
+                      params=dataclasses.replace(params, flag_seed=19), nthreads=2)
     assert a.converged and b.converged
     assert np.allclose(a.maps, sky, rtol=0, atol=1e-9)
     assert np.allclose(a.maps, b.maps, rtol=0, atol=1e-10)
     assert a.hit_map.sum() == (~flags).sum()
     assert np.isnan(d.tod[flags]).all()
     if ncoeff == 1:
-        offset = make_maps([d], nside, coordinates="E", params=dataclasses.replace(params, flag_method="offset"))
+        offset = make_maps([d], nside, coordinates="E", params=dataclasses.replace(params, flag_method="offset", act_ncoeff=None))
         assert np.allclose(a.maps, offset.maps, rtol=0, atol=1e-10)
 
 
@@ -165,6 +166,22 @@ def test_act_sampling_rate_validation():
 def test_act_ncoeff_validation(rule):
     with pytest.raises(ValueError, match="act_ncoeff"):
         GLS(np.array([0, -1, 0]), None, np.ones(2), flag_method="act", flag_sampling_rate_hz=20., act_ncoeff=rule)
+
+
+def test_options_of_other_flag_methods():
+    """Options of another flag treatment raise (flag_seed only warns)."""
+    for kw in ({"act_ncoeff": 3}, {"act_ncoeff": 3, "flag_method": "sanepic"}, {"gap_fill_tol": 1e-20},
+               {"gap_fill_maxiter": 50, "flag_method": "sanepic"}):
+        with pytest.raises(ValueError, match="act_ncoeff|gap_fill_tol"):
+            make_maps([], 1, params=GLSParameters(**kw))
+    for kw in ({"flag_method": "act"}, {"flag_method": "marginalize"},
+               {"flag_method": "sanepic", "gap_fill": "conditional_mean"}):
+        with pytest.warns(UserWarning, match="flag_seed has no effect"):
+            make_maps([], 1, params=GLSParameters(flag_seed=3, **kw), sky_model=np.zeros((3, 12)))
+    for kw in ({"act_ncoeff": 2}, {"flag_sampling_rate_hz": 20.}):
+        for method in ("marginalize", "sanepic"):
+            with pytest.raises(ValueError, match="flag_method='act'"):
+                GLS(np.array([0, -1, 0]), None, np.ones(2), flag_method=method, **kw)
 
 
 def test_act_invalid_ncoeff_without_flags():

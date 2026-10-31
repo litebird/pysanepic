@@ -156,7 +156,7 @@ white noise, seeded by `flag_seed`), including the correlations from the filled 
 to the valid ones. This is the approximate treatment of Patanchon et al.
 (2008), Sect. 3.6, and can bias the signal; it is not equivalent to `"offset"`.
 
-`gap_fill="conditional"` replaces the local white-noise fill by a Gaussian
+`gap_fill="constrained"` replaces the local white-noise fill by a Gaussian
 draw conditional on valid noise residuals after subtracting `sky_model`.
 It solves Q_ff x = -Q_fu r_u + g_f with Cov(g)=Q; `"conditional_mean"`
 omits g. FFTs apply Q without dense time matrices. DetectorGroup fills use

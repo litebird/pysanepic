@@ -147,7 +147,7 @@ available only with `"sanepic"`:
 ```python
 params = GLSParameters(
     flag_method="sanepic",
-    gap_fill="conditional",  # "local_white" is the default; "conditional_mean" is deterministic
+    gap_fill="constrained",  # "local_white" is the default; "conditional_mean" is deterministic
     flag_seed=42,
     gap_fill_tol=1e-12,
     gap_fill_maxiter=1000,
@@ -162,7 +162,11 @@ fixed during the approximate SANEPIC map solve: it does not make that solve
 equivalent to exact marginalization or a Gibbs sampler. `flag_seed` is
 reproducible for the same input, chunking and MPI assignment, generally not
 after redistributing data. `tol`/`maxiter` control the map solve separately
-from `gap_fill_tol`/`gap_fill_maxiter`.
+from `gap_fill_tol`/`gap_fill_maxiter`; `result.gap_fill_iterations` is the
+largest number of gap CG iterations (over all chunks and ranks), to compare
+with `gap_fill_maxiter`. Options of another flag method (`act_ncoeff` without
+`"act"`, `gap_fill_tol`/`gap_fill_maxiter` without a conditional fill) raise
+ValueError rather than being ignored.
 
 The ACT and SANEPIC filling modes above are unreleased additions; use the
 development checkout. See [flagged-sample parameters](parameters.md#flagged-samples),

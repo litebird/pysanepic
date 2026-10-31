@@ -1,6 +1,7 @@
 """Conditional gap statistics against independent dense Gaussian formulae."""
 
 import dataclasses
+import warnings
 
 import numpy as np
 import pytest
@@ -127,7 +128,7 @@ def test_conditional_dc_null_draw_statistics():
     assert np.max(np.abs(np.cov(z, rowvar=False) - np.eye(2))) < 0.15
 
 
-@pytest.mark.parametrize("fill", ["conditional_mean", "conditional"])
+@pytest.mark.parametrize("fill", ["conditional_mean", "constrained"])
 @pytest.mark.parametrize("pad_s", [0., 0.5])
 @pytest.mark.parametrize("grouped", [False, True])
 def test_conditional_make_maps(fill, pad_s, grouped):
@@ -147,15 +148,20 @@ def test_conditional_make_maps(fill, pad_s, grouped):
     modes = [CommonMode(coupling=np.array([1., 0.8]), noise=OneOverFNoise(net_ukrts=60., fknee_hz=0.8, fmin_hz=0.05))]
     pack = lambda ds: [DetectorGroup(detectors=ds, modes=modes)] if grouped else ds
     params = GLSParameters(flag_method="sanepic", gap_fill=fill, pad_s=pad_s, split_gap_s=2.,
-                           chunk_s=30., gap_fill_tol=1e-20, flag_seed=9, angle_dtype=np.float64, tol=1e-22)
+                           chunk_s=30., gap_fill_tol=1e-20, flag_seed=9 if fill == "constrained" else 0,
+                           angle_dtype=np.float64, tol=1e-22)
     a = make_maps(pack(dets), nside, coordinates="E", params=params, sky_model=sky)
     bad = [dataclasses.replace(d, tod=np.where(d.flags, 1e30, d.tod)) for d in dets]
     b = make_maps(pack(bad), nside, coordinates="E", params=params, sky_model=sky, nthreads=2)
     assert a.converged and b.converged
+    assert 0 < a.gap_fill_iterations < params.gap_fill_maxiter
     assert np.allclose(a.maps, b.maps, rtol=0, atol=1e-9)
     assert a.hit_map.sum() == sum((~d.flags).sum() for d in dets)
     assert all(np.isnan(d.tod[d.flags]).all() for d in dets)
-    c = make_maps(pack(dets), nside, coordinates="E", params=dataclasses.replace(params, flag_seed=10), sky_model=sky)
+    with warnings.catch_warnings(record=True) as caught:  # conditional_mean: the seed has no effect, and says so
+        warnings.simplefilter("always")
+        c = make_maps(pack(dets), nside, coordinates="E", params=dataclasses.replace(params, flag_seed=10), sky_model=sky)
+    assert any("flag_seed has no effect" in str(w.message) for w in caught) == (fill == "conditional_mean")
     if fill == "conditional_mean":
         assert np.allclose(a.maps, sky, rtol=0, atol=1e-10)
         assert np.array_equal(a.maps, c.maps)

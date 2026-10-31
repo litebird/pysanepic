@@ -16,10 +16,10 @@ so new options need no change on the litebird_sim side.
 | `tol`, `maxiter` | 1e-12, 2000 | The PCG stops when $\lvert r\rvert^2/\lvert b\rvert^2 <$ `tol` or after `maxiter` iterations |
 | `angle_dtype` | `np.float32` | Storage of 2a: float32 (angle error ~1e-7 rad) or `np.float64` (exact, 4 more bytes per sample) |
 | `flag_method` | `"marginalize"` | Flagged samples in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact), `"offset"` (one offset per run), `"act"` (Legendre coefficients per run), or `"sanepic"` (fixed gap filling, no extra unknowns; approximate, see below) |
-| `flag_seed` | 0 | Non-negative integer seed for `"sanepic"` gap filling, with independent streams per MPI rank; repeatable with the same input order, chunking and MPI partition |
-| `act_ncoeff` | `None` | With `"act"`: `None` keeps the paper's rule; a positive integer fixes the coefficient count per gap; a callable `(lengths_samples, fs_hz)` returns positive integer counts. Counts are capped at the gap length |
-| `gap_fill` | `"local_white"` | With `"sanepic"`: local line + white noise, `"conditional_mean"` (deterministic), or `"conditional"` (constrained realization). Conditional modes require `sky_model` |
-| `gap_fill_tol`, `gap_fill_maxiter` | 1e-12, 1000 | Squared relative residual threshold and maximum iterations of each conditional gap solve; nonconvergence raises RuntimeError |
+| `flag_seed` | 0 | Non-negative integer seed for `"sanepic"` gap filling, with independent streams per MPI rank; repeatable with the same input order, chunking and MPI partition. A non-zero seed without random filling (other methods, or `"conditional_mean"`) warns |
+| `act_ncoeff` | `None` | With `"act"` (with another method it raises ValueError): `None` keeps the paper's rule; a positive integer fixes the coefficient count per gap; a callable `(lengths_samples, fs_hz)` returns positive integer counts. Counts are capped at the gap length |
+| `gap_fill` | `"local_white"` | With `"sanepic"`: local line + white noise, `"conditional_mean"` (deterministic), or `"constrained"` (constrained realization). Conditional modes require `sky_model` |
+| `gap_fill_tol`, `gap_fill_maxiter` | 1e-12, 1000 | Squared relative residual threshold and maximum iterations of each conditional gap solve; nonconvergence raises RuntimeError. Non-default values without a conditional `gap_fill` raise ValueError. `MapResult.gap_fill_iterations` reports the largest count used |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run. Disabled for DetectorGroup |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
 | `template_dtype` | `np.float32` | Storage of the TODs of the templates fitted with the maps (gains of the calibration, `make_maps(templates=...)`): float32 (4 bytes per sample and template, relative rounding ~6e-8) or `np.float64` (exact, 8 bytes). See [Angle precision](#angle-precision) |
@@ -275,7 +275,7 @@ adding arbitrary white noise would generally change the map.
 
 With the default `gap_fill="local_white"`, `"sanepic"` generates random
 white noise on top of a locally fitted line. That is not a constrained
-realization of the full correlated noise. `gap_fill="conditional"` instead
+realization of the full correlated noise. `gap_fill="constrained"` instead
 draws the Gaussian conditional distribution for the supplied sky/noise model:
 
 $$n_f\mid n_u \sim \mathcal N\!\left(
@@ -292,7 +292,7 @@ from pysanepic import GLSParameters, make_maps
 # output map coordinates ("G" here) and at the output nside, or supplied as alm.
 params = GLSParameters(
     flag_method="sanepic",
-    gap_fill="conditional",       # or "conditional_mean", without random noise
+    gap_fill="constrained",       # or "conditional_mean", without random noise
     gap_fill_tol=1e-12,
     gap_fill_maxiter=1000,
     flag_seed=42,
@@ -322,7 +322,7 @@ With zero DC, a fully missing detector over the complete FFT grid has no
 proper conditional distribution and raises ValueError; use a physically
 defined DC prior to draw such an unconstrained mode. Failure to converge
 raises RuntimeError. The fill is held fixed throughout the map PCG.
-`gap_fill="conditional_mean"` and `"conditional"` require
+`gap_fill="conditional_mean"` and `"constrained"` require
 `flag_method="sanepic"`; choosing them with another method raises ValueError.
 `gap_fill_tol` and `gap_fill_maxiter` control the gap CG, whereas `tol` and
 `maxiter` control the map PCG: these are separate convergence tests.
@@ -376,7 +376,7 @@ chunk identity. Consequently:
 | `gap_fill="conditional_mean"` | No random draws; independent of `flag_seed` |
 | `"marginalize"`, `"offset"` or `"act"` | No random filling; `flag_seed` has no effect |
 
-Only `"local_white"` and `"conditional"` use random draws. The generator
+Only `"local_white"` and `"constrained"` use random draws. The generator
 is reset at each calibration pass, reusing the underlying white draws when
 the chunk/flag layout is unchanged. The filled values can nevertheless
 change because the calibrated residual, fitted baseline or noise scale

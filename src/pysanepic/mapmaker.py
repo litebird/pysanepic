@@ -348,6 +348,10 @@ class MapResult:
         constrained amplitudes. None otherwise.
     calibration_iterations : with calibration, the number of calibration
         iterations done (n_iter, or fewer with gain_tol). None otherwise.
+    gap_fill_iterations : with gap_fill="conditional_mean" or "constrained",
+        the largest number of CG iterations of a gap fill (over the chunks or
+        DetectorGroup chunks of every rank; with calibration, of the last
+        pass), to compare with gap_fill_maxiter. None otherwise.
     """
 
     maps: np.ndarray
@@ -361,6 +365,7 @@ class MapResult:
     templates: dict | None = None
     template_covariance: dict | None = None
     calibration_iterations: int | None = None
+    gap_fill_iterations: int | None = None
 
 
 @dataclass(kw_only=True)
@@ -415,7 +420,7 @@ class GLSParameters:
         positive integer scalar or an array of counts, one per gap. Counts
         are capped at the gap length. Pure, deterministic callables preserve
         reproducibility and the calibration setup reused between iterations.
-    gap_fill : "local_white" (default), "conditional_mean", or "conditional".
+    gap_fill : "local_white" (default), "conditional_mean", or "constrained".
         Used with flag_method="sanepic". Conditional modes require an explicit
         sky_model, condition the residual on all valid samples of a chunk
         (jointly across a DetectorGroup), and also fill unobserved padding.
@@ -1093,29 +1098,33 @@ def _sample_batch(fields, dets, nside, coordinates, nthreads):
 
 
 def _conditional_tod(tod, gls, npix, common_modes, params, rng, nthreads):
-    """Fill noise residuals with the same precision as GLS, one group at a time.
+    """Fill noise residuals with the same precision as GLS, one group at a time;
+    returns the largest number of CG iterations on this rank.
 
     Padding has no observations and must be sampled, not conditioned upon.
     Unpadded chunks retain compact synthetic values instead of full TOD copies.
     """
     grouped = {k for ks, _, _ in common_modes for k in ks}
     groups = list(common_modes) + [([k], None, None) for k in range(len(tod)) if k not in grouped]
+    iterations = 0
     for ks, coupling, mode_psd in groups:
         masks = [(gls.ip[k] < 0) | (gls.ip[k] >= npix) for k in ks]
         if not any(mask.any() for mask in masks):
             continue
-        filled, _ = conditional_gap_fill(
+        filled, info = conditional_gap_fill(
             np.stack([np.asarray(tod[k], dtype=float) for k in ks]), np.stack(masks),
             np.stack([gls.weights[k] for k in ks]), fft_length=gls._nfft[ks[0]],
-            coupling=coupling, mode_psd=mode_psd, draw=params.gap_fill == "conditional",
+            coupling=coupling, mode_psd=mode_psd, draw=params.gap_fill == "constrained",
             rng=rng, tol=params.gap_fill_tol, maxiter=params.gap_fill_maxiter, nthreads=nthreads,
         )
+        iterations = max(iterations, info["iterations"])
         for i, (k, mask) in enumerate(zip(ks, masks)):
             if np.any(gls.ip[k] >= npix):  # padded data already occupies a full copy
                 tod[k] = filled[i].copy()
             elif mask.any():
                 tod[k] = _GapFilledTOD(tod[k], mask, filled[i, mask])
         del filled
+    return iterations
 
 
 def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=None):
@@ -1129,8 +1138,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize', 'offset', 'act' or 'sanepic'")
     if params.flag_method == "act":
         _validate_act_ncoeff(params.act_ncoeff)
-    if params.gap_fill not in ("local_white", "conditional_mean", "conditional"):
-        raise ValueError("gap_fill must be 'local_white', 'conditional_mean' or 'conditional'")
+    if params.gap_fill not in ("local_white", "conditional_mean", "constrained"):
+        raise ValueError("gap_fill must be 'local_white', 'conditional_mean' or 'constrained'")
     conditional = params.gap_fill != "local_white"
     if conditional and params.flag_method != "sanepic":
         raise ValueError("conditional gap_fill requires flag_method='sanepic'")
@@ -1139,6 +1148,16 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     _validate_gap_solve(params.gap_fill_tol, params.gap_fill_maxiter)
     if isinstance(params.flag_seed, (bool, np.bool_)) or not isinstance(params.flag_seed, (int, np.integer)) or params.flag_seed < 0:
         raise ValueError("GLSParameters.flag_seed must be a non-negative integer")
+    # options of another flag treatment are errors, not silently ignored
+    default = GLSParameters()
+    if params.act_ncoeff is not None and params.flag_method != "act":
+        raise ValueError("act_ncoeff requires flag_method='act'")
+    if not conditional and (params.gap_fill_tol != default.gap_fill_tol or params.gap_fill_maxiter != default.gap_fill_maxiter):
+        raise ValueError("gap_fill_tol and gap_fill_maxiter require gap_fill='conditional_mean' or 'constrained'")
+    if params.flag_seed != default.flag_seed and (params.flag_method != "sanepic" or params.gap_fill == "conditional_mean"):
+        warnings.warn(f"flag_seed has no effect with flag_method={params.flag_method!r}"
+                      + (", gap_fill='conditional_mean'" if params.flag_method == "sanepic" else "")
+                      + ": no random gap filling", stacklevel=3)
     if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
         raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
     nc = params.coarse_nside
@@ -1376,8 +1395,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         if fit is not None and fit.fit:
             fit.gls = gls
     del pix_c, a2_c, gamma_c
+    gap_iterations = None
     if conditional:
-        _conditional_tod(tod_c, gls, npix, common_modes, params, flag_rng, nthreads)
+        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, params, flag_rng, nthreads)
+        if comm is not None:
+            gap_iterations = max(comm.allgather(gap_iterations))
     # warm start from the previous calibration iteration (if the pixels are the same)
     x0 = None if fit is None or fit.x0 is None or fit.x0.shape != (gls.ncomp, gls.nobs) else fit.x0
     t2 = time.perf_counter()
@@ -1404,7 +1426,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     hit_map[:n] = gls.full(gls.hits)[:n]
     maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
     if verbose and rank == 0:
-        setup = "GLS setup + conditional fill" if conditional else "GLS setup"
+        setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
               f"({info['iterations']} iterations), maps {time.perf_counter() - t3:.1f} s", flush=True)
     return MapResult(
@@ -1416,6 +1438,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         converged=info["converged"],
         residuals=info["residuals"],
         gains=None if fit is None else fit.gains,
+        gap_fill_iterations=gap_iterations,
     ), gls
 
 

@@ -848,6 +848,8 @@ class GLS:
                 raise ValueError("pixel indices must be < 2^31")
             self.ip.append(np.ascontiguousarray(p, dtype=np.int32))
         self.weights = _chunks(weights)
+        if flag_method != "act" and (act_ncoeff is not None or flag_sampling_rate_hz is not None):
+            raise ValueError("act_ncoeff and flag_sampling_rate_hz require flag_method='act'")
         if flag_method == "act":
             _validate_act_ncoeff(act_ncoeff)
             if flag_sampling_rate_hz is None:
