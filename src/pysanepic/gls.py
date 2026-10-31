@@ -14,8 +14,8 @@ angle_dtype=np.float64). gamma cos 2a and gamma sin 2a are recomputed for each
 chunk when it is used.
 """
 
+import heapq
 import os
-import queue
 import types
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -1493,14 +1493,10 @@ class GLS:
             slot["loc"], slot["sh"] = np.zeros(self.namp), np.zeros(self.nshared)
             if private:
                 slot["map"] = self._maps[j]
-        free = queue.SimpleQueue()
-        for slot in slots:
-            free.put(slot)
         whole = np.array([0, self.nobs], np.int64)  # one thread: all the pixels
 
-        def work(k):
-            slot = free.get() if private else k[1]
-            k = k if private else k[0]
+        def work(task):
+            k, slot = task
             pol, c2, s2 = self._pol_arrays(k, slot)
             t = self._chunk_tod(k, v, tod, loc, c2, s2, pol, slot)
             f = self._filter(t, k, single, slot)
@@ -1508,10 +1504,25 @@ class GLS:
             if not private:
                 return pol, c2, s2, f
             _backproject_1(self.ip[k], f, c2, s2, pol, whole, slot["map"], flag)
-            free.put(slot)
 
         if private:
-            list(pool.map(work, ks))
+            # A dynamic slot queue changes the grouping of floating-point
+            # sums with task completion order, including template amplitudes.
+            # Give each worker a fixed set of chunks and preserve their input
+            # order. Largest-first greedy assignment balances heterogeneous
+            # FFT lengths without allocating a private map for every chunk.
+            batches = [[] for _ in slots]
+            loads = [(0, j) for j in range(nw)]
+            for k in sorted(ks, key=lambda k: -self._nfft[k]):
+                load, j = heapq.heappop(loads)
+                batches[j].append(k)
+                heapq.heappush(loads, (load + self._nfft[k], j))
+
+            def work_batch(j):
+                for k in sorted(batches[j]):
+                    work((k, slots[j]))
+
+            list(pool.map(work_batch, range(nw)))
             _reduce_maps(self._maps[:nw], buf)
         else:
             for i in range(0, len(ks), nw):

@@ -67,12 +67,45 @@ the same true-residual criterion. High-order ACT checks give relative errors
 in $C^T C a-a$ of 4.0e-15 (511 coefficients on 512 samples) and 5.4e-15
 (2047 on 2048), without a stored basis matrix.
 
-The full serial/thread suite passes 185 tests with one default thread,
-including ACT calibration with 32 coefficients, and the flag/fill MPI tests
-pass on two processes. With four default threads, two existing tests
-(`test_pixel_input_and_generator`, `test_covariance_fixed_gains`) fail on
-bitwise-equality assertions, also on the unmodified base commit `d4f86c4`.
-These failures were reproduced separately and were not removed or relaxed.
+## Repeatability of chunk-worker reductions
+
+With four default threads, `test_pixel_input_and_generator` and
+`test_covariance_fixed_gains` previously failed on bitwise-equality
+assertions, also on the base commit `d4f86c4`. The dynamic slot queue changed
+which chunks were summed into each worker's map and template buffers as
+tasks finished, changing floating-point grouping between identical calls.
+A reduced RHS example changed by about 3e-16 relative between executions.
+
+Chunks are now assigned deterministically, balancing FFT lengths with a
+largest-first greedy partition and summing chunks in index order inside each
+worker. This preserves the number of private maps. The regression test
+`test_chunk_workers_repeat_with_different_completion_order` forces different
+completion orders and checks exact equality of RHS and normal products,
+including ACT cuts and local/shared templates, with two/four workers and
+both accumulation paths.
+
+G100, 2026-10-31: **189 tests pass with four default threads**, including
+both original tests without relaxing their assertions and ACT calibration
+with 32 coefficients. The flag, conditional-fill and TOD-template MPI tests
+pass on two processes (three tests per process).
+
+A timing check used 16 intensity-only chunks, 512 pixels, four threads,
+1/f weights and warmed kernels. Uniform chunks have 262144 samples each;
+mixed chunks have 524288 samples at indices 0, 4, 8, 12 and 65536 otherwise.
+Median wall seconds per RHS + normal product, from three groups of three
+pairs:
+
+| chunk lengths | dynamic queue | deterministic partition |
+|---|---|---|
+| uniform | 0.0770 (0.0768–0.0775) | 0.0829 (0.0757–0.0977) |
+| mixed | 0.0604 (0.0604–0.0604) | 0.0546 (0.0546–0.0608) |
+
+The parentheses give the range of the three batch means; these are limited
+timing checks, not a guarantee for arbitrary workload mixtures. Repeated RHS
+differences were 2.6e-15/9.3e-16 relative before the fix and exactly zero
+afterwards for these two cases. Bitwise equality across *different* thread
+counts or MPI partitions is not required; those results are checked within
+numerical tolerances.
 
 ## Covariance of the template amplitudes
 

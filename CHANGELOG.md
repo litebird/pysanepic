@@ -4,6 +4,15 @@
 
 Changes on `main` that are not in a release yet.
 
+- Fix nondeterministic chunk-worker reductions: a dynamic buffer queue
+  changed the grouping of map and template sums with task completion order,
+  causing last-bit differences between identical solves. Deterministic
+  largest-first assignment balances FFT lengths while preserving a fixed
+  sum order per worker, with the same number of private maps. A regression
+  test forces different completion orders for RHS/normal products, including
+  ACT cuts, templates and both accumulation paths. Existing exact-equality
+  tests are retained.
+
 - Conditional gap fills use PCG with independent own-noise sine-transform
   blocks for long gaps, diagonal scaling for short gaps, and an exact
   own-noise inverse for long, fully missing FFT rows. Set

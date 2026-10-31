@@ -32,8 +32,13 @@ With several chunks per process, the products of the PCG and the
 preconditioner of the templates process **one chunk per thread**: each
 thread computes $N^{-1} P v$ of its chunk with single-threaded FFTs and the
 serial numba kernels, in its own buffers (~40 bytes per sample of the
-longest chunk), and adds $P^T$ to a private map, summed at the end. The
-chunks are long and their FFTs memory bound: on G100 (48 cores) one FFT of a
+longest chunk), and adds $P^T$ to a private map, summed at the end.
+Chunks are assigned deterministically to workers, balancing the total FFT
+length per worker, with a fixed accumulation order inside each worker.
+Repeated calls with the same inputs, thread count and chunk layout give
+bitwise-identical sums regardless of task completion order. Different thread
+counts can still change floating-point grouping and are compared numerically.
+The chunks are long and their FFTs memory bound: on G100 (48 cores) one FFT of a
 day of data (3.2 million samples) on 48 threads is only 2–4 times faster than
 on one, while 48 FFTs on one thread each are 15 (float64) to 25 (float32)
 times faster. With 96 chunks of a day, 48 threads and one process, 10 PCG
