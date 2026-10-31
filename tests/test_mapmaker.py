@@ -2093,3 +2093,80 @@ def test_rotation_matrix_astropy():
         R = _rotation_matrix(a, b)
         assert np.allclose(R @ R.T, np.eye(3), atol=1e-12)
         assert np.abs(R - hp.Rotator(coord=[a, b]).mat).max() < tol
+
+
+def test_coarse_null_monopole():
+    """fmin_hz = 0 without padding: the DC weight is 0 and the I monopole has
+    no weight; the coarse level on it is left out (no singular E) and the
+    solve still satisfies A x = b, also in make_maps."""
+    from pysanepic import GLS
+
+    rng = np.random.default_rng(42)
+    for ns in (64, 1000):
+        pix = rng.integers(0, 5, (2, ns))
+        w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0), (2, 1))
+        tod = rng.normal(size=(2, ns))
+        g = GLS(pix, None, w, coarse=lambda labels: np.zeros(len(labels), int))
+        m, info = g.solve(tod, tol=1e-24)
+        assert info["converged"] and np.isfinite(m).all()
+        assert np.allclose(g.apply_A(m), g.rhs(tod), rtol=0, atol=1e-10 * np.abs(g.rhs(tod)).max())
+    nside, n, fs = 8, 24_000, 10.0
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = [dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0))
+            for d in _four_detectors(n, fs, rng, sky, nside)]
+    r = make_maps(data, nside, "E", GLSParameters(chunk_s=1200.0, tol=1e-20))
+    assert r.converged
+
+
+def test_estimate_noise_contiguous_flags():
+    """White noise with the central quarter of every chunk flagged: the PSD is
+    normalized by the energy of the window on the samples left (the fraction
+    of samples would give ~53% of it)."""
+    from pysanepic import estimate_noise
+    from pysanepic.mapmaker import MapResult
+
+    nside, fs, chunk, sigma = 16, 10.0, 4000, 50.0 * np.sqrt(10.0) * 1e-6
+    rng = np.random.default_rng(43)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = _noise_data(rng, nside, sky, fs, chunk, 40, np.ones_like, sigma)
+    truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True, residuals=None)
+    flags = (np.arange(len(data[0].tod)) % chunk >= 3 * chunk // 8) & (np.arange(len(data[0].tod)) % chunk < 5 * chunk // 8)
+    data = [dataclasses.replace(d, tod=np.where(flags, np.nan, d.tod), flags=flags) for d in data]
+    for e in estimate_noise(data, truth, chunk_s=chunk / fs, nbins=30).values():
+        assert abs(np.mean(e.psd) / (2 * sigma**2 / fs) - 1) < 0.05
+
+
+def test_pcg_zero_rhs_and_exact_start():
+    """A zero TOD gives the zero map in 0 iterations; starting from an exact
+    solution (r = b - A x = 0) stops before the first iteration (no 0/0)."""
+    from pysanepic import GLS
+
+    rng = np.random.default_rng(44)
+    pix = rng.integers(0, 5, (2, 64))
+    w = np.tile(one_over_f_weights(64, 10.0, 1.0, 0.5, 1.0, 0.05), (2, 1))
+    for x0 in (None, rng.normal(size=(1, 5))):
+        m, info = GLS(pix, None, w).solve(np.zeros((2, 64)), x0=x0)
+        assert info["converged"] and info["iterations"] == 0 and not m.any()
+    g = GLS(pix, None, w)
+    x = rng.normal(size=g._nsky)
+    b = g._apply(x.copy(), exact=True)
+    y, it, history = g._pcg(b, x.copy(), True, 1e-20, 100, 10, False)
+    assert it == 0 and history == [0.0] and np.array_equal(y, x)
+
+
+def test_shared_covariance_not_converged():
+    """shared_covariance warns when its solves stop at maxiter."""
+    from pysanepic import GLS
+
+    rng = np.random.default_rng(45)
+    npix, ns, nchunk = 6, 96, 4
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    shared = [(k, rng.normal(size=ns), np.full(ns, k % 2)) for k in range(nchunk)]
+    g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, shared_templates=shared, template_dtype=np.float64)
+    with pytest.warns(UserWarning, match="did not converge"):
+        g.shared_covariance(tol=1e-26, maxiter=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        g.shared_covariance(tol=1e-20, maxiter=1000)

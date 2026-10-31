@@ -1447,7 +1447,7 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
     The residual d - P m of each DetectorData, with m the maps of `result`
     (a MapResult, e.g. a first make_maps), is cut in chunks of `chunk_s`
     seconds; the periodogram of each chunk (Hann window, flagged samples set
-    to 0 and their fraction corrected) is averaged over all the chunks of the
+    to 0, normalized by the window energy left) is averaged over all the chunks of the
     DetectorData with the same `name` (on all MPI processes), in `nbins`
     logarithmic bins from 1/chunk_s to fs/2.
 
@@ -1491,7 +1491,8 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
             if good < 0.5:
                 continue
             win = np.hanning(x.size)
-            p = 2 * np.abs(ducc0.fft.r2c(x * win, nthreads=nthreads)) ** 2 / (fs * np.sum(win**2) * good)
+            w2 = win**2 if d.flags is None else np.where(d.flags[a:b], 0.0, win**2)  # flagged: the window energy left
+            p = 2 * np.abs(ducc0.fft.r2c(x * win, nthreads=nthreads)) ** 2 / (fs * np.sum(w2))
             f = np.fft.rfftfreq(x.size, 1 / fs)
             k = np.searchsorted(edges, f[1:-1], side="right") - 1
             ok = (k >= 0) & (k < nbins)

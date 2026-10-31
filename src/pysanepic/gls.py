@@ -17,6 +17,7 @@ chunk when it is used.
 import os
 import queue
 import types
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -791,11 +792,11 @@ class GLS:
         if (bad if comm is None else comm.allreduce(bad)) > 0:
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
         self._set_preconditioner(blocks, preconditioner)
-        del blocks
         self._full = self._buf = self._locbuf = None  # work maps, allocated by _apply
         self._einv = None
         if coarse is not None:
-            self._set_coarse(coarse)
+            self._set_coarse(coarse, blocks[:, 0])
+        del blocks
 
     def set_templates(self, templates=None, shared_templates=None):
         """Set (or replace) `templates` and `shared_templates` (see the class),
@@ -983,8 +984,9 @@ class GLS:
         for values, labels in self._shared[k]:
             _template_transpose(values, labels, f, sh)
 
-    def _set_coarse(self, coarse):
-        """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`)."""
+    def _set_coarse(self, coarse, diag_i):
+        """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`);
+        diag_i: the I diagonal of A on this rank's pixels."""
         parent = np.asarray(coarse(np.arange(self.lo, self.hi)), dtype=np.int64)
         parent[~self.mask[0]] = -1
         nz = int(parent.max(initial=-1)) + 1
@@ -1002,8 +1004,14 @@ class GLS:
         if self.comm is not None:
             E = self.comm.allreduce(E)
         E = E[np.ix_(used, used)]
+        # Pseudo-inverse in units of the summed diagonal of A: coarse modes with no
+        # weight (the monopole with fmin = 0 and no padding) are left to the PCG
+        s = 1.0 / np.sqrt(self._csum(diag_i[self._cidx], nz)[used])
+        vals, vecs = np.linalg.eigh(0.5 * (E + E.T) * np.outer(s, s))
+        keep = vals > 1e-10
+        vecs = vecs[:, keep] * s[:, None]
         self._einv = np.zeros((nz, nz))
-        self._einv[np.ix_(used, used)] = np.linalg.inv(0.5 * (E + E.T))
+        self._einv[np.ix_(used, used)] = (vecs / vals[keep]) @ vecs.T
         self._nz = nz
 
     def _csum(self, v, nz):
@@ -1333,18 +1341,25 @@ class GLS:
         A^-1, with A the operator of solve() (with `shared_groups`, of its
         pseudo-inverse on the constraints: the covariance of the projected
         amplitudes). One PCG solve per shared amplitude, A x = e_j, with the
-        current templates. (nshared, nshared) on every rank; collective."""
+        current templates. (nshared, nshared) on every rank; collective. Warns
+        if some of the solves do not converge within `maxiter`."""
         n = self._nsky + self.nflag + self.namp + self._nsh_loc
         cov = np.zeros((self.nshared, self.nshared))
+        failed = []
         for j in range(self.nshared):
             b = np.zeros(n)
             if self._root:
                 b[n - self.nshared + j] = 1.0
                 self._project_shared(b[n - self.nshared :])
-            x, _, _ = self._pcg(b, np.zeros(n), False, tol, maxiter, recompute_every, verbose)
+            x, _, history = self._pcg(b, np.zeros(n), False, tol, maxiter, recompute_every, verbose)
+            if history[-1] > tol:
+                failed.append(j)
             if self._root:
                 cov[:, j] = x[n - self.nshared :]
         self._free()
+        if failed and (self.comm is None or self.comm.rank == 0):
+            warnings.warn(f"shared_covariance: the solves of columns {failed} did not converge in {maxiter} "
+                          "iterations (raise maxiter or tol)", stacklevel=2)
         return cov if self.comm is None else self.comm.bcast(cov)
 
     def _free(self):
@@ -1362,6 +1377,9 @@ class GLS:
 
     def _pcg_loop(self, b, x, start, tol, maxiter, recompute_every, verbose):
         bb = self._dot(b, b)
+        if bb == 0:  # b = 0: the solution is x = 0
+            x[:] = 0.0
+            return x, 0, [0.0]
         r = b - self._apply(x, exact=True) if start else b.copy()  # A 0 = 0: no product
         z = self._precond_flat(r)
         d = z.copy()
@@ -1370,7 +1388,7 @@ class GLS:
         true_residual = True  # r was computed as b - A x in float64
 
         it = 0
-        while it < maxiter and (it == 0 or history[-1] > tol):
+        while it < maxiter and history[-1] > tol:
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
             _axpy(x, alpha, d)
