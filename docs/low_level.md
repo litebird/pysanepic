@@ -16,7 +16,7 @@ see {func}`~pysanepic.fast_fft_length`), and `weights` are on their rfft
 grid. Negative pixels mark flagged samples: samples of a chunk with the same
 negative value share an unknown that is not in the maps (one value per sample
 for the exact GLS without them); `apply_A` and `rhs` are then not available,
-use `solve`. With `GLS(..., flag_method="sanepic")`, negative pixels instead
+use `solve`. With `GLS(..., flag_method="fill")`, negative pixels instead
 have zero pointing/template rows and no unknowns: their **finite, already
 gap-filled TOD** is retained in the RHS (the caller fills it; `make_maps`
 does this automatically). This is approximate, not exact marginalization;
@@ -32,8 +32,9 @@ the count, and a callable `(lengths_samples, fs_hz)` returns a positive integer
 scalar or an array of counts (one per gap, capped at its length). For example
 `act_ncoeff=3` fits quadratics and `act_ncoeff=1` fits offsets.
 
-`gap_fill`, `gap_fill_tol`, `gap_fill_maxiter`, `gap_fill_preconditioner` and `flag_seed` are high-level
-GLSParameters settings, not arguments of GLS. To prepare a low-level SANEPIC
+`act_ncoeff` and `flag_sampling_rate_hz` require `flag_method="act"`.
+The fill itself ({class}`~pysanepic.GapFill`) is a high-level setting, not
+an argument of GLS. To prepare a gap-filled
 TOD, use {func}`~pysanepic.conditional_gap_fill` on the noise residual after
 subtracting a sky estimate, then pass the filled residual to GLS.solve with
 the flagged pointing rows negative. Restore the sky estimate separately

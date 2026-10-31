@@ -5,7 +5,7 @@ import dataclasses
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, GLS, GLSParameters, OneOverFNoise, Pointing, make_maps, one_over_f_weights
+from pysanepic import ACTCuts, DetectorData, GapFill, GLS, GLSParameters, OneOverFNoise, Pointing, make_maps, one_over_f_weights
 from pysanepic.gls import _act_ncoeff
 
 
@@ -181,19 +181,18 @@ def test_act_make_maps(pad_s, ncoeff):
     d = DetectorData(tod=np.where(flags, np.nan, tod), flags=flags,
                      pointing=Pointing(pix=pix, psi=psi, nside=nside, coordinates="E"),
                      sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40., fknee_hz=0.5, fmin_hz=0.05))
-    params = GLSParameters(flag_method="act", act_ncoeff=ncoeff, chunk_s=50., split_gap_s=4., pad_s=pad_s,
+    params = GLSParameters(flag_method=ACTCuts(ncoeff=ncoeff), chunk_s=50., split_gap_s=4., pad_s=pad_s,
                            angle_dtype=np.float64, min_pol_rcond=0, tol=1e-24)
     a = make_maps([d], nside, coordinates="E", params=params)
-    with pytest.warns(UserWarning, match="flag_seed has no effect"):
-        b = make_maps([dataclasses.replace(d, tod=np.where(flags, 1e30, tod))], nside, coordinates="E",
-                      params=dataclasses.replace(params, flag_seed=19), nthreads=2)
+    b = make_maps([dataclasses.replace(d, tod=np.where(flags, 1e30, tod))], nside, coordinates="E",
+                  params=params, nthreads=2)
     assert a.converged and b.converged
     assert np.allclose(a.maps, sky, rtol=0, atol=1e-9)
     assert np.allclose(a.maps, b.maps, rtol=0, atol=1e-10)
     assert a.hit_map.sum() == (~flags).sum()
     assert np.isnan(d.tod[flags]).all()
     if ncoeff == 1:
-        offset = make_maps([d], nside, coordinates="E", params=dataclasses.replace(params, flag_method="offset", act_ncoeff=None))
+        offset = make_maps([d], nside, coordinates="E", params=dataclasses.replace(params, flag_method="offset"))
         assert np.allclose(a.maps, offset.maps, rtol=0, atol=1e-10)
 
 
@@ -212,26 +211,25 @@ def test_act_ncoeff_validation(rule):
         GLS(np.array([0, -1, 0]), None, np.ones(2), flag_method="act", flag_sampling_rate_hz=20., act_ncoeff=rule)
 
 
-def test_options_of_other_flag_methods():
-    """Options of another flag treatment raise (flag_seed only warns)."""
-    for kw in ({"act_ncoeff": 3}, {"act_ncoeff": 3, "flag_method": "sanepic"}, {"gap_fill_tol": 1e-20},
-               {"gap_fill_maxiter": 50, "flag_method": "sanepic"}):
-        with pytest.raises(ValueError, match="act_ncoeff|gap_fill_tol"):
-            make_maps([], 1, params=GLSParameters(**kw))
-    for kw in ({"flag_method": "act"}, {"flag_method": "marginalize"},
-               {"flag_method": "sanepic", "gap_fill": "conditional_mean"}):
-        with pytest.warns(UserWarning, match="flag_seed has no effect"):
-            make_maps([], 1, params=GLSParameters(flag_seed=3, **kw), sky_model=np.zeros((3, 12)))
+def test_flag_method_objects():
+    """Each treatment validates its own options; "act" is ACTCuts()."""
+    for method in ("sanepic", "drop", "ACT", None, 1):
+        with pytest.raises(ValueError, match="flag_method"):
+            make_maps([], 1, params=GLSParameters(flag_method=method))
+    for kw in ({"mode": "x"}, {"seed": -1}, {"seed": True}, {"seed": np.True_}, {"seed": 1.5},
+               {"tol": 1e-20}, {"maxiter": 50}, {"preconditioner": None},  # CG options of local_white
+               {"mode": "constrained", "tol": 0.}, {"mode": "constrained", "maxiter": 0}):
+        with pytest.raises(ValueError, match="GapFill|gap fill"):
+            GapFill(**kw)
+    with pytest.warns(UserWarning, match="seed has no effect"):
+        GapFill(mode="conditional_mean", seed=3)
+    with pytest.raises(ValueError, match="act_ncoeff"):
+        ACTCuts(ncoeff=0)
+    assert GapFill(mode="constrained", seed=3) == GapFill(mode="constrained", seed=3)
     for kw in ({"act_ncoeff": 2}, {"flag_sampling_rate_hz": 20.}):
-        for method in ("marginalize", "sanepic"):
+        for method in ("marginalize", "fill"):
             with pytest.raises(ValueError, match="flag_method='act'"):
                 GLS(np.array([0, -1, 0]), None, np.ones(2), flag_method=method, **kw)
-
-
-def test_act_invalid_ncoeff_without_flags():
-    """Reject invalid static options before data is read, even without cuts."""
-    with pytest.raises(ValueError, match="act_ncoeff"):
-        make_maps([], 1, params=GLSParameters(flag_method="act", act_ncoeff=0))
 
 
 @pytest.mark.parametrize("ns", [20, 64])

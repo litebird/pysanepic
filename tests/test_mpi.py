@@ -189,15 +189,15 @@ def test_flags_mpi():
     mine = slice(comm.rank, None, comm.size)
     rules = [("marginalize", None), ("act", None), ("act", 3),
              ("act", lambda n, fs: 1 + np.ceil(n / fs / 2).astype(int)),
-             ("act", lambda n, fs: np.maximum(1, n - 1)), ("sanepic", None)]
+             ("act", lambda n, fs: np.maximum(1, n - 1)), ("fill", None)]
     for method, rule in rules:
-        # SANEPIC receives the same finite gap filling on every partition.
+        # "fill" receives the same finite gap filling on every partition.
         kw = dict(min_pol_rcond=0.0, flag_method=method,
                   flag_sampling_rate_hz=10.0 if method == "act" else None, act_ncoeff=rule)
         g = GLS(pix[mine], psi[mine], w[mine], comm=comm, **kw)
         m, info = g.solve(tod[mine], tol=1e-24)
         assert info["converged"]
-        if method == "sanepic":
+        if method == "fill":
             assert g.nflag == 0
         if comm.rank == 0:
             ms, _ = GLS(pix, psi, w, **kw).solve(tod, tol=1e-24)
@@ -206,7 +206,7 @@ def test_flags_mpi():
 
 def test_conditional_fill_mpi():
     """Conditional means, also for groups and padding, are partition invariant."""
-    from pysanepic import (CommonMode, DetectorData, DetectorGroup, GLSParameters,
+    from pysanepic import (CommonMode, DetectorData, DetectorGroup, GapFill, GLSParameters,
                           OneOverFNoise, Pointing, make_maps)
 
     comm = MPI.COMM_WORLD
@@ -228,7 +228,7 @@ def test_conditional_fill_mpi():
                                     sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40., fknee_hz=0.5, fmin_hz=0.05)))
         groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=np.array([1., 0.8]),
                       noise=OneOverFNoise(net_ukrts=60., fknee_hz=0.8, fmin_hz=0.05))]))
-    params = GLSParameters(flag_method="sanepic", gap_fill="conditional_mean", pad_s=0.5,
+    params = GLSParameters(flag_method=GapFill(mode="conditional_mean"), pad_s=0.5,
                            angle_dtype=np.float64, tol=1e-20)
     for grouped in (False, True):
         data = groups if grouped else [d for g in groups for d in g.detectors]

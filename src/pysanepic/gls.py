@@ -783,7 +783,7 @@ class GLS:
         Samples of a chunk with the same negative value share an
         intensity unknown, local to this rank and discarded: one value per
         sample is the exact GLS without them (marginalization), one per
-        contiguous run fits an offset to it. With flag_method="sanepic",
+        contiguous run fits an offset to it. With flag_method="fill",
         instead they have no unknowns and their gap-filled TOD is used.
     psi : float array(s) like `pix`, or None
         Polarization angle of each sample. None for intensity only.
@@ -890,16 +890,17 @@ class GLS:
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
-    flag_method : "marginalize" (default), "act" or "sanepic"
+    flag_method : "marginalize" (default), "act" or "fill"
         With "act", each contiguous run of negative pixels is represented by
         local Legendre coefficients following Naess et al. (2025), Sect.
         3.3.3, instead of one unknown per sample. Flagged TOD is set to zero,
         with no random filling; original flagged values are never used.
-        With "sanepic", negative pixels have no parameters: their rows of P
+        With "fill", negative pixels have no parameters: their rows of P
         and of the templates are zero. solve()/rhs() retain their TOD, which
         must already be finite gap-filled data. The normal matrix is the sky
         block of the extended system, without the marginalization correction
-        (Patanchon et al. 2008, Sect. 3.6). make_maps fills these gaps itself.
+        (Patanchon et al. 2008, Sect. 3.6). make_maps fills these gaps itself
+        (GLSParameters.flag_method=GapFill(...)).
     flag_sampling_rate_hz : scalar or one value per chunk
         Required with flag_method="act" to convert gap lengths to seconds.
     act_ncoeff : None, positive int, or callable
@@ -915,9 +916,9 @@ class GLS:
 
     def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None):
         self.comm = comm
-        if flag_method not in ("marginalize", "act", "sanepic"):
-            raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'sanepic' (offsets use repeated negative pixel labels)")
-        self._sanepic_flags = flag_method == "sanepic"
+        if flag_method not in ("marginalize", "act", "fill"):
+            raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'fill' (offsets use repeated negative pixel labels)")
+        self._filled_flags = flag_method == "fill"
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
         for p in _chunks(pix):
@@ -973,7 +974,7 @@ class GLS:
         self.nflag = 0
         self._cuts = [np.empty((0, 4), np.int64) for _ in self.ip]
         for k, p in enumerate(self.ip):
-            if self._sanepic_flags:
+            if self._filled_flags:
                 continue  # negative labels remain excluded, without PCG state
             flagged = np.flatnonzero(p < 0)
             if flagged.size:
@@ -1534,13 +1535,13 @@ class GLS:
             self._shbuf += slot["sh"]
 
     def _chunk_tod(self, k, v, tod, loc, c2, s2, pol, slot=None):
-        """P v, or chunk TOD (marginalized flags set to 0, SANEPIC fills kept);
+        """P v, or chunk TOD (marginalized flags set to 0, gap fills kept);
         with a chunk worker's `slot`, in its buffer and single-threaded."""
         ip = self.ip[k]
         if v is None:
             t = np.asarray(tod[k], dtype=float)
-            if self._sanepic_flags and not np.all(np.isfinite(t[ip < 0])):
-                raise ValueError("SANEPIC flagged TOD must be finite gap-filled data; make_maps fills it automatically")
+            if self._filled_flags and not np.all(np.isfinite(t[ip < 0])):
+                raise ValueError("flag_method='fill' needs finite gap-filled TOD at flagged samples; make_maps fills it (GapFill)")
             if self.nflag:  # the TOD of flagged samples is not used (it may be NaN)
                 t = np.where((ip < 0) | (ip >= self.nobs), 0.0, t)
             return t

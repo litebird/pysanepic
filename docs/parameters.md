@@ -15,12 +15,7 @@ so new options need no change on the litebird_sim side.
 | `preconditioner` | `"block"` | `"block"`: exact 3×3 I/Q/U block of $P^T N^{-1} P$ per pixel; `"jacobi"`: original SANEPIC |
 | `tol`, `maxiter` | 1e-12, 2000 | The PCG stops when $\lvert r\rvert^2/\lvert b\rvert^2 <$ `tol` or after `maxiter` iterations |
 | `angle_dtype` | `np.float32` | Storage of 2a: float32 (angle error ~1e-7 rad) or `np.float64` (exact, 4 more bytes per sample) |
-| `flag_method` | `"marginalize"` | Flagged samples in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact), `"offset"` (one offset per run), `"act"` (Legendre coefficients per run), or `"sanepic"` (fixed gap filling, no extra unknowns; approximate, see below) |
-| `flag_seed` | 0 | Non-negative integer seed for `"sanepic"` gap filling, with independent streams per MPI rank; repeatable with the same input order, chunking and MPI partition. A non-zero seed without random filling (other methods, or `"conditional_mean"`) warns |
-| `act_ncoeff` | `None` | With `"act"` (with another method it raises ValueError): `None` keeps the paper's rule; a positive integer fixes the coefficient count per gap; a callable `(lengths_samples, fs_hz)` returns positive integer counts. Counts are capped at the gap length |
-| `gap_fill` | `"local_white"` | With `"sanepic"`: local line + white noise, `"conditional_mean"` (deterministic), or `"constrained"` (constrained realization). Conditional modes require `sky_model` |
-| `gap_fill_tol`, `gap_fill_maxiter` | 1e-12, 1000 | Squared relative residual threshold and maximum iterations of each conditional gap solve; nonconvergence raises RuntimeError. Non-default values without a conditional `gap_fill` raise ValueError. `MapResult.gap_fill_iterations` reports the largest count used |
-| `gap_fill_preconditioner` | `"sine"` | Conditional fills: independent own-noise sine-transform blocks for long gaps; `None` disables preconditioning. Non-default values without a conditional fill raise ValueError |
+| `flag_method` | `"marginalize"` | Flagged samples in runs shorter than `split_gap_s`: `"marginalize"` (one unknown per sample, exact), `"offset"` (one offset per run), `ACTCuts(...)` (polynomial coefficients per run; `"act"` is `ACTCuts()`), or `GapFill(...)` (fixed gap filling, no extra unknowns; approximate). Each treatment's options are in its class, see [flagged samples](#flagged-samples) |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run. Disabled for DetectorGroup |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
 | `template_dtype` | `np.float32` | Storage of the TODs of the templates fitted with the maps (gains of the calibration, `make_maps(templates=...)`): float32 (4 bytes per sample and template, relative rounding ~6e-8) or `np.float64` (exact, 8 bytes). See [Angle precision](#angle-precision) |
@@ -167,14 +162,14 @@ applied with FFTs on contiguous chunks:
 |---|---|---|---|---|
 | `flag_method="marginalize"` | one per flagged sample | exact GLS without them | ~70 bytes per flagged sample | slowed down by long gaps |
 | `flag_method="offset"` | one per run of flagged samples, set to 0 | unbiased in the linear problem, generally not exact | ~70 bytes per run | long runs cost fewer unknowns |
-| `flag_method="act"` | Legendre coefficients per run, samples set to 0 | unbiased in the linear problem, generally not exact | ~70 bytes per coefficient + 32 bytes per nonconstant run | fewer unknowns than per sample for extended gaps |
-| `flag_method="sanepic"` | none; fill selected by `gap_fill`, fixed during the map solve | approximate; a conditional fill is exact only for the supplied residual/model | 8 bytes per flag + mask views, no extra map PCG state (without padding); conditional fill has temporary solver buffers | no extra map unknowns; conditional fill has an inner CG |
+| `flag_method=ACTCuts(...)` | Legendre coefficients per run, samples set to 0 | unbiased in the linear problem, generally not exact | ~70 bytes per coefficient + 32 bytes per nonconstant run | fewer unknowns than per sample for extended gaps |
+| `flag_method=GapFill(...)` | none; fill selected by `GapFill.mode`, fixed during the map solve | approximate; a conditional fill is exact only for the supplied residual/model | 8 bytes per flag + mask views, no extra map PCG state (without padding); conditional fill has temporary solver buffers | no extra map unknowns; conditional fill has an inner CG |
 | splitting (`split_gap_s`) | none: the run is dropped and the chunk split | noise correlations across the gap neglected | less | not slowed down |
 
 Runs at least `split_gap_s` long are split, the shorter ones are handled by
 `flag_method`. DetectorGroup chunks are never split at gaps: the detectors
 must retain the same time grid. The benchmark below compares only the
-marginalize, offset and splitting methods, not ACT or SANEPIC filling.
+marginalize, offset and splitting methods, not ACT cuts or gap filling.
 Inside a long gap the unknowns of `"marginalize"` are strongly
 correlated by the 1/f noise and converge slowly: on two days of 4 detectors
 ($f_\text{knee}$ = 50 mHz) a one-hour gap took the PCG from 25 to 71
@@ -184,11 +179,14 @@ the same test all the methods gave the same map errors (see the
 many short chunks of any length; their FFTs run on fast lengths (see
 [noise model](algorithm.md#noise-model)), so this costs no extra time either.
 
-`"sanepic"` implements the approximate normal matrix of
+### Gap filling
+
+`flag_method=GapFill(mode=..., seed=0, tol=1e-12, maxiter=1000,
+preconditioner="sine")` implements the approximate normal matrix of
 [Patanchon et al. (2008), Sect. 3.6](https://arxiv.org/abs/0711.3462).
 The flagged rows of the pointing and fitted templates are zero, with no
 dummy-pixel parameters or Schur-complement correction. With the default
-`gap_fill="local_white"`, each gap is filled with a line fitted to valid
+`mode="local_white"` (SANEPIC's own fill), each gap is filled with a line fitted to valid
 samples within 20 samples
 on each side, plus independent Gaussian white noise whose rms is estimated
 from the fit residual (two fitted parameters). At a chunk edge only the
@@ -210,7 +208,7 @@ to `"marginalize"`, including its memory cost.
 
 ### ACT cut model
 
-`flag_method="act"` implements the compressed cut model of
+`flag_method=ACTCuts(ncoeff=None)` implements the compressed cut model of
 [Naess et al. (2025), Sect. 3.3.3](https://arxiv.org/abs/2503.14451), with
 the sky and fitted templates zero on the flags and a Legendre series fitted
 in each contiguous run. A run of length up to 1 / 3 / 6 / 20 samples has
@@ -220,23 +218,23 @@ Ties round upward, and the count is capped at the number of samples. These
 are the ACT thresholds, retained literally at LiteBIRD sampling rates, not
 an optimization for LiteBIRD. `split_gap_s` still applies first.
 
-`act_ncoeff` overrides this rule, both in `GLSParameters` and low-level `GLS`:
+`ACTCuts.ncoeff` overrides this rule (`act_ncoeff` in low-level `GLS`):
 
 ```python
 import numpy as np
-from pysanepic import GLSParameters
+from pysanepic import ACTCuts, GLSParameters
 
-# Published ACT rule (default).
-params = GLSParameters(flag_method="act", act_ncoeff=None)
+# Published ACT rule (default): "act" is the same.
+params = GLSParameters(flag_method=ACTCuts())
 
 # Fixed coefficient count per gap: 1 = offset, 2 = linear, 3 = quadratic.
-params = GLSParameters(flag_method="act", act_ncoeff=3)
+params = GLSParameters(flag_method=ACTCuts(ncoeff=3))
 
 # One constant plus one coefficient per two seconds, at most eight.
 def cut_counts(lengths_samples, fs_hz):
     return np.minimum(8, 1 + np.ceil(lengths_samples / fs_hz / 2).astype(int))
 
-params = GLSParameters(flag_method="act", act_ncoeff=cut_counts)
+params = GLSParameters(flag_method=ACTCuts(ncoeff=cut_counts))
 ```
 
 This is a **coefficient count**, not a polynomial degree: degree = count - 1.
@@ -245,7 +243,7 @@ for custom rules. A callable receives all gap lengths of one chunk as a 1D
 integer array and that chunk's sampling rate in Hz; it must return a positive
 integer scalar or a positive integer array of the same shape. It should be
 pure and deterministic, since calibration reuses the GLS setup with the same
-cuts. Invalid counts or shapes raise ValueError. `act_ncoeff=1` is equivalent
+cuts. Invalid counts or shapes raise ValueError. `ncoeff=1` is equivalent
 to `"offset"`; a rule returning `lengths_samples` gives exact marginalization.
 Custom rules tune the approximation and should be validated against it.
 
@@ -270,21 +268,21 @@ the noise weighting and need not give minimum-variance maps.
 This reproduces the cut parametrization, not ACT's full preprocessing:
 their Sect. 3.1 also predicts glitch values using other detectors before
 noise estimation and filtering. Here the flagged input TOD is always ignored
-and replaced by zero, with no random fill or dependence on `flag_seed`.
+and replaced by zero, with no random fill and no seed.
 
-### Gap filling and noise realizations
+### Fills and noise realizations
 
 Gap filling means assigning numbers to missing time samples so that regular
 FFTs can be used; it does not necessarily mean adding random noise.
-`"marginalize"`, `"offset"` and `"act"` use zeros as a reference and fit free
+`"marginalize"`, `"offset"` and `ACTCuts` use zeros as a reference and fit free
 parameters there. With one free value per sample any fixed fill would give
 the same map, since its change can be absorbed by the nuisance parameters.
 With a restricted polynomial basis only changes in that basis are absorbed;
 adding arbitrary white noise would generally change the map.
 
-With the default `gap_fill="local_white"`, `"sanepic"` generates random
+With the default `mode="local_white"`, `GapFill` generates random
 white noise on top of a locally fitted line. That is not a constrained
-realization of the full correlated noise. `gap_fill="constrained"` instead
+realization of the full correlated noise. `mode="constrained"` instead
 draws the Gaussian conditional distribution for the supplied sky/noise model:
 
 $$n_f\mid n_u \sim \mathcal N\!\left(
@@ -295,19 +293,19 @@ where $u$ are valid samples and $f$ the gaps, using the noise residual after
 subtracting the supplied sky and current known templates. Use:
 
 ```python
-from pysanepic import GLSParameters, make_maps
+from pysanepic import GapFill, GLSParameters, make_maps
 
 # data, nside and initial.maps are already available; the model is in the
 # output map coordinates ("G" here) and at the output nside, or supplied as alm.
-params = GLSParameters(
-    flag_method="sanepic",
-    gap_fill="constrained",       # or "conditional_mean", without random noise
-    gap_fill_tol=1e-12,
-    gap_fill_maxiter=1000,
-    gap_fill_preconditioner="sine",  # None: ordinary CG for comparison
-    flag_seed=42,
+fill = GapFill(
+    mode="constrained",       # or "conditional_mean", without random noise
+    seed=42,
+    tol=1e-12,
+    maxiter=1000,
+    preconditioner="sine",    # None: ordinary CG for comparison
 )
-result = make_maps(data, nside, params=params, sky_model=initial.maps)
+result = make_maps(data, nside, params=GLSParameters(flag_method=fill), sky_model=initial.maps)
+print(result.gap_fill_iterations)  # the largest gap CG count, against maxiter
 ```
 
 `sky_model` is required to distinguish noise from the sky signal; for
@@ -320,7 +318,7 @@ with gaps, not used as a constraint; its initial `pad_fill` is immaterial.
 Chunks removed by `split_gap_s` are still removed before filling.
 
 The implementation solves $Q_{ff}x=-Q_{fu}n_u+g_f$, with $Q=N^{-1}$ and
-$\operatorname{Cov}(g)=Q$. Dropping $g_f$ gives `"conditional_mean"`.
+$\operatorname{Cov}(g)=Q$. Dropping $g_f$ gives `mode="conditional_mean"`.
 Products use FFTs without a dense time-domain covariance. For common modes,
 a low-rank factor generates $g$ without a dense detector covariance per
 frequency. The draw uses the full FFT grid, including an FFT extension,
@@ -332,11 +330,12 @@ With zero DC, a fully missing detector over the complete FFT grid has no
 proper conditional distribution and raises ValueError; use a physically
 defined DC prior to draw such an unconstrained mode. Failure to converge
 raises RuntimeError. The fill is held fixed throughout the map PCG.
-`gap_fill="conditional_mean"` and `"constrained"` require
-`flag_method="sanepic"`; choosing them with another method raises ValueError.
-`gap_fill_tol` and `gap_fill_maxiter` control the gap CG, whereas `tol` and
-`maxiter` control the map PCG: these are separate convergence tests.
-`gap_fill_preconditioner="sine"` (default) uses positive definite blocks
+`GapFill.tol` and `GapFill.maxiter` control the gap CG, whereas
+`GLSParameters.tol` and `maxiter` control the map PCG: these are separate
+convergence tests. They and `GapFill.preconditioner` are for the
+conditional modes: values other than the defaults with `mode="local_white"`
+raise ValueError.
+`preconditioner="sine"` (default) uses positive definite blocks
 for individual gaps. Runs longer than 32 samples use an orthonormal DST-I
 and the detector's own inverse noise spectrum interpolated at frequencies
 `j / (2 * (gap_length + 1))` in cycles per sample. Short runs use the
@@ -349,11 +348,11 @@ effectiveness for arbitrary spectra or common modes is not guaranteed.
 `None` disables it for comparisons. Both modes stop on the true,
 unpreconditioned squared relative residual; preconditioning does not alter
 the conditional distribution. No random numbers are consumed by setup.
-`flag_seed` controls the random draw for a fixed MPI partition and input order;
-`"conditional_mean"` consumes no random numbers.
+`GapFill.seed` controls the random draw for a fixed MPI partition and input
+order; `"conditional_mean"` consumes no random numbers (a non-zero seed warns).
 
 The conditional draw is correct for the *supplied residual and noise model*.
-A single fill frozen during the approximate SANEPIC solve is not exact GLS
+A single fill frozen during the approximate gap-filled solve is not exact GLS
 marginalization or a Gibbs map sampler. Updating the model and resampling
 the map jointly would require a separate outer algorithm. `"marginalize"`
 remains the exact reference for maps without a frozen-fill approximation.
@@ -380,11 +379,11 @@ the squared relative residual of the gap solve.
 
 ### Random seeds and MPI
 
-Pass the **same** non-negative `flag_seed` (default 0) on every MPI rank.
+Pass the **same** non-negative `GapFill.seed` (default 0) on every MPI rank.
 Each rank constructs its own stream:
 
 ```python
-rng = np.random.default_rng(np.random.SeedSequence([flag_seed, rank]))
+rng = np.random.default_rng(np.random.SeedSequence([seed, rank]))
 ```
 
 This gives distinct streams across ranks. A stream is consumed sequentially
@@ -396,8 +395,8 @@ chunk identity. Consequently:
 | Same inputs, flags, chunking, rank assignment and local order | Repeatable within floating-point precision |
 | Only the thread count changes | Same random numbers; small numerical differences may remain |
 | Rank count, rank assignment, chunking or input order changes | Generally a different realization |
-| `gap_fill="conditional_mean"` | No random draws; independent of `flag_seed` |
-| `"marginalize"`, `"offset"` or `"act"` | No random filling; `flag_seed` has no effect |
+| `GapFill(mode="conditional_mean")` | No random draws; independent of the seed |
+| `"marginalize"`, `"offset"` or `ACTCuts` | No random filling and no seed |
 
 Only `"local_white"` and `"constrained"` use random draws. The generator
 is reset at each calibration pass, reusing the underlying white draws when

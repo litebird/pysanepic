@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import pytest
 
-from pysanepic import (CalibrationParameters, CommonMode, DetectorData, DetectorGroup, GLSParameters, OneOverFNoise,
+from pysanepic import (CalibrationParameters, CommonMode, DetectorData, DetectorGroup, GapFill, GLSParameters, OneOverFNoise,
                        Pointing, conditional_gap_fill, make_maps, one_over_f_weights)
 
 
@@ -181,8 +181,10 @@ def test_sine_preconditioner_spd_white_full_and_null_dc():
     assert np.allclose(white, plain, rtol=0, atol=1e-13)
     with pytest.raises(ValueError, match="preconditioner"):
         conditional_gap_fill(data, flags[0], w[0], preconditioner="invalid")
-    with pytest.raises(ValueError, match="gap_fill_preconditioner"):
-        make_maps([], 1, params=GLSParameters(gap_fill_preconditioner=None))
+    with pytest.raises(ValueError, match="preconditioner"):
+        GapFill(preconditioner=None)  # local_white has no CG
+    with pytest.raises(ValueError, match="preconditioner"):
+        GapFill(mode="constrained", preconditioner="invalid")
 
 
 def test_conditional_dc_null_draw_statistics():
@@ -218,21 +220,21 @@ def test_conditional_make_maps(fill, pad_s, grouped):
                                 sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40., fknee_hz=0.5, fmin_hz=0.05)))
     modes = [CommonMode(coupling=np.array([1., 0.8]), noise=OneOverFNoise(net_ukrts=60., fknee_hz=0.8, fmin_hz=0.05))]
     pack = lambda ds: [DetectorGroup(detectors=ds, modes=modes)] if grouped else ds
-    params = GLSParameters(flag_method="sanepic", gap_fill=fill, pad_s=pad_s, split_gap_s=2.,
-                           chunk_s=30., gap_fill_tol=1e-20, flag_seed=9 if fill == "constrained" else 0,
-                           angle_dtype=np.float64, tol=1e-22)
+    method = GapFill(mode=fill, tol=1e-20, seed=9 if fill == "constrained" else 0)
+    params = GLSParameters(flag_method=method, pad_s=pad_s, split_gap_s=2., chunk_s=30., angle_dtype=np.float64, tol=1e-22)
     a = make_maps(pack(dets), nside, coordinates="E", params=params, sky_model=sky)
     bad = [dataclasses.replace(d, tod=np.where(d.flags, 1e30, d.tod)) for d in dets]
     b = make_maps(pack(bad), nside, coordinates="E", params=params, sky_model=sky, nthreads=2)
     assert a.converged and b.converged
-    assert 0 < a.gap_fill_iterations < params.gap_fill_maxiter
+    assert 0 < a.gap_fill_iterations < method.maxiter
     assert np.allclose(a.maps, b.maps, rtol=0, atol=1e-9)
     assert a.hit_map.sum() == sum((~d.flags).sum() for d in dets)
     assert all(np.isnan(d.tod[d.flags]).all() for d in dets)
     with warnings.catch_warnings(record=True) as caught:  # conditional_mean: the seed has no effect, and says so
         warnings.simplefilter("always")
-        c = make_maps(pack(dets), nside, coordinates="E", params=dataclasses.replace(params, flag_seed=10), sky_model=sky)
-    assert any("flag_seed has no effect" in str(w.message) for w in caught) == (fill == "conditional_mean")
+        other = dataclasses.replace(params, flag_method=dataclasses.replace(method, seed=10))
+    assert any("seed has no effect" in str(w.message) for w in caught) == (fill == "conditional_mean")
+    c = make_maps(pack(dets), nside, coordinates="E", params=other, sky_model=sky)
     if fill == "conditional_mean":
         assert np.allclose(a.maps, sky, rtol=0, atol=1e-10)
         assert np.array_equal(a.maps, c.maps)
@@ -240,8 +242,8 @@ def test_conditional_make_maps(fill, pad_s, grouped):
         assert not np.allclose(a.maps, c.maps, rtol=0, atol=1e-10)
     with pytest.raises(ValueError, match="sky_model"):
         make_maps(pack(dets), nside, params=params)
-    with pytest.raises(ValueError, match="flag_method"):
-        make_maps(pack(dets), nside, params=dataclasses.replace(params, flag_method="act"), sky_model=sky)
+    with pytest.raises(ValueError, match="GapFill"):
+        make_maps(pack(dets), nside, params=dataclasses.replace(params, flag_method="sanepic"), sky_model=sky)
 
 
 def test_conditional_calibration_reuse():
@@ -262,8 +264,7 @@ def test_conditional_calibration_reuse():
                                 sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40., fknee_hz=0.5, fmin_hz=0.05)))
     group = DetectorGroup(detectors=dets, modes=[CommonMode(coupling=np.array([1., 0.8]),
                           noise=OneOverFNoise(net_ukrts=60., fknee_hz=0.8, fmin_hz=0.05))])
-    params = GLSParameters(flag_method="sanepic", gap_fill="conditional_mean", chunk_s=30.,
-                           angle_dtype=np.float64, tol=1e-22)
+    params = GLSParameters(flag_method=GapFill(mode="conditional_mean"), chunk_s=30., angle_dtype=np.float64, tol=1e-22)
     result = make_maps([group], nside, coordinates="E", params=params, sky_model=sky,
                        calibration=CalibrationParameters(n_iter=2))
     assert result.calibration_iterations == 2 and result.converged

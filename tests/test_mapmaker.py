@@ -15,7 +15,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import Coordinates, DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
+from pysanepic import ACTCuts, Coordinates, DetectorData, GapFill, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
 
 
 def _scan(n, rng):
@@ -454,7 +454,7 @@ def test_calibration_act_flags(ncoeff):
             flags[start:start + length] = True
         flagged.append(dataclasses.replace(d, tod=np.where(flags, np.nan, d.tod), flags=flags))
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64,
-                           flag_method="act", act_ncoeff=ncoeff)
+                           flag_method=ACTCuts(ncoeff=ncoeff))
     r = make_maps(flagged, nside, coordinates="E", params=params, nthreads=2,
                   calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=3))
     assert r.converged
@@ -490,12 +490,12 @@ def test_flag_methods_noiseless_response():
         err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
         return err / np.abs(sky).max()
 
-    conditional = {"flag_method": "sanepic", "gap_fill": "conditional_mean"}
+    conditional = {"flag_method": GapFill(mode="conditional_mean")}
     for err in (error(), error(flag_method="act"), error(sky, **conditional)):
         assert np.abs(err).max() < 1e-8
     assert np.allclose(error(0 * sky, **conditional), 2 * error(0.5 * sky, **conditional), rtol=0, atol=1e-8)
     assert np.abs(error(0 * sky, **conditional)).max() > 0.1
-    assert np.sqrt(np.mean(error(flag_method="sanepic") ** 2)) > 0.01
+    assert np.sqrt(np.mean(error(flag_method=GapFill()) ** 2)) > 0.01
 
 
 def test_calibration_unsolved_pol():

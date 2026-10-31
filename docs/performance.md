@@ -139,16 +139,16 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
   with three temporary float64 vectors per active gap (24 bytes per gap
   sample per worker), rather than an allocated samples-by-coefficients matrix.
   Constant cuts use the existing offset kernels without run metadata.
-  `"sanepic"` has no extra PCG unknowns: without padding it stores 8 bytes
+  `GapFill` has no extra PCG unknowns: without padding it stores 8 bytes
   per flag (synthetic values) and views of the TOD and flag masks, filling
   one temporary chunk per worker. With padding the filled, padded TOD is
   stored as for the other methods. Split gaps have no unknowns.
-  Conditional filling (`gap_fill`) adds one temporary solve per chunk or
+  Conditional filling (`GapFill.mode`) adds one temporary solve per chunk or
   common-mode group: a few gap-sized CG vectors and full-FFT work arrays.
   The default sine preconditioner adds one gap-sized vector of diagonal
   scales and inverse spectra for distinct long-gap lengths per detector
   (at most another gap-sized vector). Its setup and application use no dense
-  gap matrices. Use `gap_fill_preconditioner=None` for cost comparisons.
+  gap matrices. Use `GapFill(preconditioner=None)` for cost comparisons.
   All detectors of a common-mode group are processed together. It is not
   guaranteed faster than exact marginalization; long gaps can slow this
   inner solve too. No gap unknowns persist in the map PCG.

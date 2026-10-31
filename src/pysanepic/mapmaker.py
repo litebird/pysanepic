@@ -13,7 +13,7 @@ import functools
 import time
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 
 import ducc0
@@ -348,10 +348,10 @@ class MapResult:
         constrained amplitudes. None otherwise.
     calibration_iterations : with calibration, the number of calibration
         iterations done (n_iter, or fewer with gain_tol). None otherwise.
-    gap_fill_iterations : with gap_fill="conditional_mean" or "constrained",
-        the largest number of CG iterations of a gap fill (over the chunks or
-        DetectorGroup chunks of every rank; with calibration, of the last
-        pass), to compare with gap_fill_maxiter. None otherwise.
+    gap_fill_iterations : with a conditional :class:`GapFill`, the largest
+        number of CG iterations of a gap fill (over the chunks or DetectorGroup
+        chunks of every rank; with calibration, of the last pass), to compare
+        with GapFill.maxiter. None otherwise.
     """
 
     maps: np.ndarray
@@ -366,6 +366,94 @@ class MapResult:
     template_covariance: dict | None = None
     calibration_iterations: int | None = None
     gap_fill_iterations: int | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ACTCuts:
+    """GLSParameters.flag_method: each run of flagged samples is fitted by its
+    own polynomial coefficients (the compressed cut model of Naess et al. 2025,
+    Sect. 3.3.3), and its TOD is set to 0 (no random filling). Exact GLS with
+    these extra unknowns: no bias if the flags do not depend on the noise.
+
+    ncoeff : None (default), positive integer, or callable. None keeps the
+        paper's rule (from the gap duration, tuned for ACT, not for LiteBIRD),
+        an integer fixes the number of coefficients per gap (1: offset, 3:
+        quadratic), and a callable takes (gap lengths array in samples,
+        sampling rate in Hz) and returns a positive integer scalar or an
+        array of counts, one per gap. Counts are capped at the gap length
+        (all of them: the same as "marginalize"); high orders use discrete
+        orthonormal polynomials spanning the same space. Pure, deterministic
+        callables preserve reproducibility and the calibration setup reused
+        between iterations.
+    """
+
+    ncoeff: int | Callable | None = None
+
+    def __post_init__(self):
+        _validate_act_ncoeff(self.ncoeff)
+
+
+@dataclass(frozen=True, kw_only=True)
+class GapFill:
+    """GLSParameters.flag_method: flagged samples have no unknowns; their TOD
+    is filled once, held fixed during the map solve, and their pointing and
+    template rows are excluded (Patanchon et al. 2008, Sect. 3.6). Approximate:
+    it can bias the signal, especially on large scales.
+
+    mode : "local_white" (default; SANEPIC's fill: a line fitted to the valid
+        samples within 20 samples of each run, plus white noise with the rms
+        of the fit residual), "conditional_mean" or "constrained" (the mean,
+        or a random draw, of the noise in the gaps conditional on the valid
+        noise residuals of the chunk, jointly across a DetectorGroup, with the
+        GLS noise model; the padding is filled too). The conditional modes
+        need make_maps' sky_model, subtracted before conditioning: their bias
+        is linear in its error. Not a Gibbs sampler.
+    seed : non-negative integer, default 0, of the random fills
+        ("local_white", "constrained"), with independent streams per MPI rank.
+        Reproducible for the same inputs, flags, order, chunking and MPI
+        partition; a changed thread count can leave rounding differences.
+        Calibration resets the stream each pass. A non-zero seed with
+        "conditional_mean" (no random numbers) warns.
+    tol, maxiter : squared relative residual threshold (default 1e-12) and
+        maximum CG iterations (default 1000) of each conditional fill; failure
+        raises RuntimeError. MapResult.gap_fill_iterations has the largest
+        number used.
+    preconditioner : "sine" (default: own-noise sine blocks for long gaps,
+        diagonal scaling for short ones) or None (plain CG); the true residual
+        controls convergence in either case.
+
+    tol, maxiter and preconditioner are for the conditional modes: values
+    other than the defaults with "local_white" raise ValueError.
+    """
+
+    mode: str = "local_white"
+    seed: int = 0
+    tol: float = 1e-12
+    maxiter: int = 1000
+    preconditioner: str | None = "sine"
+
+    def __post_init__(self):
+        if self.mode not in ("local_white", "conditional_mean", "constrained"):
+            raise ValueError(f"GapFill.mode must be 'local_white', 'conditional_mean' or 'constrained', not {self.mode!r}")
+        if isinstance(self.seed, (bool, np.bool_)) or not isinstance(self.seed, (int, np.integer)) or self.seed < 0:
+            raise ValueError("GapFill.seed must be a non-negative integer")
+        _validate_gap_solve(self.tol, self.maxiter)
+        _validate_gap_preconditioner(self.preconditioner)
+        default = {f.name: f.default for f in fields(self)}
+        if self.mode == "local_white" and any(getattr(self, k) != default[k] for k in ("tol", "maxiter", "preconditioner")):
+            raise ValueError("GapFill tol, maxiter and preconditioner are for mode='conditional_mean' or 'constrained'")
+        if self.mode == "conditional_mean" and self.seed != default["seed"]:
+            warnings.warn("GapFill.seed has no effect with mode='conditional_mean': no random numbers", stacklevel=3)
+
+
+def _flag_treatment(method):
+    """GLSParameters.flag_method as "marginalize", "offset", ACTCuts or GapFill."""
+    if isinstance(method, str) and method == "act":
+        return ACTCuts()
+    if isinstance(method, (ACTCuts, GapFill)) or (isinstance(method, str) and method in ("marginalize", "offset")):
+        return method
+    hint = " (now GapFill(...))" if method == "sanepic" else ""
+    raise ValueError(f"Unknown flag_method {method!r}{hint}: use 'marginalize', 'offset', 'act', ACTCuts(...) or GapFill(...)")
 
 
 @dataclass(kw_only=True)
@@ -402,36 +490,11 @@ class GLSParameters:
     flag_method : how runs of flagged samples (DetectorData.flags) shorter than
         split_gap_s are handled: "marginalize" (one unknown per sample, the
         exact GLS without them; ~70 bytes per flagged sample), "offset" (one
-        unknown per run, its samples set to 0), "act" (Legendre coefficients
-        per run using the counts of Naess et al. 2025, Sect. 3.3.3; zero-filled
-        TOD, no random filling), or "sanepic" (no unknowns:
-        fill gaps according to gap_fill, then exclude
-        their pointing rows; the approximation of Patanchon et al. 2008,
-        Sect. 3.6, which can bias the signal, especially on large scales).
-    flag_seed : non-negative integer, default 0. Seed of the "sanepic" gap
-        filling, with independent streams per MPI rank. Reproducible for the
-        same inputs, flags, order, chunking and MPI partition. A changed
-        thread count can leave small rounding differences. Calibration resets
-        the stream each pass; changed residuals can change the filled values.
-    act_ncoeff : None (default), positive integer, or callable. With "act",
-        None keeps the paper's rule, an integer fixes the number of Legendre
-        coefficients per gap (1: offset, 3: quadratic), and a callable takes
-        (gap lengths array in samples, sampling rate in Hz) and returns a
-        positive integer scalar or an array of counts, one per gap. Counts
-        are capped at the gap length. Pure, deterministic callables preserve
-        reproducibility and the calibration setup reused between iterations.
-    gap_fill : "local_white" (default), "conditional_mean", or "constrained".
-        Used with flag_method="sanepic". Conditional modes require an explicit
-        sky_model, condition the residual on all valid samples of a chunk
-        (jointly across a DetectorGroup), and also fill unobserved padding.
-        The result is fixed during the map solve, not a Gibbs sampler.
-    gap_fill_tol, gap_fill_maxiter : squared relative residual threshold and
-        maximum CG iterations for each conditional fill. Failure raises
-        RuntimeError rather than using an inaccurate realization.
-    gap_fill_preconditioner : "sine" (default) or None. Own-noise sine blocks
-        for long gaps and diagonal scaling for short gaps, or unpreconditioned
-        CG. Only used with a conditional gap fill; the true residual controls
-        convergence in either case.
+        unknown per run, its samples set to 0), an :class:`ACTCuts` (local
+        polynomial coefficients per run; "act" is ACTCuts()), or a
+        :class:`GapFill` (no unknowns: the gaps are filled and their pointing
+        rows excluded, as in SANEPIC; approximate, it can bias the signal).
+        The options of each treatment are in its own class.
     fft_dtype : precision of the FFTs applying N^-1 to the PCG search
         directions: np.float64 (default) or np.float32 (~45% faster FFTs; the
         right-hand side and the true residual stay in float64, see GLS).
@@ -482,18 +545,12 @@ class GLSParameters:
     covariance_tol: float = 1e-6
     maxiter: int = 2000
     angle_dtype: type = np.float32
-    flag_method: str = "marginalize"
+    flag_method: str | ACTCuts | GapFill = "marginalize"
     split_gap_s: float = 300.0
     fft_dtype: type = np.float64
     coarse_nside: int | None = 0
     template_dtype: type = np.float32
     sample_batch: int = 1
-    flag_seed: int = 0
-    act_ncoeff: int | Callable | None = None
-    gap_fill: str = "local_white"
-    gap_fill_tol: float = 1e-12
-    gap_fill_maxiter: int = 1000
-    gap_fill_preconditioner: str | None = "sine"
 
 
 @dataclass(kw_only=True)
@@ -1102,7 +1159,7 @@ def _sample_batch(fields, dets, nside, coordinates, nthreads):
     return out
 
 
-def _conditional_tod(tod, gls, npix, common_modes, params, rng, nthreads):
+def _conditional_tod(tod, gls, npix, common_modes, fill, rng, nthreads):
     """Fill noise residuals with the same precision as GLS, one group at a time;
     returns the largest number of CG iterations on this rank.
 
@@ -1119,9 +1176,8 @@ def _conditional_tod(tod, gls, npix, common_modes, params, rng, nthreads):
         filled, info = conditional_gap_fill(
             np.stack([np.asarray(tod[k], dtype=float) for k in ks]), np.stack(masks),
             np.stack([gls.weights[k] for k in ks]), fft_length=gls._nfft[ks[0]],
-            coupling=coupling, mode_psd=mode_psd, draw=params.gap_fill == "constrained",
-            rng=rng, tol=params.gap_fill_tol, maxiter=params.gap_fill_maxiter, nthreads=nthreads,
-            preconditioner=params.gap_fill_preconditioner,
+            coupling=coupling, mode_psd=mode_psd, draw=fill.mode == "constrained",
+            rng=rng, tol=fill.tol, maxiter=fill.maxiter, nthreads=nthreads, preconditioner=fill.preconditioner,
         )
         iterations = max(iterations, info["iterations"])
         for i, (k, mask) in enumerate(zip(ks, masks)):
@@ -1140,32 +1196,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     chunks): only the TOD and the templates are built."""
     reuse = fit is not None and fit.fit and fit.gls is not None
     params = GLSParameters() if params is None else params
-    if params.flag_method not in ("marginalize", "offset", "act", "sanepic"):
-        raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize', 'offset', 'act' or 'sanepic'")
-    if params.flag_method == "act":
-        _validate_act_ncoeff(params.act_ncoeff)
-    if params.gap_fill not in ("local_white", "conditional_mean", "constrained"):
-        raise ValueError("gap_fill must be 'local_white', 'conditional_mean' or 'constrained'")
-    conditional = params.gap_fill != "local_white"
-    if conditional and params.flag_method != "sanepic":
-        raise ValueError("conditional gap_fill requires flag_method='sanepic'")
+    method = _flag_treatment(params.flag_method)
+    fill = method if isinstance(method, GapFill) else None
+    conditional = fill is not None and fill.mode != "local_white"
     if conditional and (fit is None or fit.sky is None):
-        raise ValueError("conditional gap_fill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
-    _validate_gap_solve(params.gap_fill_tol, params.gap_fill_maxiter)
-    _validate_gap_preconditioner(params.gap_fill_preconditioner)
-    if isinstance(params.flag_seed, (bool, np.bool_)) or not isinstance(params.flag_seed, (int, np.integer)) or params.flag_seed < 0:
-        raise ValueError("GLSParameters.flag_seed must be a non-negative integer")
-    # options of another flag treatment are errors, not silently ignored
-    default = GLSParameters()
-    if params.act_ncoeff is not None and params.flag_method != "act":
-        raise ValueError("act_ncoeff requires flag_method='act'")
-    if not conditional and (params.gap_fill_tol != default.gap_fill_tol or params.gap_fill_maxiter != default.gap_fill_maxiter
-                            or params.gap_fill_preconditioner != default.gap_fill_preconditioner):
-        raise ValueError("gap_fill_tol, gap_fill_maxiter and gap_fill_preconditioner require gap_fill='conditional_mean' or 'constrained'")
-    if params.flag_seed != default.flag_seed and (params.flag_method != "sanepic" or params.gap_fill == "conditional_mean"):
-        warnings.warn(f"flag_seed has no effect with flag_method={params.flag_method!r}"
-                      + (", gap_fill='conditional_mean'" if params.flag_method == "sanepic" else "")
-                      + ": no random gap filling", stacklevel=3)
+        raise ValueError("a conditional GapFill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
     if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
         raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
     nc = params.coarse_nside
@@ -1174,7 +1209,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
-    flag_rng = np.random.default_rng(np.random.SeedSequence([params.flag_seed, rank]))
+    flag_rng = np.random.default_rng(np.random.SeedSequence([0 if fill is None else fill.seed, rank]))
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
     pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
     weights = {}  # chunks with the same length and noise share one array
@@ -1309,7 +1344,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     model_c.append(_padded(sky_tod, a, b, m, np.float64))
             flagged = None if flags is None else flags[a:b]
             if flagged is not None and flagged.any():
-                if params.flag_method == "sanepic" and not conditional:
+                if fill is not None and not conditional:
                     filled = _fill_flagged(tod, flagged, flag_rng)
                     tod = filled if m else _GapFilledTOD(tod, flagged, filled[flagged])
                     del filled
@@ -1341,7 +1376,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     gamma_c.append(g)
             p = pix[a:b].astype(np.int32)
             if flagged is not None and flagged.any():
-                p[flagged] = -1 if params.flag_method in ("sanepic", "act") else _flag_labels(flagged, params.flag_method)
+                p[flagged] = -1 if isinstance(method, (ACTCuts, GapFill)) else _flag_labels(flagged, method)
             if m == 0:
                 pix_c.append(p)
             else:
@@ -1405,7 +1440,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     del pix_c, a2_c, gamma_c
     gap_iterations = None
     if conditional:
-        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, params, flag_rng, nthreads)
+        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, fill, flag_rng, nthreads)
         if comm is not None:
             gap_iterations = max(comm.allgather(gap_iterations))
     # warm start from the previous calibration iteration (if the pixels are the same)
@@ -1460,6 +1495,7 @@ def _padded(x, a, b, m, dtype):
 
 
 def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit, fs_c):
+    method = _flag_treatment(params.flag_method)
     nc = params.coarse_nside
     return GLS(
         pix_c,
@@ -1480,9 +1516,9 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         shared_templates=shared,
         shared_groups=fit.groups if fit is not None and fit.fit else None,
         template_dtype=params.template_dtype,
-        flag_method=params.flag_method if params.flag_method in ("sanepic", "act") else "marginalize",
-        flag_sampling_rate_hz=fs_c if params.flag_method == "act" else None,
-        act_ncoeff=params.act_ncoeff,
+        flag_method="act" if isinstance(method, ACTCuts) else "fill" if isinstance(method, GapFill) else "marginalize",
+        flag_sampling_rate_hz=fs_c if isinstance(method, ACTCuts) else None,
+        act_ncoeff=method.ncoeff if isinstance(method, ACTCuts) else None,
     )
 
 

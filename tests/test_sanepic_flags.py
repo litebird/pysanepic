@@ -6,7 +6,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import DetectorData, GLS, GLSParameters, OneOverFNoise, Pointing, make_maps, one_over_f_weights
+from pysanepic import DetectorData, GapFill, GLS, GLSParameters, OneOverFNoise, Pointing, make_maps, one_over_f_weights
 from pysanepic.mapmaker import _fill_flagged
 from pysanepic.gls import _GapFilledTOD, _chunks
 
@@ -36,7 +36,7 @@ def test_sanepic_flags_dense(pol, nthreads, grouped):
     original = labels.copy()
     g = GLS(labels, psi, w, min_pol_rcond=0, angle_dtype=np.float64, fft_lengths=nfft,
             common_modes=common, templates=[(k, values[k], 0) for k in range(nc)],
-            template_dtype=np.float64, nthreads=nthreads, flag_method="sanepic")
+            template_dtype=np.float64, nthreads=nthreads, flag_method="fill")
     assert g.nflag == 0
     assert g._locprec.size == 1  # the template only, no state for flags
     assert np.array_equal(labels, original)
@@ -126,7 +126,7 @@ def test_sanepic_make_maps(pad_s, split_gap_s):
                         pointing=Pointing(pix=pix, psi=psi, nside=nside, coordinates="E"),
                         sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40, fknee_hz=0.5, fmin_hz=0.05))
     params = GLSParameters(chunk_s=100, pad_s=pad_s, split_gap_s=split_gap_s,
-                           flag_method="sanepic", flag_seed=17, tol=1e-20,
+                           flag_method=GapFill(seed=17), tol=1e-20,
                            min_pol_rcond=0, angle_dtype=np.float64)
     a = make_maps([data], nside, coordinates="E", params=params)
     b = make_maps([dataclasses.replace(data, tod=np.where(flags, 1e30, tod))], nside,
@@ -137,15 +137,12 @@ def test_sanepic_make_maps(pad_s, split_gap_s):
     assert np.allclose(a.maps, b.maps, rtol=0, atol=1e-10)
     assert np.isfinite(a.maps).all() and np.all(a.maps != hp.UNSEEN)
     assert np.isnan(data.tod[flags]).all()
-    c = make_maps([data], nside, coordinates="E", params=dataclasses.replace(params, flag_seed=18))
+    c = make_maps([data], nside, coordinates="E", params=dataclasses.replace(params, flag_method=GapFill(seed=18)))
     assert not np.allclose(a.maps, c.maps, rtol=0, atol=1e-10)
-    for seed in (-1, True, np.True_, 1.5):
-        with pytest.raises(ValueError, match="flag_seed"):
-            make_maps([data], nside, params=dataclasses.replace(params, flag_seed=seed))
 
 
 def test_sanepic_low_level_requires_filled_data():
-    g = GLS(np.array([0, -1, 0]), None, np.ones(2), flag_method="sanepic")
+    g = GLS(np.array([0, -1, 0]), None, np.ones(2), flag_method="fill")
     with pytest.raises(ValueError, match="gap-filled"):
         g.solve(np.array([1., np.nan, 1.]))
     with pytest.raises(ValueError, match="flag_method"):
@@ -155,7 +152,7 @@ def test_sanepic_low_level_requires_filled_data():
     assert np.allclose(g.apply_A(np.array([[2.]])), [[4.]])
     assert np.allclose(g.rhs(np.array([1., 0., 1.])), [[2.]])
     assert np.allclose(g.binned(np.array([1., np.nan, 1.])), [[1.]])
-    empty = GLS(np.array([-1, -1]), None, np.ones(2), flag_method="sanepic")
+    empty = GLS(np.array([-1, -1]), None, np.ones(2), flag_method="fill")
     m, info = empty.solve(np.zeros(2))
     assert info["converged"] and m.shape == (1, 0)
 

@@ -120,13 +120,13 @@ its existing flags:
 ```python
 from dataclasses import replace
 import numpy as np
-from pysanepic import GLSParameters, make_maps
+from pysanepic import ACTCuts, GLSParameters, make_maps
 
 flags = np.zeros(detector.tod.size, dtype=bool) if detector.flags is None else detector.flags.copy()
 flags[100:110] = True
 flagged_detector = replace(detector, flags=flags)
 
-params = GLSParameters(flag_method="act", act_ncoeff=3)  # quadratic cut model
+params = GLSParameters(flag_method=ACTCuts(ncoeff=3))  # quadratic cut model
 result = make_maps([flagged_detector], nside, params=params)
 ```
 
@@ -136,40 +136,40 @@ Choose `flag_method` independently of the length threshold `split_gap_s`:
 |---|---|---|
 | `"marginalize"` (default) | One free value per flagged sample, exact for the retained chunk model | None |
 | `"offset"` | One constant per contiguous run | None |
-| `"act"` | Legendre coefficients per run | `act_ncoeff`: None for the ACT rule, a positive integer, or a callable |
-| `"sanepic"` | Fixed synthetic values, no gap unknowns in the map solve | `gap_fill`, `flag_seed`; conditional modes also use `gap_fill_tol` and `gap_fill_maxiter` |
+| `ACTCuts(ncoeff=None)` (or `"act"`) | Legendre coefficients per run | `ncoeff`: None for the ACT rule, a positive integer, or a callable |
+| `GapFill(mode="local_white")` | Fixed synthetic values, no gap unknowns in the map solve | `mode`, `seed`; the conditional modes also use `tol`, `maxiter` and `preconditioner` |
 
 Runs at least `split_gap_s=300` seconds long are dropped and split the chunk
 before this treatment; use `np.inf` to retain every run, or 0 to split every
-run. This splitting is disabled for DetectorGroup. Conditional filling is
-available only with `"sanepic"`:
+run. This splitting is disabled for DetectorGroup. Conditional filling:
 
 ```python
-params = GLSParameters(
-    flag_method="sanepic",
-    gap_fill="constrained",  # "local_white" is the default; "conditional_mean" is deterministic
-    flag_seed=42,
-    gap_fill_tol=1e-12,
-    gap_fill_maxiter=1000,
-    gap_fill_preconditioner="sine",  # default; None disables preconditioning
-)
+from pysanepic import GapFill
+
+params = GLSParameters(flag_method=GapFill(
+    mode="constrained",  # "local_white" is the default; "conditional_mean" is deterministic
+    seed=42,
+    tol=1e-12,
+    maxiter=1000,
+    preconditioner="sine",  # default; None disables preconditioning
+))
 # sky_estimate is a prior model or preliminary map, in the output coordinates
 # and at this nside (or provided as alm). For noise-only TOD use a zero model.
 result = make_maps([flagged_detector], nside, params=params, sky_model=sky_estimate)
 ```
 
 The conditional fill is exact for the supplied residual/noise model, then
-fixed during the approximate SANEPIC map solve: it does not make that solve
-equivalent to exact marginalization or a Gibbs sampler. `flag_seed` is
+fixed during the approximate gap-filled map solve: it does not make that
+solve equivalent to exact marginalization or a Gibbs sampler. The seed is
 reproducible for the same input, chunking and MPI assignment, generally not
-after redistributing data. `tol`/`maxiter` control the map solve separately
-from `gap_fill_tol`/`gap_fill_maxiter`; `result.gap_fill_iterations` is the
-largest number of gap CG iterations (over all chunks and ranks), to compare
-with `gap_fill_maxiter`. Options of another flag method (`act_ncoeff` without
-`"act"`, `gap_fill_tol`/`gap_fill_maxiter` without a conditional fill) raise
-ValueError rather than being ignored.
+after redistributing data. `GLSParameters.tol`/`maxiter` control the map
+solve separately from `GapFill.tol`/`maxiter`; `result.gap_fill_iterations`
+is the largest number of gap CG iterations (over all chunks and ranks), to
+compare with `GapFill.maxiter`. Each class validates its own options: the CG
+settings with `mode="local_white"` raise ValueError, a seed with
+`"conditional_mean"` warns.
 
-The ACT and SANEPIC filling modes above are unreleased additions; use the
+`ACTCuts` and `GapFill` are unreleased additions; use the
 development checkout. See [flagged-sample parameters](parameters.md#flagged-samples),
 [seed behavior with MPI](parameters.md#random-seeds-and-mpi), and the
 [saved benchmark notebook](notebooks/flags) (marginalize, offset and splitting).
