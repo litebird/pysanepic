@@ -437,6 +437,66 @@ def test_calibration_noiseless():
         make_maps(data, nside, calibration=CalibrationParameters(mask=band[:10]))
 
 
+@pytest.mark.parametrize("ncoeff", [None, 3])
+def test_calibration_act_flags(ncoeff):
+    """flag_method="act" with calibration: the cuts (also Legendre ones, in
+    chunk workers) are reused between iterations; gains and maps are recovered
+    as without flags, and the flagged TOD is never read."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs, per = 16, 120_000, 10.0, 12_000
+    data, true, sky = _calibration_data(nside, n, fs, per)
+    rng = np.random.default_rng(8)
+    flagged = []
+    for d in data:
+        flags = rng.random(n) < 0.01
+        for start, length in zip(rng.integers(0, n - 400, 12), (2, 5, 9, 25, 40, 80, 150, 300) * 2):
+            flags[start:start + length] = True
+        flagged.append(dataclasses.replace(d, tod=np.where(flags, np.nan, d.tod), flags=flags))
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64,
+                           flag_method="act", act_ncoeff=ncoeff)
+    r = make_maps(flagged, nside, coordinates="E", params=params, nthreads=2,
+                  calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=3))
+    assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
+    seen = r.maps[1] != hp.UNSEEN
+    err = r.maps[:, seen] - sky[:, seen]
+    err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
+    assert np.abs(err).max() < 1e-7 * np.abs(sky).max()
+    assert r.hit_map.sum() == sum((~d.flags).sum() for d in flagged)
+
+
+def test_flag_methods_noiseless_response():
+    """Signal response with no noise, i.e. the bias of each flag treatment:
+    marginalize, act and conditional_mean with the true sky_model are exact;
+    conditional_mean is biased linearly in the sky_model error; the local
+    SANEPIC fill is biased (a white sky is its worst case: ~20% rms here)."""
+    nside, n, fs = 8, 60_000, 10.0
+    rng = np.random.default_rng(3)
+    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    data = []
+    for d in _four_detectors(n, fs, rng, sky, nside):
+        flags = rng.random(n) < 0.01
+        for start, length in zip(rng.integers(0, n - 400, 8), (3, 8, 20, 40, 80, 150, 300, 300)):
+            flags[start:start + length] = True
+        data.append(dataclasses.replace(d, tod=np.where(flags, np.nan, d.tod), flags=flags))
+    base = {"chunk_s": 1200.0, "tol": 1e-24, "min_pol_rcond": 0.0, "angle_dtype": np.float64}
+
+    def error(model=None, **kw):
+        r = make_maps(data, nside, coordinates="E", params=GLSParameters(**base, **kw), sky_model=model)
+        assert r.converged
+        seen = r.maps[1] != hp.UNSEEN
+        err = r.maps[:, seen] - sky[:, seen]
+        err[0] -= err[0].mean()  # I monopole unconstrained with 1/f weights
+        return err / np.abs(sky).max()
+
+    conditional = {"flag_method": "sanepic", "gap_fill": "conditional_mean"}
+    for err in (error(), error(flag_method="act"), error(sky, **conditional)):
+        assert np.abs(err).max() < 1e-8
+    assert np.allclose(error(0 * sky, **conditional), 2 * error(0.5 * sky, **conditional), rtol=0, atol=1e-8)
+    assert np.abs(error(0 * sky, **conditional)).max() > 0.1
+    assert np.sqrt(np.mean(error(flag_method="sanepic") ** 2)) > 0.01
+
+
 def test_calibration_unsolved_pol():
     """Few detectors, Q/U not solved in most pixels (default min_pol_rcond):
     their samples are flagged from the second iteration, so the iterations

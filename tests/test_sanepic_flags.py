@@ -139,8 +139,9 @@ def test_sanepic_make_maps(pad_s, split_gap_s):
     assert np.isnan(data.tod[flags]).all()
     c = make_maps([data], nside, coordinates="E", params=dataclasses.replace(params, flag_seed=18))
     assert not np.allclose(a.maps, c.maps, rtol=0, atol=1e-10)
-    with pytest.raises(ValueError, match="flag_seed"):
-        make_maps([data], nside, params=dataclasses.replace(params, flag_seed=-1))
+    for seed in (-1, True, np.True_, 1.5):
+        with pytest.raises(ValueError, match="flag_seed"):
+            make_maps([data], nside, params=dataclasses.replace(params, flag_seed=seed))
 
 
 def test_sanepic_low_level_requires_filled_data():

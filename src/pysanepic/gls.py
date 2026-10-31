@@ -908,7 +908,11 @@ class GLS:
                     first = self.nflag + np.cumsum(counts) - counts
                     poly = counts > 1
                     self._cuts[k] = np.column_stack([starts[poly], stops[poly], first[poly], counts[poly]])
-                    self.nflag += int(counts.sum())
+                    # Chunk workers write C^T f in place: coefficient ranges must not overlap
+                    own = slice(self.nflag, self.nflag + int(counts.sum()))
+                    if np.any(first < own.start) or np.any(first + counts > own.stop):
+                        raise RuntimeError("ACT cut coefficients outside the range of their chunk")
+                    self.nflag = own.stop
                     if self.nobs + self.nflag >= 2**31:
                         raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
                     # Constant cuts use the existing offset kernels, with no
@@ -1179,6 +1183,10 @@ class GLS:
         loc = self._locbuf[self.nflag :] if loc is None else loc
         sh = self._shbuf if sh is None else sh
         if self._cuts[k].size:
+            # Written in place, also by concurrent chunk workers: like the
+            # offsets in _backproject, each chunk owns a disjoint range of
+            # _locbuf[:nflag] (checked in __init__). Template amplitudes are
+            # shared by chunks, so workers sum them in private `loc` buffers.
             _cut_transpose(self._cuts[k], f, self._locbuf)
         for values, labels in self._tmpl[k]:
             _template_transpose(values, labels, f, loc)

@@ -1137,7 +1137,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     if conditional and (fit is None or fit.sky is None):
         raise ValueError("conditional gap_fill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
     _validate_gap_solve(params.gap_fill_tol, params.gap_fill_maxiter)
-    if not isinstance(params.flag_seed, (int, np.integer)) or params.flag_seed < 0:
+    if isinstance(params.flag_seed, (bool, np.bool_)) or not isinstance(params.flag_seed, (int, np.integer)) or params.flag_seed < 0:
         raise ValueError("GLSParameters.flag_seed must be a non-negative integer")
     if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
         raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
