@@ -12,6 +12,7 @@ chunks and noise weights itself, with one set of conventions documented here.
 import functools
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -21,7 +22,8 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
-from .gls import _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu
+from .gls import _GapFilledTOD, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
+from .gapfill import conditional_gap_fill, _validate_gap_solve
 
 
 class Coordinates(str, Enum):
@@ -233,8 +235,8 @@ class DetectorData:
 
     flags: boolean array like `tod`, True for samples to exclude (glitches,
     gaps, ...), or None. Flagged samples do not enter the maps and their TOD is
-    not used (it may be NaN): each one is fitted by an unknown of its own,
-    which is the exact GLS solution without them.
+    not used (it may be NaN). By default each one is fitted by an unknown of
+    its own; GLSParameters.flag_method selects other treatments.
 
     dipole: the dipole signal in the TOD (K, like `tod`), or None; needed with
     calibration (see :class:`CalibrationParameters`), and then subtracted from
@@ -394,9 +396,33 @@ class GLSParameters:
         per sample, angle error ~1e-7 rad) or np.float64 (exact).
     flag_method : how runs of flagged samples (DetectorData.flags) shorter than
         split_gap_s are handled: "marginalize" (one unknown per sample, the
-        exact GLS without them; ~70 bytes per flagged sample) or "offset" (one
-        unknown per run, its samples set to 0: no bias, nearly optimal, no
-        memory).
+        exact GLS without them; ~70 bytes per flagged sample), "offset" (one
+        unknown per run, its samples set to 0), "act" (Legendre coefficients
+        per run using the counts of Naess et al. 2025, Sect. 3.3.3; zero-filled
+        TOD, no random filling), or "sanepic" (no unknowns:
+        fill gaps according to gap_fill, then exclude
+        their pointing rows; the approximation of Patanchon et al. 2008,
+        Sect. 3.6, which can bias the signal, especially on large scales).
+    flag_seed : non-negative integer, default 0. Seed of the "sanepic" gap
+        filling, with independent streams per MPI rank. Reproducible for the
+        same inputs, flags, order, chunking and MPI partition. A changed
+        thread count can leave small rounding differences. Calibration resets
+        the stream each pass; changed residuals can change the filled values.
+    act_ncoeff : None (default), positive integer, or callable. With "act",
+        None keeps the paper's rule, an integer fixes the number of Legendre
+        coefficients per gap (1: offset, 3: quadratic), and a callable takes
+        (gap lengths array in samples, sampling rate in Hz) and returns a
+        positive integer scalar or an array of counts, one per gap. Counts
+        are capped at the gap length. Pure, deterministic callables preserve
+        reproducibility and the calibration setup reused between iterations.
+    gap_fill : "local_white" (default), "conditional_mean", or "conditional".
+        Used with flag_method="sanepic". Conditional modes require an explicit
+        sky_model, condition the residual on all valid samples of a chunk
+        (jointly across a DetectorGroup), and also fill unobserved padding.
+        The result is fixed during the map solve, not a Gibbs sampler.
+    gap_fill_tol, gap_fill_maxiter : squared relative residual threshold and
+        maximum CG iterations for each conditional fill. Failure raises
+        RuntimeError rather than using an inaccurate realization.
     fft_dtype : precision of the FFTs applying N^-1 to the PCG search
         directions: np.float64 (default) or np.float32 (~45% faster FFTs; the
         right-hand side and the true residual stay in float64, see GLS).
@@ -453,6 +479,11 @@ class GLSParameters:
     coarse_nside: int | None = 0
     template_dtype: type = np.float32
     sample_batch: int = 1
+    flag_seed: int = 0
+    act_ncoeff: int | Callable | None = None
+    gap_fill: str = "local_white"
+    gap_fill_tol: float = 1e-12
+    gap_fill_maxiter: int = 1000
 
 
 @dataclass(kw_only=True)
@@ -513,7 +544,7 @@ class CalibrationParameters:
         so that by default every sample is in all the fits or in none.
         Samples left out of all the active fits (gains and templates) are
         flagged in the n_iter
-        iterations (with GLSParameters.flag_method; "offset" takes no memory;
+        iterations (with GLSParameters.flag_method; "offset" uses one unknown per run;
         together with DetectorData.flags), then one more GLS solve makes the
         maps with all the samples and the final values; samples left out of
         some fits only keep those templates at 0, and the iterations converge
@@ -705,6 +736,57 @@ def _flag_labels(f, method):
         return -1 - np.arange(int(f.sum()), dtype=np.int32)
     starts, stops = _flag_runs(f)
     return np.repeat(-1 - np.arange(starts.size, dtype=np.int32), stops - starts)
+
+
+@numba.njit(nogil=True, cache=True)
+def _fill_flagged_runs(tod, flags, starts, stops, white, nfit, out):
+    """Two-pass centered line fits, without Python allocations per glitch."""
+    pos = 0
+    for start, stop in zip(starts, stops):
+        # The windows can contain other gaps: read only the original good TOD.
+        windows = ((max(0, start - nfit), start), (stop, min(tod.size, stop + nfit)))
+        n, sx, sy = 0, 0.0, 0.0
+        for lo, hi in windows:
+            for i in range(lo, hi):
+                if not flags[i]:
+                    n += 1
+                    sx += i - start
+                    sy += tod[i]
+        mx, my = (sx / n, sy / n) if n else (0.0, 0.0)
+        xx, xy = 0.0, 0.0
+        for lo, hi in windows:
+            for i in range(lo, hi):
+                if not flags[i]:
+                    x = i - start - mx
+                    xx += x * x
+                    xy += x * (tod[i] - my)
+        slope = xy / xx if xx > 0 else 0.0
+        rss = 0.0
+        for lo, hi in windows:
+            for i in range(lo, hi):
+                if not flags[i]:
+                    residual = tod[i] - my - slope * (i - start - mx)
+                    rss += residual * residual
+        sigma = np.sqrt(rss / (n - 2)) if n > 2 else 0.0
+        for i in range(start, stop):
+            out[i] = my + slope * (i - start - mx) + sigma * white[pos]
+            pos += 1
+
+
+def _fill_flagged(tod, flags, rng, nfit=20):
+    """SANEPIC gap filling (Patanchon et al. 2008, Sect. 2.2).
+
+    Fit a line to valid samples in the nfit-sample windows on each side of
+    each run, add white noise with rms estimated from the fit residual, and
+    leave good data untouched. This is approximate, not a constrained noise
+    realization. At an edge use the available side; with one neighbor use a
+    constant, with none use zero. Never read flagged TOD, even at other gaps.
+    """
+    out = np.array(tod, dtype=float, copy=True)
+    starts, stops = _flag_runs(flags)
+    white = rng.standard_normal(int(np.sum(stops - starts)))
+    _fill_flagged_runs(tod, flags, starts, stops, white, nfit, out)
+    return out
 
 
 def _monopole_pixel(nside):
@@ -1010,6 +1092,32 @@ def _sample_batch(fields, dets, nside, coordinates, nthreads):
     return out
 
 
+def _conditional_tod(tod, gls, npix, common_modes, params, rng, nthreads):
+    """Fill noise residuals with the same precision as GLS, one group at a time.
+
+    Padding has no observations and must be sampled, not conditioned upon.
+    Unpadded chunks retain compact synthetic values instead of full TOD copies.
+    """
+    grouped = {k for ks, _, _ in common_modes for k in ks}
+    groups = list(common_modes) + [([k], None, None) for k in range(len(tod)) if k not in grouped]
+    for ks, coupling, mode_psd in groups:
+        masks = [(gls.ip[k] < 0) | (gls.ip[k] >= npix) for k in ks]
+        if not any(mask.any() for mask in masks):
+            continue
+        filled, _ = conditional_gap_fill(
+            np.stack([np.asarray(tod[k], dtype=float) for k in ks]), np.stack(masks),
+            np.stack([gls.weights[k] for k in ks]), fft_length=gls._nfft[ks[0]],
+            coupling=coupling, mode_psd=mode_psd, draw=params.gap_fill == "conditional",
+            rng=rng, tol=params.gap_fill_tol, maxiter=params.gap_fill_maxiter, nthreads=nthreads,
+        )
+        for i, (k, mask) in enumerate(zip(ks, masks)):
+            if np.any(gls.ip[k] >= npix):  # padded data already occupies a full copy
+                tod[k] = filled[i].copy()
+            elif mask.any():
+                tod[k] = _GapFilledTOD(tod[k], mask, filled[i, mask])
+        del filled
+
+
 def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=None):
     """make_maps with the current estimates in `fit` (a _Fit, or None), which
     are updated; returns (MapResult, GLS). In the calibration iterations after
@@ -1017,8 +1125,20 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     chunks): only the TOD and the templates are built."""
     reuse = fit is not None and fit.fit and fit.gls is not None
     params = GLSParameters() if params is None else params
-    if params.flag_method not in ("marginalize", "offset"):
-        raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize' or 'offset'")
+    if params.flag_method not in ("marginalize", "offset", "act", "sanepic"):
+        raise ValueError(f"Unknown flag_method {params.flag_method!r}: use 'marginalize', 'offset', 'act' or 'sanepic'")
+    if params.flag_method == "act":
+        _validate_act_ncoeff(params.act_ncoeff)
+    if params.gap_fill not in ("local_white", "conditional_mean", "conditional"):
+        raise ValueError("gap_fill must be 'local_white', 'conditional_mean' or 'conditional'")
+    conditional = params.gap_fill != "local_white"
+    if conditional and params.flag_method != "sanepic":
+        raise ValueError("conditional gap_fill requires flag_method='sanepic'")
+    if conditional and (fit is None or fit.sky is None):
+        raise ValueError("conditional gap_fill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
+    _validate_gap_solve(params.gap_fill_tol, params.gap_fill_maxiter)
+    if not isinstance(params.flag_seed, (int, np.integer)) or params.flag_seed < 0:
+        raise ValueError("GLSParameters.flag_seed must be a non-negative integer")
     if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
         raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
     nc = params.coarse_nside
@@ -1027,8 +1147,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
+    flag_rng = np.random.default_rng(np.random.SeedSequence([params.flag_seed, rank]))
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
-    pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c = [], [], [], [], [], []
+    pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
     common_modes = []
@@ -1160,8 +1281,13 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 if fit.sky is not None:  # the templates are not put back
                     model_c.append(_padded(sky_tod, a, b, m, np.float64))
             flagged = None if flags is None else flags[a:b]
-            if m and flagged is not None and flagged.any():  # the padding is built from the chunk: not from flagged samples
-                tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
+            if flagged is not None and flagged.any():
+                if params.flag_method == "sanepic" and not conditional:
+                    filled = _fill_flagged(tod, flagged, flag_rng)
+                    tod = filled if m else _GapFilledTOD(tod, flagged, filled[flagged])
+                    del filled
+                elif m:  # the padding must not use flagged TOD
+                    tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
             tod_c.append(tod if m == 0 else _pad(tod, m, params.pad_fill))
             if reuse:  # the GLS has pixels, angles and weights already
                 continue
@@ -1172,6 +1298,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 weights[key] = d.noise.weights(nfft, fs)
             w_c.append(weights[key])
             nfft_c.append(nfft)
+            fs_c.append(fs)
             # 2a computed in float64, then stored as `dtype`; the margins of a
             # padded chunk carry no polarization (gamma = 0: intensity-only
             # virtual pixels), so only padded chunks need gamma per sample
@@ -1187,7 +1314,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     gamma_c.append(g)
             p = pix[a:b].astype(np.int32)
             if flagged is not None and flagged.any():
-                p[flagged] = _flag_labels(flagged, params.flag_method)  # unknowns not in the maps (see GLS)
+                p[flagged] = -1 if params.flag_method in ("sanepic", "act") else _flag_labels(flagged, params.flag_method)
             if m == 0:
                 pix_c.append(p)
             else:
@@ -1229,12 +1356,12 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         # a group: chunks at the same times, not split at gaps (that would break
         # the alignment); one common_modes entry per chunk of time
         idx = [add(x, split=False) for x in d.detectors]
-        if reuse:
+        if reuse and not conditional:
             continue
         fs = d.detectors[0].sampling_rate_hz
         U = np.array([mode.coupling for mode in d.modes], dtype=float).T  # (ndet, r)
         for chunks in zip(*idx):
-            nfft = nfft_c[chunks[0]]
+            nfft = fit.gls._nfft[chunks[0]] if reuse else nfft_c[chunks[0]]
             lam = np.array([1 / np.maximum(w, w.max() * 1e-12) for w in (mode.noise.weights(nfft, fs) for mode in d.modes)])
             common_modes.append((list(chunks), U, lam))
 
@@ -1245,10 +1372,12 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls = fit.gls
         gls.set_templates(templates, shared)
     else:
-        gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit)
+        gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit, fs_c)
         if fit is not None and fit.fit:
             fit.gls = gls
     del pix_c, a2_c, gamma_c
+    if conditional:
+        _conditional_tod(tod_c, gls, npix, common_modes, params, flag_rng, nthreads)
     # warm start from the previous calibration iteration (if the pixels are the same)
     x0 = None if fit is None or fit.x0 is None or fit.x0.shape != (gls.ncomp, gls.nobs) else fit.x0
     t2 = time.perf_counter()
@@ -1275,7 +1404,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     hit_map[:n] = gls.full(gls.hits)[:n]
     maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
     if verbose and rank == 0:
-        print(f"TOD and templates {t1 - t0:.1f} s, GLS setup {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
+        setup = "GLS setup + conditional fill" if conditional else "GLS setup"
+        print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
               f"({info['iterations']} iterations), maps {time.perf_counter() - t3:.1f} s", flush=True)
     return MapResult(
         maps=maps,
@@ -1298,7 +1428,7 @@ def _padded(x, a, b, m, dtype):
     return out
 
 
-def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit):
+def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit, fs_c):
     nc = params.coarse_nside
     return GLS(
         pix_c,
@@ -1319,6 +1449,9 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         shared_templates=shared,
         shared_groups=fit.groups if fit is not None and fit.fit else None,
         template_dtype=params.template_dtype,
+        flag_method=params.flag_method if params.flag_method in ("sanepic", "act") else "marginalize",
+        flag_sampling_rate_hz=fs_c if params.flag_method == "act" else None,
+        act_ncoeff=params.act_ncoeff,
     )
 
 

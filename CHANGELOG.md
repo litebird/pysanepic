@@ -4,6 +4,40 @@
 
 Changes on `main` that are not in a release yet.
 
+- `gap_fill="conditional"` / `"conditional_mean"` with
+  `flag_method="sanepic"`: Gaussian noise conditional on valid residuals
+  after subtracting the required `sky_model`. Includes joint DetectorGroup
+  conditioning and unobserved padding, matching GLS precision and FFT
+  extension. `flag_seed`, `gap_fill_tol` and `gap_fill_maxiter` control the
+  draw/solve; nonconvergence raises RuntimeError. Public
+  `conditional_gap_fill` returns filled residuals and solve diagnostics.
+  This freezes a conditional fill, not an exact GLS or Gibbs map algorithm;
+  the default remains `gap_fill="local_white"`.
+
+- `act_ncoeff` in `GLSParameters` and `GLS`: None retains the published ACT
+  rule, a positive integer sets a fixed count per gap, or a callable
+  `(lengths_samples, fs_hz)` chooses positive integer counts. Counts are
+  capped at the gap length; 1 recovers offsets, full counts recover exact
+  marginalization. Invalid counts and callable output shapes are rejected.
+
+- `GLSParameters.flag_method="act"`: the compressed Legendre cut model of
+  Naess et al. (2025), Sect. 3.3.3, with the published coefficient counts.
+  Fits local coefficients with zero-filled flags and no random realization;
+  evaluates the basis without storing a design matrix. Its own-noise
+  diagonal preconditioner is exact. Low-level `GLS` takes
+  `flag_sampling_rate_hz` (scalar or per chunk) with this mode. Dense GLS,
+  exact-marginalization limits, threading and MPI tests cover the operator.
+  The ACT rule is retained at other sampling rates, not tuned for LiteBIRD.
+
+- `GLSParameters.flag_method="sanepic"`: approximate gap treatment from
+  Patanchon et al. (2008), Sect. 3.6. Fill flagged data with a local line plus
+  white noise, then zero their pointing/template rows without auxiliary PCG
+  parameters. `flag_seed` (default 0) controls reproducible filling for a
+  fixed input order and MPI partition. The default remains `"marginalize"`;
+  unlike it, `"sanepic"` can bias the signal. Low-level `GLS` accepts the
+  same mode with caller-supplied finite gap-filled TOD. Dense GLS, threaded,
+  gap-filling and MPI regression tests cover the new operator.
+
 ## 0.6.2 (2026-10-30)
 
 - `Coordinates(str, Enum)` (`Ecliptic = "E"`, `Galactic = "G"`,

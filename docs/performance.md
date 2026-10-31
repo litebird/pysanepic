@@ -127,7 +127,19 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
   before 0.6).
 - Flagged samples with `flag_method="marginalize"`: ~70 bytes per flagged
   sample, on the process that holds it (its share of the PCG vectors);
-  negligible with `"offset"` or when the run is split (`split_gap_s`).
+  ~70 bytes per run with `"offset"` (the same cost for isolated flags).
+  `"act"` has ~70 bytes per Legendre coefficient and 32 bytes per run with
+  more than one coefficient; the basis is evaluated without stored columns.
+  Constant cuts use the existing offset kernels without run metadata.
+  `"sanepic"` has no extra PCG unknowns: without padding it stores 8 bytes
+  per flag (synthetic values) and views of the TOD and flag masks, filling
+  one temporary chunk per worker. With padding the filled, padded TOD is
+  stored as for the other methods. Split gaps have no unknowns.
+  Conditional filling (`gap_fill`) adds one temporary solve per chunk or
+  common-mode group: a few gap-sized CG vectors and full-FFT work arrays.
+  All detectors of a common-mode group are processed together. It is not
+  guaranteed faster than exact marginalization; long gaps can slow this
+  inner solve too. No gap unknowns persist in the map PCG.
 - Pixel indices are int32, enough up to nside 8192. With MPI, the maps
   exchanged are limited by the int32 counts of MPI to nside 4096.
 

@@ -16,6 +16,10 @@ N⁻¹ in Fourier space on chunks of data, and returns I, Q, U HEALPix maps.
   by default on the I monopole alone, the slowest mode).
 - Noise spectra, couplings and common modes estimated from the data
   (`estimate_noise`).
+- Flagged samples: exact marginalization, offsets, ACT Legendre cut models,
+  or fixed filling with local white noise or conditional Gaussian noise.
+  See the [flagging guide](docs/usage.md#flagged-samples), including the
+  model requirements and MPI seed behavior (new filling modes are unreleased).
 - Gain calibration on the dipole, fitted with the maps
   (`CalibrationParameters`), with masks for the Galactic plane.
 - Sky model as alm interpolated at the pointing (no pixelization error)

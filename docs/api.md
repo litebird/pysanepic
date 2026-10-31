@@ -28,6 +28,8 @@
 
 .. autofunction:: pysanepic.estimate_noise
 
+.. autofunction:: pysanepic.conditional_gap_fill
+
 .. autoclass:: pysanepic.GLSParameters
    :no-members:
 

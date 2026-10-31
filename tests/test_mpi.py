@@ -184,12 +184,59 @@ def test_flags_mpi():
     w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.01), (nchunk, 1))
     tod = rng.normal(size=(nchunk, ns))
     flags = rng.random((nchunk, ns)) < 0.05
+    flags[0, 20:26] = flags[1, 80:120] = True
     pix[flags] = (-1 - np.arange(ns))[None].repeat(nchunk, 0)[flags]  # one unknown per sample
     mine = slice(comm.rank, None, comm.size)
-    m, _ = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0).solve(tod[mine], tol=1e-24)
-    if comm.rank == 0:
-        ms, _ = GLS(pix, psi, w, min_pol_rcond=0.0).solve(tod, tol=1e-24)
-        assert np.allclose(m, ms, rtol=1e-9, atol=1e-12 * np.abs(ms).max())
+    rules = [("marginalize", None), ("act", None), ("act", 3),
+             ("act", lambda n, fs: 1 + np.ceil(n / fs / 2).astype(int)), ("sanepic", None)]
+    for method, rule in rules:
+        # SANEPIC receives the same finite gap filling on every partition.
+        kw = dict(min_pol_rcond=0.0, flag_method=method,
+                  flag_sampling_rate_hz=10.0 if method == "act" else None, act_ncoeff=rule)
+        g = GLS(pix[mine], psi[mine], w[mine], comm=comm, **kw)
+        m, info = g.solve(tod[mine], tol=1e-24)
+        assert info["converged"]
+        if method == "sanepic":
+            assert g.nflag == 0
+        if comm.rank == 0:
+            ms, _ = GLS(pix, psi, w, **kw).solve(tod, tol=1e-24)
+            assert np.allclose(m, ms, rtol=1e-9, atol=1e-12 * np.abs(ms).max())
+
+
+def test_conditional_fill_mpi():
+    """Conditional means, also for groups and padding, are partition invariant."""
+    from pysanepic import (CommonMode, DetectorData, DetectorGroup, GLSParameters,
+                          OneOverFNoise, Pointing, make_maps)
+
+    comm = MPI.COMM_WORLD
+    rng = np.random.default_rng(37)
+    ns, fs = 300, 10.
+    sky = rng.normal(size=(3, 12))
+    groups = []
+    for _ in range(comm.size + 1):
+        dets = []
+        for _ in range(2):
+            pix = rng.integers(12, size=ns)
+            psi = rng.uniform(-np.pi, np.pi, size=ns)
+            tod = sky[0, pix] + sky[1, pix] * np.cos(2 * psi) + sky[2, pix] * np.sin(2 * psi)
+            tod += rng.normal(0, 1e-4, ns)
+            flags = np.zeros(ns, bool)
+            flags[3:8] = flags[100:120] = True
+            dets.append(DetectorData(tod=np.where(flags, np.nan, tod), flags=flags,
+                                    pointing=Pointing(pix=pix, psi=psi, nside=1, coordinates="E"),
+                                    sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40., fknee_hz=0.5, fmin_hz=0.05)))
+        groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=np.array([1., 0.8]),
+                      noise=OneOverFNoise(net_ukrts=60., fknee_hz=0.8, fmin_hz=0.05))]))
+    params = GLSParameters(flag_method="sanepic", gap_fill="conditional_mean", pad_s=0.5,
+                           angle_dtype=np.float64, tol=1e-20)
+    for grouped in (False, True):
+        data = groups if grouped else [d for g in groups for d in g.detectors]
+        result = make_maps(data[comm.rank::comm.size], 1, coordinates="E", params=params, sky_model=sky, comm=comm)
+        assert result.converged
+        if comm.rank == 0:
+            ref = make_maps(data, 1, coordinates="E", params=params, sky_model=sky)
+            assert np.array_equal(result.hit_map, ref.hit_map)
+            assert np.allclose(result.maps, ref.maps, rtol=1e-10, atol=1e-10)
 
 
 
@@ -274,6 +321,7 @@ if __name__ == "__main__":
     test_more_ranks_than_pixels()
     test_mpi_count_check()
     test_flags_mpi()
+    test_conditional_fill_mpi()
     test_estimate_noise_mpi()
     test_detector_groups_mpi()
     test_estimate_common_modes_mpi()

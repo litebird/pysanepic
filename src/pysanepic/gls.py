@@ -117,10 +117,31 @@ def _as_list(x):
     return list(x) if isinstance(x, (list, tuple)) else [x]
 
 
+class _GapFilledTOD:
+    """A TOD view plus only the synthetic gap values, materialized per chunk.
+
+    Keep no full filled copy across the solve: with sparse flags that could
+    cost more memory than exact marginalization. The original TOD is untouched.
+    """
+
+    def __init__(self, tod, flags, values):
+        self.tod, self.flags, self.values = tod, flags, values
+
+    def __array__(self, dtype=None, copy=None):
+        if copy is False:
+            raise ValueError("gap-filled TOD requires a temporary copy")
+        out = np.array(self.tod, dtype=float if dtype is None else dtype, copy=True)
+        out[self.flags] = self.values
+        return out
+
+
 def _chunks(x):
     """1D chunks (views) from a 2D block (one chunk per row), a 1D chunk, or a list of them."""
     out = []
     for b in _as_list(x):
+        if isinstance(b, _GapFilledTOD):
+            out.append(b)
+            continue
         b = np.asarray(b)
         out.extend(b if b.ndim == 2 else [b])
     return out
@@ -148,13 +169,137 @@ def fast_fft_length(n):
     return m
 
 
+def _validate_act_ncoeff(rule):
+    if rule is not None and not callable(rule):
+        if isinstance(rule, (bool, np.bool_)) or not isinstance(rule, (int, np.integer)) or rule < 1:
+            raise ValueError("act_ncoeff must be None, a positive integer, or a callable (lengths, fs) -> counts")
+
+
+def _act_ncoeff(lengths, fs, rule=None):
+    """Coefficient counts of Naess et al. (2025), Sect. 3.3.3.
+
+    Durations are length / fs; nearest-integer ties round upward. Never use
+    more parameters than samples (a full-rank gap is represented as identity).
+    rule=None retains the ACT thresholds, an integer fixes the count, and
+    a callable takes (lengths array, sampling rate) and returns integer counts.
+    """
+    _validate_act_ncoeff(rule)
+    lengths = np.asarray(lengths, dtype=np.int64)
+    if rule is None:
+        # Cap in floating point before casting, also at tiny sampling rates.
+        with np.errstate(over="ignore"):
+            counts = np.floor(np.minimum(5.5 + lengths / fs / 4.0, lengths)).astype(np.int64)
+        counts = np.select([lengths <= 1, lengths <= 3, lengths <= 6, lengths <= 20], [1, 2, 3, 4], default=counts)
+    elif callable(rule):
+        counts = np.asarray(rule(lengths, float(fs)))
+        if counts.dtype.kind not in "iu" or np.any(counts < 1):
+            raise ValueError("act_ncoeff callable must return positive integer counts")
+        if counts.ndim and counts.shape != lengths.shape:
+            raise ValueError("act_ncoeff callable must return a scalar or one count per gap")
+    else:
+        counts = min(int(rule), int(lengths.max(initial=1)))
+    return np.minimum(counts, lengths).astype(np.int64)
+
+
+@numba.njit(nogil=True, cache=True)
+def _cut_project(cuts, amp, tod):
+    """Replace each cut by its Legendre series, evaluated without a matrix."""
+    for start, stop, first, ncoef in cuts:
+        n = stop - start
+        for i in range(n):
+            if ncoef == n:  # same full space as marginalization, stable basis
+                tod[start + i] = amp[first + i]
+                continue
+            x = 2.0 * i / (n - 1) - 1.0
+            prev, cur = 1.0, x
+            value = amp[first]
+            for j in range(1, ncoef):
+                value += cur * amp[first + j]
+                prev, cur = cur, ((2 * j + 1) * x * cur - j * prev) / (j + 1)
+            tod[start + i] = value
+
+
+@numba.njit(nogil=True, cache=True)
+def _cut_transpose(cuts, tod, out):
+    """Add C^T tod to the local cut coefficients (disjoint across chunks)."""
+    for start, stop, first, ncoef in cuts:
+        n = stop - start
+        for i in range(n):
+            value = tod[start + i]
+            if ncoef == n:
+                out[first + i] += value
+                continue
+            x = 2.0 * i / (n - 1) - 1.0
+            prev, cur = 1.0, x
+            out[first] += value
+            for j in range(1, ncoef):
+                out[first + j] += cur * value
+                prev, cur = cur, ((2 * j + 1) * x * cur - j * prev) / (j + 1)
+
+
+@numba.njit(nogil=True, cache=True)
+def _cut_diagonal_small(cuts, c, out):
+    """Exact diagonal C^T N^-1 C for short cuts, with small direct sums."""
+    for start, stop, first, ncoef in cuts:
+        n = stop - start
+        if ncoef == n:
+            out[first:first + ncoef] = c[0]
+            continue
+        if n > 32:
+            continue
+        basis = np.empty((n, ncoef))
+        for i in range(n):
+            x = 2.0 * i / (n - 1) - 1.0
+            basis[i, 0] = 1.0
+            basis[i, 1] = x
+            for j in range(1, ncoef - 1):
+                basis[i, j + 1] = ((2 * j + 1) * x * basis[i, j] - j * basis[i, j - 1]) / (j + 1)
+        for j in range(ncoef):
+            value = 0.0
+            for a in range(n):
+                for b in range(n):
+                    value += basis[a, j] * c[(a - b) % c.size] * basis[b, j]
+            out[first + j] = value
+
+
+def _cut_diagonal(cuts, c, out, nthreads, dc_weight):
+    """Own-noise cut diagonal; long cuts use FFT autocorrelations per column.
+
+    Only two Legendre vectors of the gap length are kept, rather than a
+    samples x coefficients design matrix. c is the circulant filter kernel.
+    """
+    _cut_diagonal_small(cuts, c, out)
+    for start, stop, first, ncoef in cuts:
+        n = stop - start
+        if n == c.size and ncoef < n:
+            # A constant over a whole unextended chunk is its DC mode.
+            # Use the exact weight, avoiding cancellation to +/- roundoff
+            # when fmin=0 and this direction is a null mode.
+            out[first] = n * dc_weight
+        if n <= 32 or ncoef == n:
+            continue
+        x = np.linspace(-1.0, 1.0, n)
+        prev, cur = np.zeros(n), np.ones(n)
+        m = fast_fft_length(2 * n)
+        for j in range(ncoef):
+            if j != 0 or n != c.size:
+                f = ducc0.fft.r2c(np.concatenate([cur, np.zeros(m - n)]), nthreads=nthreads)
+                r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=nthreads)[:n]
+                out[first + j] = c[0] * r[0] + 2 * np.dot(c[1:n], r[1:])
+            prev, cur = cur, ((2 * j + 1) * x * cur - j * prev) / (j + 1)
+
+
 @numba.njit(parallel=True, cache=True)
 def _project(ip, m, c2, s2, pol, loc, out):
     """out[i] = I[p] + c2[i] Q[p] + s2[i] U[p], p = ip[i]; m is (nobs, ncomp).
-    Labels p >= nobs are flagged samples: out[i] = loc[p - nobs]."""
+    Labels p >= nobs are local unknowns; p < 0 has no pixel response
+    (an ACT polynomial, if any, is applied separately)."""
     nobs = m.shape[0]
     for i in numba.prange(ip.size):
         p = ip[i]
+        if p < 0:
+            out[i] = 0.0
+            continue
         if p >= nobs:
             out[i] = loc[p - nobs]
             continue
@@ -428,7 +573,7 @@ def _coverage(ip, c2, s2, pol, out):
     are summed in parallel into private arrays (GLS._chunk_coverage)."""
     for i in range(ip.size):
         p = ip[i]
-        if p >= out.shape[0]:  # flagged sample
+        if p < 0 or p >= out.shape[0]:  # flagged sample
             continue
         out[p, 0] += 1.0
         if pol:
@@ -445,15 +590,16 @@ def _coverage(ip, c2, s2, pol, out):
 @numba.njit(cache=True)
 def _pixel_order(ip, npix):
     """Indices of the samples sorted by pixel, in time order within each pixel:
-    a stable counting sort, O(ns + npix), instead of an O(ns log ns) argsort."""
-    start = np.zeros(npix + 1, np.int64)
+    a stable counting sort, O(ns + npix). Negative labels go in a last bucket."""
+    start = np.zeros(npix + 2, np.int64)
     for i in range(ip.size):
-        start[ip[i] + 1] += 1
-    for p in range(npix):
+        p = ip[i] if ip[i] >= 0 else npix
+        start[p + 1] += 1
+    for p in range(npix + 1):
         start[p + 1] += start[p]
     order = np.empty(ip.size, np.int64)
     for i in range(ip.size):
-        p = ip[i]
+        p = ip[i] if ip[i] >= 0 else npix
         order[start[p]] = i
         start[p] += 1
     return order
@@ -500,6 +646,8 @@ def _block_circulant(ip, c, c2, s2, pol, out, nlabels, locout):
         for r in numba.prange(bounds.size - 1):
             start, stop = bounds[r], bounds[r + 1]
             p = sorted_ip[start]
+            if p < 0:  # excluded samples have neither map nor local parameters
+                continue
             n = stop - start
             local = p >= nobs  # an unknown of flagged samples: no Q/U
             # Contiguous run of samples with no polarization sensitivity (e.g. the
@@ -557,11 +705,12 @@ class GLS:
         max(pix) + 1 pixels; pixels without hits are not solved. Used without
         copies if int32 (chunks with flagged samples are copied, see
         overwrite_pix). pix < 0 marks
-        flagged samples: they do not enter the maps and their TOD is not used
-        (taken as 0). Samples of a chunk with the same negative value share an
+        flagged samples: by default their TOD is not used (taken as 0).
+        Samples of a chunk with the same negative value share an
         intensity unknown, local to this rank and discarded: one value per
         sample is the exact GLS without them (marginalization), one per
-        contiguous run fits an offset to it.
+        contiguous run fits an offset to it. With flag_method="sanepic",
+        instead they have no unknowns and their gap-filled TOD is used.
     psi : float array(s) like `pix`, or None
         Polarization angle of each sample. None for intensity only.
     weights : float array (nchunk, ns//2+1), or list like `pix`
@@ -667,10 +816,31 @@ class GLS:
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
+    flag_method : "marginalize" (default), "act" or "sanepic"
+        With "act", each contiguous run of negative pixels is represented by
+        local Legendre coefficients following Naess et al. (2025), Sect.
+        3.3.3, instead of one unknown per sample. Flagged TOD is set to zero,
+        with no random filling; original flagged values are never used.
+        With "sanepic", negative pixels have no parameters: their rows of P
+        and of the templates are zero. solve()/rhs() retain their TOD, which
+        must already be finite gap-filled data. The normal matrix is the sky
+        block of the extended system, without the marginalization correction
+        (Patanchon et al. 2008, Sect. 3.6). make_maps fills these gaps itself.
+    flag_sampling_rate_hz : scalar or one value per chunk
+        Required with flag_method="act" to convert gap lengths to seconds.
+    act_ncoeff : None, positive int, or callable
+        Override ACT's coefficient count: None keeps the paper's rule, an
+        integer fixes the count per gap (1: offsets), a callable takes the
+        array of gap lengths in samples and the chunk sampling rate in Hz,
+        and returns a positive integer scalar or array of matching shape.
+        Counts are capped at each gap length; degree is count minus one.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None):
         self.comm = comm
+        if flag_method not in ("marginalize", "act", "sanepic"):
+            raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'sanepic' (offsets use repeated negative pixel labels)")
+        self._sanepic_flags = flag_method == "sanepic"
         self.nthreads = resolve_nthreads(nthreads)
         self.ip = []
         for p in _chunks(pix):
@@ -678,6 +848,13 @@ class GLS:
                 raise ValueError("pixel indices must be < 2^31")
             self.ip.append(np.ascontiguousarray(p, dtype=np.int32))
         self.weights = _chunks(weights)
+        if flag_method == "act":
+            _validate_act_ncoeff(act_ncoeff)
+            if flag_sampling_rate_hz is None:
+                raise ValueError("flag_sampling_rate_hz is required for ACT cuts")
+            rates = np.broadcast_to(np.asarray(flag_sampling_rate_hz, dtype=float), (len(self.ip),))
+            if np.any(~np.isfinite(rates)) or np.any(rates <= 0):
+                raise ValueError("flag_sampling_rate_hz must be finite and positive")
         if fft_dtype not in (np.float32, np.float64):
             raise ValueError("fft_dtype must be np.float32 or np.float64")
         self._single = fft_dtype == np.float32
@@ -711,19 +888,37 @@ class GLS:
             L = lam.T[:, :, None] * np.eye(U.shape[1])  # Lambda per frequency
             self._groups.append((chunks, U, np.linalg.solve(np.eye(U.shape[1]) + L @ S, L)))
             self._grouped[chunks] = True
-        nobs = 1 + max((int(p.max()) for p in self.ip if p.size), default=-1)
+        nobs = 1 + max((int(p.max(initial=-1)) for p in self.ip), default=-1)
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
         # flagged samples: labels nobs, nobs + 1, ... of unknowns local to this rank
         self.nflag = 0
+        self._cuts = [np.empty((0, 4), np.int64) for _ in self.ip]
         for k, p in enumerate(self.ip):
+            if self._sanepic_flags:
+                continue  # negative labels remain excluded, without PCG state
             flagged = np.flatnonzero(p < 0)
             if flagged.size:
-                labels, unknown = np.unique(p[flagged], return_inverse=True)
                 if not (overwrite_pix and p.flags.writeable):
                     p = p.copy()
-                p[flagged] = self.nobs + self.nflag + unknown
+                if flag_method == "act":
+                    edges = np.flatnonzero(np.diff(np.r_[False, p < 0, False].astype(np.int8)))
+                    starts, stops = edges[::2], edges[1::2]
+                    lengths = stops - starts
+                    counts = _act_ncoeff(lengths, rates[k], act_ncoeff)
+                    first = self.nflag + np.cumsum(counts) - counts
+                    poly = counts > 1
+                    self._cuts[k] = np.column_stack([starts[poly], stops[poly], first[poly], counts[poly]])
+                    self.nflag += int(counts.sum())
+                    if self.nobs + self.nflag >= 2**31:
+                        raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
+                    # Constant cuts use the existing offset kernels, with no
+                    # run metadata. Higher orders have zero sky rows and C.
+                    p[flagged] = np.repeat(np.where(poly, -1, self.nobs + first), lengths)
+                else:
+                    labels, unknown = np.unique(p[flagged], return_inverse=True)
+                    p[flagged] = self.nobs + self.nflag + unknown
+                    self.nflag += labels.size
                 self.ip[k] = p
-                self.nflag += labels.size
         if self.nobs + self.nflag >= 2**31:
             raise ValueError("too many pixels and flagged samples on this rank for int32 labels")
         self._root = comm is None or comm.rank == 0
@@ -784,7 +979,9 @@ class GLS:
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, blocks, self.nobs + self.nflag, self._locprec)
-        self._flagprec = 1.0 / self._locprec
+                if self._cuts[k].size:
+                    _cut_diagonal(self._cuts[k], c, self._locprec, self.nthreads, w[0])
+        self._flagprec = self._inverse(self._locprec)
         self._solved = None  # the full Q/U mask, for the templates
         self.set_templates(templates, shared_templates)
         blocks = self._scatter_sum(blocks, by_column=True)
@@ -814,7 +1011,9 @@ class GLS:
             if self._solved is None:
                 self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
             for k, ip in enumerate(self.ip):
-                bad = ~self._solved[np.minimum(ip, self.nobs - 1)] & (ip < self.nobs)
+                valid = (ip >= 0) & (ip < self.nobs)
+                bad = np.zeros(ip.size, bool)
+                bad[valid] = ~self._solved[ip[valid]]
                 if bad.any():  # copies: the arrays may be the caller's (none if 0 already)
                     for tmpl in (self._tmpl[k], self._shared[k]):
                         tmpl[:] = [(np.where(bad.reshape(-1, *[1] * (v.ndim - 1)), 0, v).astype(v.dtype, copy=False)
@@ -833,7 +1032,7 @@ class GLS:
         def parse(entry):
             """(k, values, labels, number of amplitudes) of one entry, or None."""
             k, values, labels = entry
-            bad = self.ip[k] >= self.nobs
+            bad = (self.ip[k] < 0) | (self.ip[k] >= self.nobs)
             if np.ndim(values) == 2:  # columns with one amplitude each
                 labels = np.asarray(labels, dtype=np.int64)
                 if labels.shape != (np.shape(values)[1],) or np.any(labels < 0):
@@ -979,6 +1178,8 @@ class GLS:
         _shbuf (or in `loc` and `sh`, those of a chunk worker)."""
         loc = self._locbuf[self.nflag :] if loc is None else loc
         sh = self._shbuf if sh is None else sh
+        if self._cuts[k].size:
+            _cut_transpose(self._cuts[k], f, self._locbuf)
         for values, labels in self._tmpl[k]:
             _template_transpose(values, labels, f, loc)
         for values, labels in self._shared[k]:
@@ -1235,16 +1436,20 @@ class GLS:
             self._shbuf += slot["sh"]
 
     def _chunk_tod(self, k, v, tod, loc, c2, s2, pol, slot=None):
-        """P v on chunk k (v given), or the TOD of chunk k (flagged samples set
-        to 0); with a chunk worker's `slot`, in its buffer and single-threaded."""
+        """P v, or chunk TOD (marginalized flags set to 0, SANEPIC fills kept);
+        with a chunk worker's `slot`, in its buffer and single-threaded."""
         ip = self.ip[k]
         if v is None:
             t = np.asarray(tod[k], dtype=float)
+            if self._sanepic_flags and not np.all(np.isfinite(t[ip < 0])):
+                raise ValueError("SANEPIC flagged TOD must be finite gap-filled data; make_maps fills it automatically")
             if self.nflag:  # the TOD of flagged samples is not used (it may be NaN)
-                t = np.where(ip >= self.nobs, 0.0, t)
+                t = np.where((ip < 0) | (ip >= self.nobs), 0.0, t)
             return t
         t = np.empty(ip.size) if slot is None else slot["t"][: ip.size]
         (_project if slot is None else _project_1)(ip, self._full, c2, s2, pol, loc, t)
+        if self._cuts[k].size:
+            _cut_project(self._cuts[k], loc, t)
         serial = slot is not None
         for values, labels in self._tmpl[k]:
             _template_add(t, values, labels, loc[self.nflag : self.nflag + self.namp], serial)
@@ -1300,13 +1505,13 @@ class GLS:
     def apply_A(self, m):
         """P^T N^-1 P m for this rank's pixels of a map, (ncomp, nloc) (without
         MPI, the whole map); returns the same pixels. Collective with MPI. Not
-        available with flagged samples."""
+        available with marginalized flagged samples."""
         self._no_flags()
         return self._apply(np.ravel(m)).reshape(self.ncomp, self.nloc)
 
     def rhs(self, tod):
         """P^T N^-1 d on this rank's pixels (ncomp, nloc), for timelines laid out
-        like `pix`. Collective with MPI. Not available with flagged samples."""
+        like `pix`. Collective with MPI. Not available with marginalized flags."""
         self._no_flags()
         return self._apply(tod=_chunks(tod)).reshape(self.ncomp, self.nloc)
 
@@ -1420,6 +1625,7 @@ class GLS:
         rank, for timelines laid out like `pix`; I only where Q/U are not
         solved, 0 where not observed; flagged samples are not used. Collective
         with MPI."""
+        tod = _chunks(tod)
         cov = self._cov  # the coverage of the setup: the same samples
         rhs = np.zeros((self.nobs, self.ncomp))
         flag = np.zeros(self.nflag)  # not used
