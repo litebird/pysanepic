@@ -32,14 +32,16 @@ the count, and a callable `(lengths_samples, fs_hz)` returns a positive integer
 scalar or an array of counts (one per gap, capped at its length). For example
 `act_ncoeff=3` fits quadratics and `act_ncoeff=1` fits offsets.
 
-`gap_fill`, `gap_fill_tol`, `gap_fill_maxiter` and `flag_seed` are high-level
+`gap_fill`, `gap_fill_tol`, `gap_fill_maxiter`, `gap_fill_preconditioner` and `flag_seed` are high-level
 GLSParameters settings, not arguments of GLS. To prepare a low-level SANEPIC
 TOD, use {func}`~pysanepic.conditional_gap_fill` on the noise residual after
 subtracting a sky estimate, then pass the filled residual to GLS.solve with
 the flagged pointing rows negative. Restore the sky estimate separately
 for a full-sky map; make_maps performs that subtraction/restoration itself.
 The helper takes `rng` (a seed or Generator), `draw` (False for the mean),
-`tol`, `maxiter`, and optionally `fft_length`, `coupling` and `mode_psd`.
+`tol`, `maxiter`, `preconditioner` (`"sine"` or None), and optionally
+`fft_length`, `coupling` and `mode_psd`. This helper's preconditioner is
+independent of the map preconditioner selected in GLS.
 
 `common_modes` correlates chunks observed at the same times, and
 `templates`, a list of `(chunk, values, labels)`, fits template amplitudes

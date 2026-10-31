@@ -20,6 +20,7 @@ so new options need no change on the litebird_sim side.
 | `act_ncoeff` | `None` | With `"act"` (with another method it raises ValueError): `None` keeps the paper's rule; a positive integer fixes the coefficient count per gap; a callable `(lengths_samples, fs_hz)` returns positive integer counts. Counts are capped at the gap length |
 | `gap_fill` | `"local_white"` | With `"sanepic"`: local line + white noise, `"conditional_mean"` (deterministic), or `"constrained"` (constrained realization). Conditional modes require `sky_model` |
 | `gap_fill_tol`, `gap_fill_maxiter` | 1e-12, 1000 | Squared relative residual threshold and maximum iterations of each conditional gap solve; nonconvergence raises RuntimeError. Non-default values without a conditional `gap_fill` raise ValueError. `MapResult.gap_fill_iterations` reports the largest count used |
+| `gap_fill_preconditioner` | `"sine"` | Conditional fills: independent own-noise sine-transform blocks for long gaps; `None` disables preconditioning. Non-default values without a conditional fill raise ValueError |
 | `split_gap_s` | 300 | Runs of flagged samples at least this long [s] split the chunk and are dropped; `inf`: never, 0: every run. Disabled for DetectorGroup |
 | `fft_dtype` | `np.float64` | Precision of the FFTs of $N^{-1}$ on the PCG search directions; `np.float32` is faster, see [FFT precision](#fft-precision) |
 | `template_dtype` | `np.float32` | Storage of the TODs of the templates fitted with the maps (gains of the calibration, `make_maps(templates=...)`): float32 (4 bytes per sample and template, relative rounding ~6e-8) or `np.float64` (exact, 8 bytes). See [Angle precision](#angle-precision) |
@@ -248,8 +249,16 @@ cuts. Invalid counts or shapes raise ValueError. `act_ncoeff=1` is equivalent
 to `"offset"`; a rule returning `lengths_samples` gives exact marginalization.
 Custom rules tune the approximation and should be validated against it.
 
-The basis is evaluated by recurrence on [-1, 1], without storing a design
-matrix. Coefficients belong to their chunk and MPI process. Their
+The basis is evaluated by recurrence without storing a design matrix.
+For high orders (`ncoeff > 4` and `ncoeff**2 > 4 * gap_length_samples`),
+sampled Legendre columns are replaced by discrete orthonormal Gram
+polynomials, spanning **the same polynomial space of the same dimension**.
+Low degrees use the degree recurrence; high degrees use the symmetric Hahn
+difference equation on the sample grid, evaluated from the endpoint to the
+middle and reflected with parity to avoid endpoint instability. This is a
+change of coordinates, not a switch to full sample marginalization.
+See the [Hahn difference equations](https://dlmf.nist.gov/18.22.ii).
+Coefficients belong to their chunk and MPI process. Their
 preconditioner is the exact own-noise diagonal of $C^T N^{-1} C$ (as for the
 other local unknowns); long cuts use FFT autocorrelations in setup. If the
 number of coefficients equals the sample count, an identity basis avoids
@@ -295,6 +304,7 @@ params = GLSParameters(
     gap_fill="constrained",       # or "conditional_mean", without random noise
     gap_fill_tol=1e-12,
     gap_fill_maxiter=1000,
+    gap_fill_preconditioner="sine",  # None: ordinary CG for comparison
     flag_seed=42,
 )
 result = make_maps(data, nside, params=params, sky_model=initial.maps)
@@ -326,6 +336,19 @@ raises RuntimeError. The fill is held fixed throughout the map PCG.
 `flag_method="sanepic"`; choosing them with another method raises ValueError.
 `gap_fill_tol` and `gap_fill_maxiter` control the gap CG, whereas `tol` and
 `maxiter` control the map PCG: these are separate convergence tests.
+`gap_fill_preconditioner="sine"` (default) uses positive definite blocks
+for individual gaps. Runs longer than 32 samples use an orthonormal DST-I
+and the detector's own inverse noise spectrum interpolated at frequencies
+`j / (2 * (gap_length + 1))` in cycles per sample. Short runs use the
+own-noise diagonal; a long, fully missing complete FFT row uses its exact
+own-noise inverse. It stores no dense time-domain matrices. The blocks
+ignore correlations between gaps and detectors, while the **PCG operator
+keeps the full GLS precision**, including common modes and FFT extension.
+This follows the [sine-transform preconditioning approach](https://arxiv.org/abs/1404.5332);
+effectiveness for arbitrary spectra or common modes is not guaranteed.
+`None` disables it for comparisons. Both modes stop on the true,
+unpreconditioned squared relative residual; preconditioning does not alter
+the conditional distribution. No random numbers are consumed by setup.
 `flag_seed` controls the random draw for a fixed MPI partition and input order;
 `"conditional_mean"` consumes no random numbers.
 
@@ -344,7 +367,7 @@ from pysanepic import conditional_gap_fill
 # residual is noise-only, flags is boolean, and noise/fs/nfft are known.
 filled, info = conditional_gap_fill(
     residual, flags, noise.weights(nfft, fs), fft_length=nfft,
-    rng=42, draw=True, tol=1e-12, maxiter=1000,
+    rng=42, draw=True, tol=1e-12, maxiter=1000, preconditioner="sine",
 )
 ```
 

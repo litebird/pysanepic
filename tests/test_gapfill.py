@@ -114,6 +114,77 @@ def test_conditional_long_gap_iterations():
     assert info["iterations"] < 200
 
 
+@pytest.mark.parametrize("ndet", [1, 2])
+@pytest.mark.parametrize("m", [95, 128])
+@pytest.mark.parametrize("draw", [False, True])
+def test_sine_preconditioner_preserves_long_gap_solution(ndet, m, draw):
+    """PCG and CG solve the same seeded conditional, including common modes."""
+    data, flags, w, U, lam, _, _ = _problem(ndet, 95, m)
+    flags[:, 10:58] = True
+    masked = np.where(flags, np.nan, data)
+    kw = dict(fft_length=m, coupling=U, mode_psd=lam, draw=draw, rng=7, tol=1e-24)
+    a, ia = conditional_gap_fill(masked, flags, w, **kw)
+    b, ib = conditional_gap_fill(masked, flags, w, preconditioner=None, **kw)
+    assert ia["residual"] <= kw["tol"] and ib["residual"] <= kw["tol"]
+    assert np.allclose(a, b, rtol=1e-10, atol=1e-11)
+    assert np.array_equal(a[~flags], data[~flags])
+    if not draw:
+        # Dense reference for the new long mask, not the helper's short mask.
+        spectral = np.array([np.diag(1 / w[:, f]) + ((U * lam[:, f]) @ U.T if ndet > 1 else 0.)
+                             for f in range(w.shape[1])])
+        q = np.linalg.inv(spectral)
+        lag = (np.arange(95)[:, None] - np.arange(95)[None, :]) % m
+        Q = np.block([[np.fft.irfft(q[:, i, j], n=m)[lag] for j in range(ndet)] for i in range(ndet)])
+        f, u = flags.ravel(), ~flags.ravel()
+        ref = np.linalg.solve(Q[np.ix_(f, f)], -Q[np.ix_(f, u)] @ data.ravel()[u])
+        assert np.allclose(a[flags], ref, rtol=1e-10, atol=1e-11)
+
+
+def test_sine_preconditioner_accelerates_steep_noise():
+    ns = 4096
+    w = one_over_f_weights(ns, 19., 1., 1., 2., 1e-4)
+    flags = np.zeros(ns, bool)
+    flags[100:1100] = True
+    data = np.random.default_rng(2).normal(size=ns)
+    a, ia = conditional_gap_fill(data, flags, w, draw=False, tol=1e-18)
+    b, ib = conditional_gap_fill(data, flags, w, draw=False, tol=1e-18, preconditioner=None)
+    assert ia["iterations"] < ib["iterations"] / 3
+    assert np.allclose(a, b, rtol=1e-6, atol=1e-7)
+
+
+def test_sine_preconditioner_spd_white_full_and_null_dc():
+    from pysanepic.gapfill import _gap_preconditioner
+
+    ns = 95
+    flags = np.zeros((1, ns), bool)
+    flags[:, 5:50] = True
+    flags[:, 60:63] = True
+    w = one_over_f_weights(ns, 19., 1., 1., 2., 0.)[None]
+    apply = _gap_preconditioner(flags, w, ns, 1)
+    nf = flags.sum()
+    M = np.empty((nf, nf))
+    for j in range(nf):
+        v = np.zeros(nf)
+        v[j] = 1.
+        apply(v, M[:, j])
+    assert np.allclose(M, M.T, rtol=1e-13, atol=1e-13)
+    assert np.linalg.eigvalsh(M).min() > 0
+    data = np.random.default_rng(2).normal(size=ns)
+    a, _ = conditional_gap_fill(data, flags[0], w[0], draw=False, tol=1e-22)
+    b, _ = conditional_gap_fill(data, flags[0], w[0], draw=False, tol=1e-22, preconditioner=None)
+    assert np.allclose(a, b, rtol=1e-9, atol=1e-10)
+    full = np.ones(ns, bool)
+    _, info = conditional_gap_fill(data, full, w[0] + .01, rng=5, maxiter=1)
+    assert info["iterations"] == 1
+    white, _ = conditional_gap_fill(data, flags[0], np.full(ns // 2 + 1, .25), rng=5)
+    plain, _ = conditional_gap_fill(data, flags[0], np.full(ns // 2 + 1, .25), rng=5, preconditioner=None)
+    assert np.allclose(white, plain, rtol=0, atol=1e-13)
+    with pytest.raises(ValueError, match="preconditioner"):
+        conditional_gap_fill(data, flags[0], w[0], preconditioner="invalid")
+    with pytest.raises(ValueError, match="gap_fill_preconditioner"):
+        make_maps([], 1, params=GLSParameters(gap_fill_preconditioner=None))
+
+
 def test_conditional_dc_null_draw_statistics():
     """Zero DC yields a proper conditional with mean anchored by the good data."""
     data = np.array([3., 1., np.nan, np.nan, 2., 4.])

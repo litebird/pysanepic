@@ -151,6 +151,7 @@ params = GLSParameters(
     flag_seed=42,
     gap_fill_tol=1e-12,
     gap_fill_maxiter=1000,
+    gap_fill_preconditioner="sine",  # default; None disables preconditioning
 )
 # sky_estimate is a prior model or preliminary map, in the output coordinates
 # and at this nside (or provided as alm). For noise-only TOD use a zero model.

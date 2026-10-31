@@ -201,11 +201,65 @@ def _act_ncoeff(lengths, fs, rule=None):
     return np.minimum(counts, lengths).astype(np.int64)
 
 
+@numba.njit(cache=True)
+def _orthogonal_cut(n, ncoef):
+    """Change coordinates before the sampled Legendre basis becomes ill-conditioned."""
+    return 4 < ncoef < n and ncoef * ncoef > 4 * n
+
+
+@numba.njit(cache=True)
+def _cut_orthogonal_column(n, degree, prev, cur, out):
+    """Orthonormal Gram (Hahn alpha=beta=0) polynomial on 0,...,n-1.
+
+    Low degrees use the orthonormal three-term recurrence in degree. At high
+    degrees that recurrence amplifies roundoff near the endpoints. Instead
+    solve the symmetric difference equation from an endpoint to the middle,
+    reflect with parity, and normalize. Its eigenvalue is degree*(degree+1)
+    and edge coefficients are a_i=(i+1)*(n-1-i). Rescaling prevents overflow.
+    See https://dlmf.nist.gov/18.22.ii. No design matrix is stored.
+    """
+    if degree == 0:
+        out[:] = 1.0 / np.sqrt(n)
+    elif degree * degree <= 4 * n:
+        b = degree / (n - 1) * np.sqrt((n * n - degree * degree) / (4 * degree * degree - 1))
+        j = degree - 1
+        a = j / (n - 1) * np.sqrt((n * n - j * j) / (4 * j * j - 1)) if j else 0.0
+        for i in range(n):
+            out[i] = ((2.0 * i / (n - 1) - 1.0) * cur[i] - a * prev[i]) / b
+    else:
+        out[0] = 1.0
+        for i in range((n - 1) // 2):
+            a, b = (i + 1) * (n - 1 - i), i * (n - i)
+            out[i + 1] = ((a + b - degree * (degree + 1)) * out[i]
+                          - (b * out[i - 1] if i else 0.0)) / a
+            if abs(out[i + 1]) > 1e100:
+                out[:i + 2] *= 1e-100
+        parity = -1.0 if degree % 2 else 1.0
+        for i in range(n // 2):
+            out[n - 1 - i] = parity * out[i]
+        if n % 2 and degree % 2:
+            out[n // 2] = 0.0
+        norm2 = 0.0
+        for i in range(n):
+            norm2 += out[i] * out[i]
+        norm = np.sqrt(norm2)
+        out[:] /= norm
+
+
 @numba.njit(nogil=True, cache=True)
 def _cut_project(cuts, amp, tod):
-    """Replace each cut by its Legendre series, evaluated without a matrix."""
+    """Replace each cut by its polynomial series, without a stored matrix."""
     for start, stop, first, ncoef in cuts:
         n = stop - start
+        if _orthogonal_cut(n, ncoef):
+            prev, cur, column = np.zeros(n), np.zeros(n), np.empty(n)
+            tod[start:stop] = 0.0
+            for j in range(ncoef):
+                _cut_orthogonal_column(n, j, prev, cur, column)
+                for i in range(n):
+                    tod[start + i] += amp[first + j] * column[i]
+                prev, cur, column = cur, column, prev
+            continue
         for i in range(n):
             if ncoef == n:  # same full space as marginalization, stable basis
                 tod[start + i] = amp[first + i]
@@ -224,6 +278,14 @@ def _cut_transpose(cuts, tod, out):
     """Add C^T tod to the local cut coefficients (disjoint across chunks)."""
     for start, stop, first, ncoef in cuts:
         n = stop - start
+        if _orthogonal_cut(n, ncoef):
+            prev, cur, column = np.zeros(n), np.zeros(n), np.empty(n)
+            for j in range(ncoef):
+                _cut_orthogonal_column(n, j, prev, cur, column)
+                for i in range(n):
+                    out[first + j] += column[i] * tod[start + i]
+                prev, cur, column = cur, column, prev
+            continue
         for i in range(n):
             value = tod[start + i]
             if ncoef == n:
@@ -248,12 +310,18 @@ def _cut_diagonal_small(cuts, c, out):
         if n > 32:
             continue
         basis = np.empty((n, ncoef))
-        for i in range(n):
-            x = 2.0 * i / (n - 1) - 1.0
-            basis[i, 0] = 1.0
-            basis[i, 1] = x
-            for j in range(1, ncoef - 1):
-                basis[i, j + 1] = ((2 * j + 1) * x * basis[i, j] - j * basis[i, j - 1]) / (j + 1)
+        if _orthogonal_cut(n, ncoef):
+            prev, cur = np.zeros(n), np.zeros(n)
+            for j in range(ncoef):
+                _cut_orthogonal_column(n, j, prev, cur, basis[:, j])
+                prev, cur = cur, basis[:, j]
+        else:
+            for i in range(n):
+                x = 2.0 * i / (n - 1) - 1.0
+                basis[i, 0] = 1.0
+                basis[i, 1] = x
+                for j in range(1, ncoef - 1):
+                    basis[i, j + 1] = ((2 * j + 1) * x * basis[i, j] - j * basis[i, j - 1]) / (j + 1)
         for j in range(ncoef):
             value = 0.0
             for a in range(n):
@@ -265,28 +333,34 @@ def _cut_diagonal_small(cuts, c, out):
 def _cut_diagonal(cuts, c, out, nthreads, dc_weight):
     """Own-noise cut diagonal; long cuts use FFT autocorrelations per column.
 
-    Only two Legendre vectors of the gap length are kept, rather than a
-    samples x coefficients design matrix. c is the circulant filter kernel.
+    At most three polynomial vectors of the gap length are kept, rather than
+    a samples x coefficients matrix. c is the circulant filter kernel.
     """
     _cut_diagonal_small(cuts, c, out)
     for start, stop, first, ncoef in cuts:
         n = stop - start
+        orthogonal = _orthogonal_cut(n, ncoef)
         if n == c.size and ncoef < n:
             # A constant over a whole unextended chunk is its DC mode.
             # Use the exact weight, avoiding cancellation to +/- roundoff
             # when fmin=0 and this direction is a null mode.
-            out[first] = n * dc_weight
+            out[first] = dc_weight if orthogonal else n * dc_weight
         if n <= 32 or ncoef == n:
             continue
-        x = np.linspace(-1.0, 1.0, n)
+        x = None if orthogonal else np.linspace(-1.0, 1.0, n)
         prev, cur = np.zeros(n), np.ones(n)
+        column = np.empty(n) if orthogonal else None
         m = fast_fft_length(2 * n)
         for j in range(ncoef):
+            if orthogonal:
+                _cut_orthogonal_column(n, j, prev, cur, column)
+                prev, cur, column = cur, column, prev
             if j != 0 or n != c.size:
                 f = ducc0.fft.r2c(np.concatenate([cur, np.zeros(m - n)]), nthreads=nthreads)
                 r = ducc0.fft.c2r(f * f.conj(), lastsize=m, forward=False, inorm=2, nthreads=nthreads)[:n]
                 out[first + j] = c[0] * r[0] + 2 * np.dot(c[1:n], r[1:])
-            prev, cur = cur, ((2 * j + 1) * x * cur - j * prev) / (j + 1)
+            if not orthogonal:
+                prev, cur = cur, ((2 * j + 1) * x * cur - j * prev) / (j + 1)
 
 
 @numba.njit(parallel=True, cache=True)
@@ -834,6 +908,9 @@ class GLS:
         array of gap lengths in samples and the chunk sampling rate in Hz,
         and returns a positive integer scalar or array of matching shape.
         Counts are capped at each gap length; degree is count minus one.
+        High orders use discrete orthonormal polynomials spanning the same
+        space, instead of ill-conditioned sampled Legendre columns. Full
+        counts use identity. No dense basis is stored in either case.
     """
 
     def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None):

@@ -23,7 +23,7 @@ import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 from .gls import _GapFilledTOD, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
-from .gapfill import conditional_gap_fill, _validate_gap_solve
+from .gapfill import conditional_gap_fill, _validate_gap_solve, _validate_gap_preconditioner
 
 
 class Coordinates(str, Enum):
@@ -428,6 +428,10 @@ class GLSParameters:
     gap_fill_tol, gap_fill_maxiter : squared relative residual threshold and
         maximum CG iterations for each conditional fill. Failure raises
         RuntimeError rather than using an inaccurate realization.
+    gap_fill_preconditioner : "sine" (default) or None. Own-noise sine blocks
+        for long gaps and diagonal scaling for short gaps, or unpreconditioned
+        CG. Only used with a conditional gap fill; the true residual controls
+        convergence in either case.
     fft_dtype : precision of the FFTs applying N^-1 to the PCG search
         directions: np.float64 (default) or np.float32 (~45% faster FFTs; the
         right-hand side and the true residual stay in float64, see GLS).
@@ -489,6 +493,7 @@ class GLSParameters:
     gap_fill: str = "local_white"
     gap_fill_tol: float = 1e-12
     gap_fill_maxiter: int = 1000
+    gap_fill_preconditioner: str | None = "sine"
 
 
 @dataclass(kw_only=True)
@@ -1116,6 +1121,7 @@ def _conditional_tod(tod, gls, npix, common_modes, params, rng, nthreads):
             np.stack([gls.weights[k] for k in ks]), fft_length=gls._nfft[ks[0]],
             coupling=coupling, mode_psd=mode_psd, draw=params.gap_fill == "constrained",
             rng=rng, tol=params.gap_fill_tol, maxiter=params.gap_fill_maxiter, nthreads=nthreads,
+            preconditioner=params.gap_fill_preconditioner,
         )
         iterations = max(iterations, info["iterations"])
         for i, (k, mask) in enumerate(zip(ks, masks)):
@@ -1146,14 +1152,16 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     if conditional and (fit is None or fit.sky is None):
         raise ValueError("conditional gap_fill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
     _validate_gap_solve(params.gap_fill_tol, params.gap_fill_maxiter)
+    _validate_gap_preconditioner(params.gap_fill_preconditioner)
     if isinstance(params.flag_seed, (bool, np.bool_)) or not isinstance(params.flag_seed, (int, np.integer)) or params.flag_seed < 0:
         raise ValueError("GLSParameters.flag_seed must be a non-negative integer")
     # options of another flag treatment are errors, not silently ignored
     default = GLSParameters()
     if params.act_ncoeff is not None and params.flag_method != "act":
         raise ValueError("act_ncoeff requires flag_method='act'")
-    if not conditional and (params.gap_fill_tol != default.gap_fill_tol or params.gap_fill_maxiter != default.gap_fill_maxiter):
-        raise ValueError("gap_fill_tol and gap_fill_maxiter require gap_fill='conditional_mean' or 'constrained'")
+    if not conditional and (params.gap_fill_tol != default.gap_fill_tol or params.gap_fill_maxiter != default.gap_fill_maxiter
+                            or params.gap_fill_preconditioner != default.gap_fill_preconditioner):
+        raise ValueError("gap_fill_tol, gap_fill_maxiter and gap_fill_preconditioner require gap_fill='conditional_mean' or 'constrained'")
     if params.flag_seed != default.flag_seed and (params.flag_method != "sanepic" or params.gap_fill == "conditional_mean"):
         warnings.warn(f"flag_seed has no effect with flag_method={params.flag_method!r}"
                       + (", gap_fill='conditional_mean'" if params.flag_method == "sanepic" else "")

@@ -4,6 +4,20 @@
 
 Changes on `main` that are not in a release yet.
 
+- Conditional gap fills use PCG with independent own-noise sine-transform
+  blocks for long gaps, diagonal scaling for short gaps, and an exact
+  own-noise inverse for long, fully missing FFT rows. Set
+  `GLSParameters.gap_fill_preconditioner=None` (or `preconditioner=None` in
+  `conditional_gap_fill`) for ordinary CG. The true-residual threshold,
+  conditional distribution, RNG streams and full common-mode operator are
+  preserved. No dense gap matrix or new dependency is introduced.
+
+- ACT high-order cuts use discrete orthonormal Gram polynomials instead of
+  ill-conditioned sampled Legendre columns. The polynomial subspace and
+  coefficient counts are preserved; full counts still use identity. Stable
+  degree/sample recurrences retain matrix-free projection, transpose and
+  exact own-noise diagonal preconditioning.
+
 - `gap_fill="constrained"` / `"conditional_mean"` with
   `flag_method="sanepic"`: Gaussian noise conditional on valid residuals
   after subtracting the required `sky_model`. Includes joint DetectorGroup

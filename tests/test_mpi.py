@@ -188,7 +188,8 @@ def test_flags_mpi():
     pix[flags] = (-1 - np.arange(ns))[None].repeat(nchunk, 0)[flags]  # one unknown per sample
     mine = slice(comm.rank, None, comm.size)
     rules = [("marginalize", None), ("act", None), ("act", 3),
-             ("act", lambda n, fs: 1 + np.ceil(n / fs / 2).astype(int)), ("sanepic", None)]
+             ("act", lambda n, fs: 1 + np.ceil(n / fs / 2).astype(int)),
+             ("act", lambda n, fs: np.maximum(1, n - 1)), ("sanepic", None)]
     for method, rule in rules:
         # SANEPIC receives the same finite gap filling on every partition.
         kw = dict(min_pol_rcond=0.0, flag_method=method,

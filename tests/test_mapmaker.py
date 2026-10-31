@@ -437,7 +437,7 @@ def test_calibration_noiseless():
         make_maps(data, nside, calibration=CalibrationParameters(mask=band[:10]))
 
 
-@pytest.mark.parametrize("ncoeff", [None, 3])
+@pytest.mark.parametrize("ncoeff", [None, 3, 32])
 def test_calibration_act_flags(ncoeff):
     """flag_method="act" with calibration: the cuts (also Legendre ones, in
     chunk workers) are reused between iterations; gains and maps are recovered
@@ -457,6 +457,7 @@ def test_calibration_act_flags(ncoeff):
                            flag_method="act", act_ncoeff=ncoeff)
     r = make_maps(flagged, nside, coordinates="E", params=params, nthreads=2,
                   calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=3))
+    assert r.converged
     assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
     seen = r.maps[1] != hp.UNSEEN
     err = r.maps[:, seen] - sky[:, seen]

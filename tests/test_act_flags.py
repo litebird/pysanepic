@@ -25,7 +25,7 @@ def test_act_coefficient_counts():
 @pytest.mark.parametrize("pol", [False, True])
 @pytest.mark.parametrize("nthreads", [1, 2])
 @pytest.mark.parametrize("grouped", [False, True])
-@pytest.mark.parametrize("rule", [None, 1, 3, "duration"])
+@pytest.mark.parametrize("rule", [None, 1, 3, "duration", "near_full"])
 def test_act_dense_gls(pol, nthreads, grouped, rule):
     """I/Q/U, templates, common modes, exact cut diagonals and long-cut FFTs."""
     rng = np.random.default_rng(25)
@@ -35,7 +35,10 @@ def test_act_dense_gls(pol, nthreads, grouped, rule):
     flags = np.zeros(pix.shape, bool)
     gaps = [(0, 0, 1, 1), (0, 10, 13, 2), (0, 20, 26, 3), (0, 40, 60, 4),
             (1, 1, 8, 4), (1, 25, 46, 5), (1, 60, 100, 6), (2, 0, 160, 7)]
-    if rule == "duration":
+    if rule == "near_full":
+        gaps = [(k, a, b, max(1, b - a - 1)) for k, a, b, _ in gaps]
+        rule = lambda n, fs: np.maximum(1, n - 1)
+    elif rule == "duration":
         gaps = [(k, a, b, min(b - a, 1 + int(np.ceil((b - a) / fs / 2)))) for k, a, b, _ in gaps]
         rule = lambda n, fs: 1 + np.ceil(n / fs / 2).astype(int)
     elif rule is not None:
@@ -46,6 +49,13 @@ def test_act_dense_gls(pol, nthreads, grouped, rule):
     for k, start, stop, count in gaps:
         flags[k, start:stop] = True
         basis = np.eye(count) if count == stop - start else np.polynomial.legendre.legvander(np.linspace(-1., 1., stop - start), count - 1)
+        n = stop - start
+        if 4 < count < n and count * count > 4 * n:
+            # Independent reference: the symmetric Hahn difference operator
+            # has polynomial eigenvectors of degree j, eigenvalue j*(j+1).
+            a = np.arange(1, n) * np.arange(n - 1, 0, -1)
+            L = np.diag(np.r_[a, 0] + np.r_[0, a]) - np.diag(a, 1) - np.diag(a, -1)
+            basis = np.linalg.eigh(L)[1][:, :count]
         C[k * ns + start:k * ns + stop, first:first + count] = basis
         first += count
     ncomp = 3 if pol else 1
@@ -97,6 +107,40 @@ def test_act_dense_gls(pol, nthreads, grouped, rule):
     assert np.allclose(info["shared_amplitudes"], ref[-1:], rtol=1e-9, atol=1e-11)
     assert np.allclose(1 / g._flagprec, np.diag(C.T @ Wown @ C), rtol=1e-10, atol=1e-12)
     assert np.array_equal(g.hits, np.bincount(pix[~flags], minlength=npix))
+
+
+@pytest.mark.parametrize("n,count", [(16, 15), (63, 62), (64, 63), (128, 127)])
+def test_act_high_degree_orthogonality_and_adjoint(n, count):
+    """Stable even near full rank; same polynomial space, without dense storage."""
+    from pysanepic.gls import _cut_project, _cut_transpose
+
+    cuts = np.array([[0, n, 0, count]], dtype=np.int64)
+    C = np.empty((n, count))
+    for j in range(count):
+        amp = np.zeros(count)
+        amp[j] = 1.
+        _cut_project(cuts, amp, C[:, j])
+    assert np.allclose(C.T @ C, np.eye(count), rtol=0, atol=2e-12)
+    a = np.arange(1, n) * np.arange(n - 1, 0, -1)
+    L = np.diag(np.r_[a, 0] + np.r_[0, a]) - np.diag(a, 1) - np.diag(a, -1)
+    degree = np.arange(count)
+    assert np.allclose(L @ C, C * (degree * (degree + 1)), rtol=1e-9, atol=1e-9)
+    rng = np.random.default_rng(21)
+    tod = rng.normal(size=n)
+    out = np.zeros(count)
+    _cut_transpose(cuts, tod, out)
+    assert np.allclose(out, C.T @ tod, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("n", [16, 64])
+def test_act_high_degree_zero_dc_diagonal(n):
+    """The normalized constant of a whole flagged chunk is exactly null."""
+    pix = np.tile(np.arange(n) % 4, (2, 1))
+    pix[1] = -1
+    w = np.tile(one_over_f_weights(n, 20., 1., .5, 1., 0.), (2, 1))
+    g = GLS(pix, None, w, flag_method="act", flag_sampling_rate_hz=20., act_ncoeff=n - 1)
+    assert g._flagprec[0] == 0.
+    assert np.isfinite(g._flagprec).all() and np.all(g._flagprec >= 0)
 
 
 @pytest.mark.parametrize("fs, full_gap, rule", [(20., False, None), (0.01, True, None), (20., True, lambda n, fs: n)])

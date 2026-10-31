@@ -147,6 +147,10 @@ other flag unknowns. The preconditioner is the exact diagonal C^T N^-1 C
 for each chunk's own noise (direct sums for short cuts, FFT autocorrelations
 for long ones). This is exact for the restricted cut model, generally not
 equivalent to marginalizing every missing sample; no noise draw is needed.
+At high orders a discrete orthonormal Gram basis replaces the sampled
+Legendre basis, preserving its span and coefficient count. The Hahn
+difference equation gives stable high-degree columns without storing a
+design matrix; a full sample count still uses identity.
 
 With `flag_method="sanepic"`, flagged samples instead have zero pointing and
 template rows, without local unknowns. The operator is the sky/template
@@ -163,6 +167,11 @@ omits g. FFTs apply Q without dense time matrices. DetectorGroup fills use
 the joint common-mode model; padding is unobserved and included among the
 missing samples. The fill is fixed during the map solve: this supplies a
 conditional noise realization, not a joint Gibbs or exact GLS map algorithm.
+The inner solve uses PCG with independent own-noise sine-transform blocks
+for long gaps and diagonal scaling for short gaps. Cross-gap and detector
+correlations remain in Q_ff. The preconditioner changes convergence, not the
+model or the true-residual acceptance criterion; it can be disabled with
+`gap_fill_preconditioner=None`.
 
 ## Calibration
 
