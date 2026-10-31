@@ -156,6 +156,9 @@ def conditional_gap_fill(residual, flags, weights, *, draw=True, rng=None, tol=1
             iteration += 1
             new_rr = float(np.dot(r, r))
             # Recheck the true residual periodically and before accepting a draw.
+            # Replace the recursive residual but keep the search direction:
+            # restarting would discard the Krylov space (5-10x more iterations
+            # with steep 1/f noise and long gaps).
             if iteration % 10 == 0 or new_rr / bb <= tol:
                 apply(x, q)
                 r[:] = b - q
@@ -163,9 +166,7 @@ def conditional_gap_fill(residual, flags, weights, *, draw=True, rng=None, tol=1
                 if new_rr / bb <= tol:
                     rr, error = new_rr, new_rr / bb
                     break
-                p[:] = r  # restart after replacing the recursive residual
-            else:
-                _xpby(p, r, new_rr / rr)
+            _xpby(p, r, new_rr / rr)
             rr, error = new_rr, new_rr / bb
     if not np.isfinite(error) or error > tol:
         raise RuntimeError(f"conditional gap CG did not converge in {maxiter} iterations (squared relative residual {error:.3g})")

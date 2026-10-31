@@ -102,6 +102,17 @@ def test_conditional_failures():
     assert np.array_equal(out, data) and info["iterations"] == 0
 
 
+def test_conditional_long_gap_iterations():
+    """Steep 1/f with a long gap: restarting CG at each true-residual check took ~1000 iterations."""
+    ns = 2**14
+    w = one_over_f_weights(ns, 19., 1., 0.1, 2., 1e-4)
+    flags = np.zeros(ns, bool)
+    flags[500:4500] = True
+    data = np.random.default_rng(2).standard_normal(ns)
+    _, info = conditional_gap_fill(data, flags, w, draw=False)
+    assert info["iterations"] < 200
+
+
 def test_conditional_dc_null_draw_statistics():
     """Zero DC yields a proper conditional with mean anchored by the good data."""
     data = np.array([3., 1., np.nan, np.nan, 2., 4.])
