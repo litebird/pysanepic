@@ -16,7 +16,35 @@ see {func}`~pysanepic.fast_fft_length`), and `weights` are on their rfft
 grid. Negative pixels mark flagged samples: samples of a chunk with the same
 negative value share an unknown that is not in the maps (one value per sample
 for the exact GLS without them); `apply_A` and `rhs` are then not available,
-use `solve`. `common_modes` correlates chunks observed at the same times, and
+use `solve`. With `GLS(..., flag_method="fill")`, negative pixels instead
+have zero pointing/template rows and no unknowns: their **finite, already
+gap-filled TOD** is retained in the RHS (the caller fills it; `make_maps`
+does this automatically). This is approximate, not exact marginalization;
+`apply_A` and `rhs` are available without templates in this mode.
+With `flag_method="act", flag_sampling_rate_hz=fs`, contiguous negative
+pixels instead get the local Legendre coefficients of the ACT cut model;
+fs is scalar or one sampling rate per chunk, needed for gap durations.
+Flagged TOD is ignored and set to zero. The basis is evaluated without
+stored template arrays; `nflag` counts the coefficients, not cut samples.
+Use `solve`, as with the other local unknowns.
+`act_ncoeff` is also accepted here: None keeps the ACT rule, an integer fixes
+the count, and a callable `(lengths_samples, fs_hz)` returns a positive integer
+scalar or an array of counts (one per gap, capped at its length). For example
+`act_ncoeff=3` fits quadratics and `act_ncoeff=1` fits offsets.
+
+`act_ncoeff` and `flag_sampling_rate_hz` require `flag_method="act"`.
+The fill itself ({class}`~pysanepic.GapFill`) is a high-level setting, not
+an argument of GLS. To prepare a gap-filled
+TOD, use {func}`~pysanepic.conditional_gap_fill` on the noise residual after
+subtracting a sky estimate, then pass the filled residual to GLS.solve with
+the flagged pointing rows negative. Restore the sky estimate separately
+for a full-sky map; make_maps performs that subtraction/restoration itself.
+The helper takes `rng` (a seed or Generator), `draw` (False for the mean),
+`tol`, `maxiter`, `preconditioner` (`"sine"` or None), and optionally
+`fft_length`, `coupling` and `mode_psd`. This helper's preconditioner is
+independent of the map preconditioner selected in GLS.
+
+`common_modes` correlates chunks observed at the same times, and
 `templates`, a list of `(chunk, values, labels)`, fits template amplitudes
 with the map (the TOD of the chunk gets `values * a[labels]`, labels -1: none;
 amplitudes local to each process, returned in `info["amplitudes"]`;

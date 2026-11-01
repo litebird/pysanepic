@@ -126,7 +126,7 @@ the maps and then discarded, so the padding does not enter the maps.
 
 ## Flagged samples
 
-Flagged samples point to *local unknowns*: intensity-only values that are
+With `"marginalize"` or `"offset"`, flagged samples point to *local unknowns*: intensity-only values that are
 not pixels of the map and belong to the process holding the samples, so they
 take no part in the reduce-scatter and allgather of the PCG; their TOD is set
 to 0. With one unknown per sample (`flag_method="marginalize"`) the solution
@@ -137,6 +137,41 @@ are exactly described by the offset, so there is no bias. The preconditioner
 of a local unknown is its diagonal element of $P^T N^{-1} P$. Long runs can
 instead split the chunk (`split_gap_s`), see
 [flagged samples](parameters.md#flagged-samples).
+
+`flag_method=ACTCuts(...)` instead fits a small Legendre series in each contiguous
+cut, with the coefficient counts of Naess et al. (2025), Sect. 3.3.3. For
+zero-filled flagged TOD, the joint design is [P, C], with P zero on cuts and
+C supported only there. C and C^T are evaluated by recurrence without a
+stored design matrix, and the coefficients occupy local PCG state like the
+other flag unknowns. The preconditioner is the exact diagonal C^T N^-1 C
+for each chunk's own noise (direct sums for short cuts, FFT autocorrelations
+for long ones). This is exact for the restricted cut model, generally not
+equivalent to marginalizing every missing sample; no noise draw is needed.
+At high orders a discrete orthonormal Gram basis replaces the sampled
+Legendre basis, preserving its span and coefficient count. The Hahn
+difference equation gives stable high-degree columns without storing a
+design matrix; a full sample count still uses identity.
+
+With `flag_method=GapFill(...)`, flagged samples instead have zero pointing and
+template rows, without local unknowns. The operator is the sky/template
+block of the extended normal matrix, omitting the Schur correction from
+marginalization. Its RHS uses gap-filled data (by default a local line plus
+white noise, seeded by `GapFill.seed`), including the correlations from the filled samples
+to the valid ones. This is the approximate treatment of Patanchon et al.
+(2008), Sect. 3.6, and can bias the signal; it is not equivalent to `"offset"`.
+
+`GapFill(mode="constrained")` replaces the local white-noise fill by a Gaussian
+draw conditional on valid noise residuals after subtracting `sky_model`.
+It solves Q_ff x = -Q_fu r_u + g_f with Cov(g)=Q; `mode="conditional_mean"`
+omits g. FFTs apply Q without dense time matrices. DetectorGroup fills use
+the joint common-mode model; padding is unobserved and included among the
+missing samples. The fill is fixed during the map solve: this supplies a
+conditional noise realization, not a joint Gibbs or exact GLS map algorithm.
+The inner solve uses PCG with independent own-noise sine-transform blocks
+for long gaps and diagonal scaling for short gaps. Cross-gap and detector
+correlations remain in Q_ff. The preconditioner changes convergence, not the
+model or the true-residual acceptance criterion; it can be disabled with
+`GapFill(preconditioner=None)`.
 
 ## Calibration
 

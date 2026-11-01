@@ -107,6 +107,73 @@ A detector observed in several stretches of time (e.g. one per day, as the
 observations of litebird_sim) is passed as several `DetectorData`. The
 stretches are treated as independent: see [chunks](parameters.md#chunk-length).
 
+## Flagged samples
+
+Pass boolean `DetectorData.flags`: True means excluded; integer bit fields
+must first be converted with the desired bit mask. NaN values in TOD do not
+automatically flag a sample. A flagged value may be NaN because its original
+value is never used, and flagged samples do not count in the hit map.
+
+Given a DetectorData named `detector`, mark a short interval while retaining
+its existing flags:
+
+```python
+from dataclasses import replace
+import numpy as np
+from pysanepic import ACTCuts, GLSParameters, make_maps
+
+flags = np.zeros(detector.tod.size, dtype=bool) if detector.flags is None else detector.flags.copy()
+flags[100:110] = True
+flagged_detector = replace(detector, flags=flags)
+
+params = GLSParameters(flag_method=ACTCuts(ncoeff=3))  # quadratic cut model
+result = make_maps([flagged_detector], nside, params=params)
+```
+
+Choose `flag_method` independently of the length threshold `split_gap_s`:
+
+| Method | Gap treatment | Specific settings |
+|---|---|---|
+| `"marginalize"` (default) | One free value per flagged sample, exact for the retained chunk model | None |
+| `"offset"` | One constant per contiguous run | None |
+| `ACTCuts(ncoeff=None)` (or `"act"`) | Legendre coefficients per run | `ncoeff`: None for the ACT rule, a positive integer, or a callable |
+| `GapFill(mode="local_white")` | Fixed synthetic values, no gap unknowns in the map solve | `mode`, `seed`; the conditional modes also use `tol`, `maxiter` and `preconditioner` |
+
+Runs at least `split_gap_s=300` seconds long are dropped and split the chunk
+before this treatment; use `np.inf` to retain every run, or 0 to split every
+run. This splitting is disabled for DetectorGroup. Conditional filling:
+
+```python
+from pysanepic import GapFill
+
+params = GLSParameters(flag_method=GapFill(
+    mode="constrained",  # "local_white" is the default; "conditional_mean" is deterministic
+    seed=42,
+    tol=1e-12,
+    maxiter=1000,
+    preconditioner="sine",  # default; None disables preconditioning
+))
+# sky_estimate is a prior model or preliminary map, in the output coordinates
+# and at this nside (or provided as alm). For noise-only TOD use a zero model.
+result = make_maps([flagged_detector], nside, params=params, sky_model=sky_estimate)
+```
+
+The conditional fill is exact for the supplied residual/noise model, then
+fixed during the approximate gap-filled map solve: it does not make that
+solve equivalent to exact marginalization or a Gibbs sampler. The seed is
+reproducible for the same input, chunking and MPI assignment, generally not
+after redistributing data. `GLSParameters.tol`/`maxiter` control the map
+solve separately from `GapFill.tol`/`maxiter`; `result.gap_fill_iterations`
+is the largest number of gap CG iterations (over all chunks and ranks), to
+compare with `GapFill.maxiter`. Each class validates its own options: the CG
+settings with `mode="local_white"` raise ValueError, a seed with
+`"conditional_mean"` warns.
+
+`ACTCuts` and `GapFill` are unreleased additions; use the
+development checkout. See [flagged-sample parameters](parameters.md#flagged-samples),
+[seed behavior with MPI](parameters.md#random-seeds-and-mpi), and the
+[saved benchmark notebook](notebooks/flags) (marginalize, offset and splitting).
+
 ## Conventions
 
 The conventions are the same as litebird_sim:

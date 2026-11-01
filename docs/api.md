@@ -28,7 +28,15 @@
 
 .. autofunction:: pysanepic.estimate_noise
 
+.. autofunction:: pysanepic.conditional_gap_fill
+
 .. autoclass:: pysanepic.GLSParameters
+   :no-members:
+
+.. autoclass:: pysanepic.ACTCuts
+   :no-members:
+
+.. autoclass:: pysanepic.GapFill
    :no-members:
 
 .. autoclass:: pysanepic.CalibrationParameters

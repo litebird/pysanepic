@@ -4,6 +4,64 @@
 
 Changes on `main` that are not in a release yet.
 
+- Fix nondeterministic chunk-worker reductions: a dynamic buffer queue
+  changed the grouping of map and template sums with task completion order,
+  causing last-bit differences between identical solves. Deterministic
+  largest-first assignment balances FFT lengths while preserving a fixed
+  sum order per worker, with the same number of private maps. A regression
+  test forces different completion orders for RHS/normal products, including
+  ACT cuts, templates and both accumulation paths. Existing exact-equality
+  tests are retained.
+
+- `GLSParameters.flag_method` also takes an object with the options of its
+  treatment, instead of flat `GLSParameters` fields valid for one method
+  only: `ACTCuts(ncoeff=...)` (`"act"` is `ACTCuts()`) and
+  `GapFill(mode=..., seed=..., tol=..., maxiter=..., preconditioner=...)`.
+  `"marginalize"` and `"offset"` are unchanged. Each class validates its
+  own options at construction (CG settings with `mode="local_white"` raise
+  ValueError, a seed with `"conditional_mean"` warns). Low-level `GLS`
+  calls the gap-filled mode `flag_method="fill"`, and `act_ncoeff` or
+  `flag_sampling_rate_hz` without `"act"` raise ValueError.
+
+- `flag_method=GapFill()`: approximate gap treatment from Patanchon et al.
+  (2008), Sect. 3.6. Flagged data are filled, then their pointing/template
+  rows are zeroed without auxiliary PCG parameters. The default
+  `mode="local_white"` is SANEPIC's fill (a local line plus white noise);
+  `seed` (default 0) makes it reproducible for a fixed input order and MPI
+  partition. The default `flag_method` remains `"marginalize"`; unlike it,
+  `GapFill` can bias the signal. Low-level `GLS(flag_method="fill")` takes
+  caller-supplied finite gap-filled TOD. Dense GLS, threaded, gap-filling
+  and MPI regression tests cover the new operator.
+
+- `GapFill(mode="constrained")` / `"conditional_mean"`: Gaussian noise
+  conditional on valid residuals after subtracting the required
+  `sky_model` (the bias is linear in its error). Includes joint
+  DetectorGroup conditioning and unobserved padding, matching GLS precision
+  and FFT extension. `tol` and `maxiter` control the solve; nonconvergence
+  raises RuntimeError. The solve is a PCG with independent own-noise
+  sine-transform blocks for long gaps, diagonal scaling for short gaps, and
+  an exact own-noise inverse for long, fully missing FFT rows
+  (`preconditioner=None` for ordinary CG); no dense gap matrix or new
+  dependency. `MapResult.gap_fill_iterations` has the largest CG iteration
+  count. Public `conditional_gap_fill` returns filled residuals and solve
+  diagnostics. This freezes a conditional fill, not an exact GLS or Gibbs
+  map algorithm.
+
+- `flag_method=ACTCuts()`: the compressed Legendre cut model of Naess et al.
+  (2025), Sect. 3.3.3, with the published coefficient counts. Fits local
+  coefficients with zero-filled flags and no random realization; evaluates
+  the basis without storing a design matrix. Its own-noise diagonal
+  preconditioner is exact. `ncoeff`: None retains the published rule, a
+  positive integer sets a fixed count per gap, or a callable
+  `(lengths_samples, fs_hz)` chooses positive integer counts. Counts are
+  capped at the gap length; 1 recovers offsets, full counts recover exact
+  marginalization. High orders use discrete orthonormal Gram polynomials
+  instead of ill-conditioned sampled Legendre columns, with the same
+  subspace and counts. Low-level `GLS(flag_method="act")` takes
+  `flag_sampling_rate_hz` (scalar or per chunk) and `act_ncoeff`. Dense GLS,
+  exact-marginalization limits, threading and MPI tests cover the operator.
+  The ACT rule is retained at other sampling rates, not tuned for LiteBIRD.
+
 ## 0.6.2 (2026-10-30)
 
 - `Coordinates(str, Enum)` (`Ecliptic = "E"`, `Galactic = "G"`,

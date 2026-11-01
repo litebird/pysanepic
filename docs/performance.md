@@ -32,8 +32,13 @@ With several chunks per process, the products of the PCG and the
 preconditioner of the templates process **one chunk per thread**: each
 thread computes $N^{-1} P v$ of its chunk with single-threaded FFTs and the
 serial numba kernels, in its own buffers (~40 bytes per sample of the
-longest chunk), and adds $P^T$ to a private map, summed at the end. The
-chunks are long and their FFTs memory bound: on G100 (48 cores) one FFT of a
+longest chunk), and adds $P^T$ to a private map, summed at the end.
+Chunks are assigned deterministically to workers, balancing the total FFT
+length per worker, with a fixed accumulation order inside each worker.
+Repeated calls with the same inputs, thread count and chunk layout give
+bitwise-identical sums regardless of task completion order. Different thread
+counts can still change floating-point grouping and are compared numerically.
+The chunks are long and their FFTs memory bound: on G100 (48 cores) one FFT of a
 day of data (3.2 million samples) on 48 threads is only 2–4 times faster than
 on one, while 48 FFTs on one thread each are 15 (float64) to 25 (float32)
 times faster. With 96 chunks of a day, 48 threads and one process, 10 PCG
@@ -127,7 +132,26 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
   before 0.6).
 - Flagged samples with `flag_method="marginalize"`: ~70 bytes per flagged
   sample, on the process that holds it (its share of the PCG vectors);
-  negligible with `"offset"` or when the run is split (`split_gap_s`).
+  ~70 bytes per run with `"offset"` (the same cost for isolated flags).
+  `"act"` has ~70 bytes per Legendre coefficient and 32 bytes per run with
+  more than one coefficient; the basis is evaluated without stored columns.
+  High orders use discrete orthonormal polynomials in the same cut space,
+  with three temporary float64 vectors per active gap (24 bytes per gap
+  sample per worker), rather than an allocated samples-by-coefficients matrix.
+  Constant cuts use the existing offset kernels without run metadata.
+  `GapFill` has no extra PCG unknowns: without padding it stores 8 bytes
+  per flag (synthetic values) and views of the TOD and flag masks, filling
+  one temporary chunk per worker. With padding the filled, padded TOD is
+  stored as for the other methods. Split gaps have no unknowns.
+  Conditional filling (`GapFill.mode`) adds one temporary solve per chunk or
+  common-mode group: a few gap-sized CG vectors and full-FFT work arrays.
+  The default sine preconditioner adds one gap-sized vector of diagonal
+  scales and inverse spectra for distinct long-gap lengths per detector
+  (at most another gap-sized vector). Its setup and application use no dense
+  gap matrices. Use `GapFill(preconditioner=None)` for cost comparisons.
+  All detectors of a common-mode group are processed together. It is not
+  guaranteed faster than exact marginalization; long gaps can slow this
+  inner solve too. No gap unknowns persist in the map PCG.
 - Pixel indices are int32, enough up to nside 8192. With MPI, the maps
   exchanged are limited by the int32 counts of MPI to nside 4096.
 

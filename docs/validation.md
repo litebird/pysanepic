@@ -19,6 +19,94 @@ The tests run on GitHub Actions for every pull request. The comparison with
 litebird_sim's binner and destriper is in the
 [example notebook](notebooks/lbs_example).
 
+## Conditional-fill solvers and high-order ACT cuts
+
+`test_gapfill.py` checks conditional means and sampled covariances against
+independent dense Gaussian formulae. Long-gap tests compare preconditioned
+and ordinary CG with the same random RHS, including common modes, odd and
+extended FFT grids, zero DC, and unchanged observed samples. The sine
+preconditioner is checked for symmetry and positive definiteness.
+
+`test_act_flags.py` compares the high-order cut operator and its own-noise
+diagonal against a dense reference built from the symmetric Hahn difference
+operator. Orthogonality and the transpose are checked up to 127 coefficients
+on 128 samples, with separate tests for the zero-DC constant. The dense GLS
+comparisons include chunk workers, templates and detector common modes.
+
+For larger timing and stability checks, run on the cluster:
+
+```bash
+python tools/benchmark_flag_solvers.py --ns 262144 --nthreads 4 --output benchmark.json
+```
+
+It compares ordinary CG and the sine preconditioner on dispersed flags,
+long gaps, steep 1/f noise and detector common modes, using identical seeded
+conditional draws. It also checks matrix-free $C^T C$ at near-full ACT order
+on 512 and 2048 samples. JSON output records spectral parameters, flag
+counts, draw seeds, tolerance, iterations, true residuals and timings.
+These are solver checks, not a
+validation of LiteBIRD map bias or low-multipole BB residuals.
+
+G100, 2026-10-31: 262144 samples per detector, 19 Hz, four threads,
+`fmin_hz=1e-5`, squared relative residual threshold `1e-16`, NumPy 2.5.4
+and ducc0 0.42.0. The valid residuals are synthetic unit Gaussian data;
+both solvers condition on the same input and use the same seeded draw.
+Long-gap cases add a run of 16384 missing samples to 3% dispersed flags:
+
+| case | alpha | fknee [Hz] | CG iterations | PCG iterations | CG / PCG time [s] |
+|---|---|---|---|---|---|
+| dispersed flags | 1 | 0.025 | 5 | 5 | 0.136 / 0.079 |
+| long gap | 2 | 0.1 | 289 | 7 | 2.798 / 0.134 |
+| steep noise, long gap | 2 | 1 | not converged at 2000 | 11 | 18.435 / 0.158 |
+| two detectors, common mode | 2 | 0.1 | 634 | 12 | 12.715 / 0.385 |
+
+Times are single-run wall times including setup; first-use FFT planning can
+affect the first case. Where both solvers converge, the relative differences
+of the filled values are 1.9e-16, 1.5e-8 and 6.2e-8 respectively; both meet
+the same true-residual criterion. High-order ACT checks give relative errors
+in $C^T C a-a$ of 4.0e-15 (511 coefficients on 512 samples) and 5.4e-15
+(2047 on 2048), without a stored basis matrix.
+
+## Repeatability of chunk-worker reductions
+
+With four default threads, `test_pixel_input_and_generator` and
+`test_covariance_fixed_gains` previously failed on bitwise-equality
+assertions, also on the base commit `d4f86c4`. The dynamic slot queue changed
+which chunks were summed into each worker's map and template buffers as
+tasks finished, changing floating-point grouping between identical calls.
+A reduced RHS example changed by about 3e-16 relative between executions.
+
+Chunks are now assigned deterministically, balancing FFT lengths with a
+largest-first greedy partition and summing chunks in index order inside each
+worker. This preserves the number of private maps. The regression test
+`test_chunk_workers_repeat_with_different_completion_order` forces different
+completion orders and checks exact equality of RHS and normal products,
+including ACT cuts and local/shared templates, with two/four workers and
+both accumulation paths.
+
+G100, 2026-10-31: **189 tests pass with four default threads**, including
+both original tests without relaxing their assertions and ACT calibration
+with 32 coefficients. The flag, conditional-fill and TOD-template MPI tests
+pass on two processes (three tests per process).
+
+A timing check used 16 intensity-only chunks, 512 pixels, four threads,
+1/f weights and warmed kernels. Uniform chunks have 262144 samples each;
+mixed chunks have 524288 samples at indices 0, 4, 8, 12 and 65536 otherwise.
+Median wall seconds per RHS + normal product, from three groups of three
+pairs:
+
+| chunk lengths | dynamic queue | deterministic partition |
+|---|---|---|
+| uniform | 0.0770 (0.0768–0.0775) | 0.0829 (0.0757–0.0977) |
+| mixed | 0.0604 (0.0604–0.0604) | 0.0546 (0.0546–0.0608) |
+
+The parentheses give the range of the three batch means; these are limited
+timing checks, not a guarantee for arbitrary workload mixtures. Repeated RHS
+differences were 2.6e-15/9.3e-16 relative before the fix and exactly zero
+afterwards for these two cases. Bitwise equality across *different* thread
+counts or MPI partitions is not required; those results are checked within
+numerical tolerances.
+
 ## Covariance of the template amplitudes
 
 `MapResult.template_covariance` is the exact inverse of the GLS operator for
