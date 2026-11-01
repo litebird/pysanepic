@@ -4,6 +4,8 @@
 
 Changes on `main` that are not in a release yet.
 
+## 0.6.3 (2026-11-01)
+
 - Fix nondeterministic chunk-worker reductions: a dynamic buffer queue
   changed the grouping of map and template sums with task completion order,
   causing last-bit differences between identical solves. Deterministic
@@ -11,7 +13,7 @@ Changes on `main` that are not in a release yet.
   sum order per worker, with the same number of private maps. A regression
   test forces different completion orders for RHS/normal products, including
   ACT cuts, templates and both accumulation paths. Existing exact-equality
-  tests are retained.
+  tests are retained. (#69)
 
 - `GLSParameters.flag_method` also takes an object with the options of its
   treatment, instead of flat `GLSParameters` fields valid for one method
@@ -21,7 +23,7 @@ Changes on `main` that are not in a release yet.
   own options at construction (CG settings with `mode="local_white"` raise
   ValueError, a seed with `"conditional_mean"` warns). Low-level `GLS`
   calls the gap-filled mode `flag_method="fill"`, and `act_ncoeff` or
-  `flag_sampling_rate_hz` without `"act"` raise ValueError.
+  `flag_sampling_rate_hz` without `"act"` raise ValueError. (#69)
 
 - `flag_method=GapFill()`: approximate gap treatment from Patanchon et al.
   (2008), Sect. 3.6. Flagged data are filled, then their pointing/template
@@ -31,7 +33,7 @@ Changes on `main` that are not in a release yet.
   partition. The default `flag_method` remains `"marginalize"`; unlike it,
   `GapFill` can bias the signal. Low-level `GLS(flag_method="fill")` takes
   caller-supplied finite gap-filled TOD. Dense GLS, threaded, gap-filling
-  and MPI regression tests cover the new operator.
+  and MPI regression tests cover the new operator. (#69)
 
 - `GapFill(mode="constrained")` / `"conditional_mean"`: Gaussian noise
   conditional on valid residuals after subtracting the required
@@ -45,7 +47,7 @@ Changes on `main` that are not in a release yet.
   dependency. `MapResult.gap_fill_iterations` has the largest CG iteration
   count. Public `conditional_gap_fill` returns filled residuals and solve
   diagnostics. This freezes a conditional fill, not an exact GLS or Gibbs
-  map algorithm.
+  map algorithm. (#69)
 
 - `flag_method=ACTCuts()`: the compressed Legendre cut model of Naess et al.
   (2025), Sect. 3.3.3, with the published coefficient counts. Fits local
@@ -61,6 +63,20 @@ Changes on `main` that are not in a release yet.
   `flag_sampling_rate_hz` (scalar or per chunk) and `act_ncoeff`. Dense GLS,
   exact-marginalization limits, threading and MPI tests cover the operator.
   The ACT rule is retained at other sampling rates, not tuned for LiteBIRD.
+  (#69)
+
+- `estimate_noise` with flags: the periodogram is normalized by the energy
+  of the window on the unflagged samples, not by their fraction (as already
+  for DetectorGroup). Noise estimated from flagged data changes. (#68)
+
+- Two-level preconditioner: E^-1 is a pseudo-inverse scaled by the summed
+  diagonal of A, so that coarse modes with no weight (the I monopole with
+  `fmin_hz=0` and no padding) are left to the PCG instead of giving
+  LinAlgError or a huge, wrong E^-1. (#68)
+
+- PCG: b = 0 returns x = 0, and no iteration is forced when the starting
+  residual is already below `tol`. `shared_covariance` (and so
+  `template_covariance`) warns when some of its solves do not converge. (#68)
 
 ## 0.6.2 (2026-10-30)
 
