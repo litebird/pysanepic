@@ -553,6 +553,53 @@ class GLSParameters:
     sample_batch: int = 1
 
 
+@dataclass(frozen=True, kw_only=True)
+class Prior:
+    """An independent Gaussian prior on fitted amplitudes, each one ~ N(mean,
+    sigma^2): Template(prior=...) for the amplitudes of a template,
+    CalibrationParameters(prior=...) for the gains. make_maps then gives the
+    maximum of the posterior, and MapResult.template_covariance its
+    covariance. With calibration the prior is on the values after each
+    iteration (g, a), not on their linearized corrections. With
+    Template.sum_zero the prior acts within the constraint: give means
+    summing to zero.
+
+    Attributes
+    ----------
+    sigma : the standard deviation, one for all the amplitudes, or {detector
+        name: value} (DetectorData.name, every detector with amplitudes);
+        inf: no prior. Amplitudes per period (Template.period_s, the gains)
+        have each the value of their detector.
+    mean : None (default): the nominal value, 0 for the amplitudes of a
+        template and 1 for the gains; or one value, or {detector name: value}.
+    """
+
+    sigma: float | dict
+    mean: float | dict | None = None
+
+    def __post_init__(self):
+        for field, x in (("sigma", self.sigma), ("mean", self.mean)):
+            values = np.array(list(x.values()) if isinstance(x, dict) else [] if x is None else [x], dtype=float)
+            if field == "sigma" and not np.all(values > 0):
+                raise ValueError("Prior.sigma must be > 0 (inf: no prior)")
+            if field == "mean" and not np.all(np.isfinite(values)):
+                raise ValueError("Prior.mean must be finite")
+
+    def _terms(self, det, nominal, name):
+        """(precision, mean) of the amplitudes of detector `det` (None: a
+        common amplitude, or a DetectorData without a name)."""
+
+        def value(x, field):
+            if not isinstance(x, dict):
+                return float(x)
+            if det not in x:
+                raise ValueError(f"{name}.{field}: no value for detector {det!r} (one value per detector needs "
+                                 "DetectorData.name, and a common amplitude one value)")
+            return float(x[det])
+
+        return 1.0 / value(self.sigma, "sigma") ** 2, nominal if self.mean is None else value(self.mean, "mean")
+
+
 @dataclass(kw_only=True)
 class CalibrationParameters:
     """Gain calibration on the dipole, fitted together with the maps.
@@ -633,6 +680,7 @@ class CalibrationParameters:
         In a test with a gain mask and bandpass, angle and FWHM sky templates,
         the errors were 0.05-0.13% smaller, with 35% fewer iterations.
         False (default): marginalized.
+    prior : :class:`Prior` on the gains g (mean None: 1), or None (default).
     """
 
     gain_period_s: float = 3600.0
@@ -641,10 +689,13 @@ class CalibrationParameters:
     mask: np.ndarray | None = None
     cache_model: bool = False
     covariance_fixed_gains: bool = False
+    prior: Prior | None = None
 
     def __post_init__(self):
         if self.gain_tol is not None and not self.gain_tol > 0:
             raise ValueError("CalibrationParameters.gain_tol must be None or > 0")
+        if self.prior is not None and not isinstance(self.prior, Prior):
+            raise TypeError("CalibrationParameters.prior must be a pysanepic.Prior")
         if isinstance(self.mask, dict):
             raise TypeError("CalibrationParameters.mask is the mask of the gains (one map); "
                             "the templates have their own, Template.mask")
@@ -690,7 +741,8 @@ class Template:
         amplitude 1 (times the gain with calibration) and is not put back in
         the maps, e.g. the beam asymmetries from the beams' alm
         (:func:`~pysanepic.blm_templates`). Not in MapResult.templates; no
-        period_s, common, sum_zero or mask.
+        period_s, common, sum_zero, mask or prior.
+    prior : :class:`Prior` on the amplitudes (mean None: 0), or None (default).
     """
 
     sky: np.ndarray | None = None
@@ -699,10 +751,14 @@ class Template:
     sum_zero: bool = False
     mask: np.ndarray | None = None
     fixed: bool = False
+    prior: Prior | None = None
 
     def __post_init__(self):
-        if self.fixed and (self.period_s is not None or self.common or self.sum_zero or self.mask is not None):
-            raise ValueError("Template: a fixed template has no amplitudes: no period_s, common, sum_zero or mask")
+        if self.fixed and (self.period_s is not None or self.common or self.sum_zero or self.mask is not None
+                           or self.prior is not None):
+            raise ValueError("Template: a fixed template has no amplitudes: no period_s, common, sum_zero, mask or prior")
+        if self.prior is not None and not isinstance(self.prior, Prior):
+            raise TypeError("Template.prior must be a pysanepic.Prior")
         if self.period_s is not None and not self.period_s > 0:
             raise ValueError("Template.period_s must be None or > 0")
         if self.period_s is not None and (self.common or self.sum_zero):
@@ -966,6 +1022,19 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         names = {k: sorted(set().union(*comm.allgather(v))) for k, v in names.items()}
     labels = [(k, n) for k, t in fitted.items() if t.period_s is None for n in names.get(k, [None])]
     index = {x: i for i, x in enumerate(labels)}
+    # the priors: (precision, mean) of the shared amplitudes; those of the local ones checked here
+    prior = None
+    if any(fitted[k].prior is not None for k, _ in labels):
+        prior = np.array([(0.0, 0.0) if fitted[k].prior is None else fitted[k].prior._terms(n, 0.0, f"templates[{k!r}].prior")
+                          for k, n in labels]).T
+    for k, t in fitted.items():
+        if t.period_s is not None and t.prior is not None:
+            for d in dets:
+                if k in skies or k in (d.templates or {}):
+                    t.prior._terms(d.name, 0.0, f"templates[{k!r}].prior")
+    if calibration is not None and calibration.prior is not None:
+        for d in dets:
+            calibration.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
     mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
     # a template without a mask has that of the gains; equal masks are one array (and one test per sample)
     masks = {k: mask_gain if t.mask is None else _mask(t.mask, nside, f"templates[{k!r}].mask")
@@ -980,7 +1049,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         warnings.warn("templates with a mask different from that of the gains: their samples are calibrated with "
                       "the gains of the previous iteration and the calibration converges slower (see "
                       "CalibrationParameters.mask)", stacklevel=2)
-    fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, index=index, amp=np.zeros(len(index)),
+    fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, index=index, amp=np.zeros(len(index)), prior=prior,
                groups=[[index[k, n] for n in names[k]] for k in per_det if tmpls[k].sum_zero],
                local={k: None for k, t in tmpls.items() if t.period_s is not None},
                mask_gain=mask_gain, masks=masks,
@@ -1030,6 +1099,7 @@ class _Fit:
     skies: dict  # name -> map or alm of the templates given as a sky signal
     index: dict  # (template name, detector name or None) -> shared amplitude
     amp: np.ndarray  # current shared amplitudes
+    prior: np.ndarray | None  # (precision, mean) of the shared amplitudes (2, n), or None
     groups: list  # shared amplitudes summing to zero
     local: dict  # name -> current amplitudes per period, one array per DetectorData (None at the start)
     mask_gain: np.ndarray | None
@@ -1040,7 +1110,7 @@ class _Fit:
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
     cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, sky template TODs)
-    no_gains: tuple | None = None  # the templates of the GLS but the gains (covariance_fixed_gains)
+    no_gains: tuple | None = None  # the templates and priors of the GLS but the gain templates (covariance_fixed_gains)
     fit: bool = True  # False: final maps with gains and amplitudes fixed
 
     @property
@@ -1219,6 +1289,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     gains, offsets = [], []  # gains of each DetectorData and their first label
     local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
     cal = None if fit is None else fit.calibration
+    # (precision, mean) of the local amplitudes, in the order of their labels, with a prior on some of them
+    priors = None
+    if fit is not None and fit.fit and ((cal is not None and cal.prior is not None)
+                                        or any(fit.templates[k].prior is not None for k in fit.local)):
+        priors = []
     nchunk = ndata = nlab = 0  # chunks, DetectorData and local amplitudes so far
     gain_ids = set()  # ids of the gain templates in `templates`
     t0 = time.perf_counter()  # the time of each step, with verbose
@@ -1278,6 +1353,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 gains.append(gain)
                 gain_period = p
                 labels = offsets[-1] + p
+                if priors is not None:
+                    prec, g0 = (0.0, 1.0) if cal.prior is None else cal.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
+                    # g (1 + dg) ~ N(g0, 1 / prec): dg ~ N((g0 - g) / g, 1 / (prec g^2))
+                    priors.append((prec * gain**2, (g0 - gain) / gain))
             for k, amps in local.items():
                 if k not in ttod:
                     amps.append((np.zeros(0), nlab))
@@ -1286,6 +1365,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 amp = np.zeros(p[-1] + 1) if fit.local[k] is None else fit.local[k][ndata - 1]
                 known += amp[p] * ttod[k]
                 amps.append((amp, nlab))
+                if priors is not None:
+                    tp = fit.templates[k].prior
+                    prec, a0 = (0.0, 0.0) if tp is None else tp._terms(d.name, 0.0, f"templates[{k!r}].prior")
+                    priors.append((np.full(amp.size, prec), a0 - amp))  # on a + da
                 tlab[k] = nlab + p
                 nlab += amp.size
             if cal is not None and fit.fit:
@@ -1428,13 +1511,17 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             common_modes.append((list(chunks), U, lam))
 
     t1 = time.perf_counter()
+    prior = None if not priors else tuple(np.concatenate(x) for x in zip(*priors))
+    shared_prior = None if fit is None or not fit.fit or fit.prior is None else (fit.prior[0], fit.prior[1] - fit.amp)
     if fit is not None and fit.fit and cal is not None and cal.covariance_fixed_gains:
-        fit.no_gains = ([t for t in templates if id(t) not in gain_ids], shared)  # the same arrays: no copies
+        # the same arrays: no copies
+        fit.no_gains = ([t for t in templates if id(t) not in gain_ids], shared, prior, shared_prior)
     if reuse:
         gls = fit.gls
-        gls.set_templates(templates, shared)
+        gls.set_templates(templates, shared, prior, shared_prior)
     else:
-        gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit, fs_c)
+        gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior,
+                       params, nside, comm, nthreads, fit, fs_c)
         if fit is not None and fit.fit:
             fit.gls = gls
     del pix_c, a2_c, gamma_c
@@ -1494,7 +1581,8 @@ def _padded(x, a, b, m, dtype):
     return out
 
 
-def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, params, nside, comm, nthreads, fit, fs_c):
+def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior, params, nside, comm,
+             nthreads, fit, fs_c):
     method = _flag_treatment(params.flag_method)
     nc = params.coarse_nside
     return GLS(
@@ -1514,6 +1602,8 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         coarse=None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
         templates=templates,
         shared_templates=shared,
+        prior=prior,
+        shared_prior=shared_prior,
         shared_groups=fit.groups if fit is not None and fit.fit else None,
         template_dtype=params.template_dtype,
         flag_method="act" if isinstance(method, ACTCuts) else "fill" if isinstance(method, GapFill) else "marginalize",

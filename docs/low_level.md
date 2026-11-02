@@ -53,7 +53,9 @@ amplitudes local to each process, returned in `info["amplitudes"]`;
 templates with one amplitude each in a chunk can be given as the columns of
 one array, `(chunk, values (n, ncol), labels (ncol,))`, applied in one pass
 over the chunk instead of one per template; see
-{class}`~pysanepic.GLS`). `apply_A` and `rhs` are not available with templates.
+{class}`~pysanepic.GLS`). `prior` and `shared_prior`, `(precision, mean)`
+arrays by label, add Gaussian priors on the amplitudes (the posterior; see
+{class}`~pysanepic.Prior` for `make_maps`). `apply_A` and `rhs` are not available with templates.
 `shared_covariance()` gives the covariance of the shared amplitudes (one PCG
 solve each), `set_templates` replaces the templates keeping the rest of the setup, and
 `binned(tod)` gives the binned (white-noise) map of timelines laid out like
