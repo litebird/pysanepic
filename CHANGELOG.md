@@ -13,7 +13,9 @@ Changes on `main` that are not in a release yet.
   iterations the prior acts on `g` and `a`, not on their linearized
   corrections. Low level: `GLS(prior=, shared_prior=)` and
   `GLS.set_templates` take `(precision, mean)` arrays, added to the
-  operator, the right-hand side and the preconditioner.
+  operator, the right-hand side and the preconditioner. `solve()` works on
+  the deviations from the means, so that with tight priors `precision * mean`
+  does not dominate the PCG stopping criterion before the maps converge.
 
 ## 0.6.3 (2026-11-01)
 

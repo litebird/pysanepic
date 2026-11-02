@@ -893,9 +893,12 @@ class GLS:
         rank): a ~ N(mean, 1 / precision), two arrays with one value per label
         (precision 0: no prior). They add diag(precision) to the operator and
         precision * mean to P^T N^-1 d, so solve() gives the maximum of the
-        posterior and shared_covariance() its covariance. Labels beyond those
-        of the templates are amplitudes without data (equal to the mean).
-        With `shared_groups`, the prior acts within the constraints.
+        posterior and shared_covariance() its covariance. solve() works on
+        the deviations from the means (the TOD minus the templates at their
+        means): with tight priors, precision * mean would otherwise dominate
+        norm(b) and stop the PCG before the maps converge. Labels beyond
+        those of the templates are amplitudes without data (equal to the
+        mean). With `shared_groups`, the prior acts within the constraints.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
@@ -1136,12 +1139,11 @@ class GLS:
 
     @staticmethod
     def _prior_terms(prior, n):
-        """(precision, precision * mean) of n amplitudes (2, n): the terms of the
-        operator and of the right-hand side, zero without a prior."""
+        """(precision, mean) of n amplitudes (2, n), zero without a prior."""
         prec, mean = prior
         out = np.zeros((2, n))
         out[0, : prec.size] = prec
-        out[1, : prec.size] = prec * mean
+        out[1, : prec.size] = mean
         return out
 
     def _parse_templates(self, templates):
@@ -1461,8 +1463,9 @@ class GLS:
         ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, out=out, nthreads=nthreads)
         return out[:n]
 
-    def _apply(self, v=None, tod=None, exact=False):
-        """P^T N^-1 P v or P^T N^-1 tod, one chunk at a time. v and the result
+    def _apply(self, v=None, tod=None, exact=False, prior=True):
+        """P^T N^-1 P v (+ the precisions of the priors times v, unless not
+        `prior`) or P^T N^-1 tod (without the priors), one chunk at a time. v and the result
         are flat PCG vectors: this rank's pixels (ncomp, nloc) raveled, then the
         unknowns of its flagged samples. FFTs in float32 only for P^T N^-1 P v
         with fft_dtype=np.float32 and not `exact`."""
@@ -1497,10 +1500,9 @@ class GLS:
             for chunks, U, M in self._groups:
                 self._apply_group(chunks, U, M, v, tod, loc, buf)
         sh = self._shbuf if self.comm is None or not self.nshared else self.comm.allreduce(self._shbuf)
-        # the priors: precision * v, or precision * mean on the right-hand side
-        a0 = self.nflag
-        self._locbuf[a0:] += self._prior[1] if v is None else self._prior[0] * loc[a0 : a0 + self.namp]
-        sh = sh + (self._shprior[1] if v is None else self._shprior[0] * self._shv)
+        if v is not None and prior:  # precision * v
+            self._locbuf[self.nflag :] += self._prior[0] * loc[self.nflag : self.nflag + self.namp]
+            sh = sh + self._shprior[0] * self._shv
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf,
                                self._project_shared(sh)[: self._nsh_loc]])
 
@@ -1666,10 +1668,22 @@ class GLS:
         and "shared_amplitudes" (on every rank).
         """
         b = self._apply(tod=_chunks(tod))
+        # the deviations from the means of the priors, x = xp + x': A x' = b + precision * mean - A xp
+        a0 = self._nsky + self.nflag
+        xp = np.zeros_like(b)
+        xp[a0 : a0 + self.namp] = self._prior[1]
+        if self._nsh_loc:
+            xp[a0 + self.namp :] = self._project_shared(self._shprior[1].copy())
+        shifted = int(np.any(xp))
+        if (shifted if self.comm is None else self.comm.allreduce(shifted)) > 0:
+            b -= self._apply(xp, exact=True, prior=False)  # the TOD minus the templates at the means
+            if self._nsh_loc:  # the part of the means out of the constraints
+                b[a0 + self.namp :] += self._project_shared(self._shprior[0] * (self._shprior[1] - xp[a0 + self.namp :]))
         x = np.zeros_like(b)
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
         x, it, history = self._pcg(b, x, x0 is not None, tol, maxiter, recompute_every, verbose)
+        x += xp
         a0 = self._nsky + self.nflag
         shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),

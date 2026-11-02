@@ -400,7 +400,7 @@ def test_prior_exact_gls():
     shared += [(k, rng.normal(size=ns), np.full(ns, 2)) for k in range(nchunk)]  # a common one
     local = [(2, rng.normal(size=ns), np.zeros(ns, int))]
     prior = (np.array([4.0, 2.0]), np.array([0.3, -0.7]))  # label 1: no data, equal to its mean
-    shared_prior = (np.array([1.5, 0.5, 3.0]), np.array([0.2, -0.2, 0.1]))
+    shared_prior = (np.array([1.5, 0.5, 3.0]), np.array([0.5, -0.2, 0.1]))  # means not summing to zero
     g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, templates=local, template_dtype=np.float64,
             shared_templates=shared, shared_groups=[[0, 1]], prior=prior, shared_prior=shared_prior)
     assert g.namp == 2 and g.nshared == 3
@@ -435,6 +435,29 @@ def test_prior_exact_gls():
     for bad in ((np.array([-1.0]), np.zeros(1)), (np.ones(2), np.zeros(1)), (np.ones(1), np.array([np.nan]))):
         with pytest.raises(ValueError, match="prior"):
             g.set_templates(local, shared, prior=bad)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_prior_tight_mean_converges(shared):
+    """A tight prior with a mean far from 0: precision * mean must not
+    dominate norm(b) and stop the PCG before the maps converge (it did after
+    one iteration, with map errors ~0.2): solve() works on the deviations
+    from the means."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(3)
+    npix, ns, fs, nchunk = 8, 256, 10.0, 4
+    pix = rng.integers(0, npix, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, fs, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    m = rng.normal(size=npix) + 3
+    T = rng.normal(size=(nchunk, ns))
+    tmpl = [(k, T[k], np.zeros(ns, int)) for k in range(nchunk)]
+    prior = (np.array([1e12]), np.array([1.0]))
+    kw = dict(shared_templates=tmpl, shared_prior=prior) if shared else dict(templates=tmpl, prior=prior)
+    x, info = GLS(pix, None, w, template_dtype=np.float64, **kw).solve(m[pix] + T)
+    err = x[0] - m
+    assert info["converged"] and np.abs(err - err.mean()).max() < 1e-10  # the monopole is free with 1/f weights
+    assert info["shared_amplitudes" if shared else "amplitudes"] == pytest.approx([1.0], abs=1e-12)
 
 
 def _calibration_data(nside, n, fs, per):
