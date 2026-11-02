@@ -453,7 +453,7 @@ def test_prior_tight_mean_converges(shared):
     T = rng.normal(size=(nchunk, ns))
     tmpl = [(k, T[k], np.zeros(ns, int)) for k in range(nchunk)]
     prior = (np.array([1e12]), np.array([1.0]))
-    kw = dict(shared_templates=tmpl, shared_prior=prior) if shared else dict(templates=tmpl, prior=prior)
+    kw = {"shared_templates": tmpl, "shared_prior": prior} if shared else {"templates": tmpl, "prior": prior}
     x, info = GLS(pix, None, w, template_dtype=np.float64, **kw).solve(m[pix] + T)
     err = x[0] - m
     assert info["converged"] and np.abs(err - err.mean()).max() < 1e-10  # the monopole is free with 1/f weights
