@@ -45,6 +45,9 @@
 .. autoclass:: pysanepic.Template
    :no-members:
 
+.. autoclass:: pysanepic.Prior
+   :no-members:
+
 .. autofunction:: pysanepic.pol_angle_template
 
 .. autofunction:: pysanepic.fwhm_template

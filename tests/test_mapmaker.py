@@ -15,7 +15,7 @@ import healpy as hp
 import numpy as np
 import pytest
 
-from pysanepic import ACTCuts, Coordinates, DetectorData, GapFill, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
+from pysanepic import ACTCuts, Coordinates, DetectorData, GapFill, GLSParameters, OneOverFNoise, Pointing, Prior, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
 
 
 def _scan(n, rng):
@@ -380,6 +380,84 @@ def test_shared_templates_exact_gls():
     # covariance of the shared amplitudes: the shared block of Z (Z^T A Z)^-1 Z^T
     cov = (Z @ np.linalg.solve(Z.T @ A @ Z, Z.T))[n + 1 :, n + 1 :]
     assert np.allclose(g.shared_covariance(tol=1e-26), cov, rtol=1e-8, atol=1e-10 * np.abs(cov).max())
+
+
+def test_prior_exact_gls():
+    """Gaussian priors on local and shared amplitudes (sum-zero constraint, a
+    local label without data): solution and shared covariance equal the
+    dense posterior, A + diag(precision) and b + precision * mean."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(31)
+    npix, ns, fs, nchunk = 6, 96, 10.0, 4
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, fs, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    Ps, _ = _dense_gls(pix, psi, np.eye(ns), npix)
+    det = [0, 1, 0, 1]
+    shared = [(k, rng.normal(size=ns), np.full(ns, det[k])) for k in range(nchunk)]
+    shared += [(k, rng.normal(size=ns), np.full(ns, 2)) for k in range(nchunk)]  # a common one
+    local = [(2, rng.normal(size=ns), np.zeros(ns, int))]
+    prior = (np.array([4.0, 2.0]), np.array([0.3, -0.7]))  # label 1: no data, equal to its mean
+    shared_prior = (np.array([1.5, 0.5, 3.0]), np.array([0.5, -0.2, 0.1]))  # means not summing to zero
+    g = GLS(pix, psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, templates=local, template_dtype=np.float64,
+            shared_templates=shared, shared_groups=[[0, 1]], prior=prior, shared_prior=shared_prior)
+    assert g.namp == 2 and g.nshared == 3
+    x, info = g.solve(tod, tol=1e-26, maxiter=1000)
+    assert info["converged"]
+
+    n = 3 * npix
+    cols = [np.hstack([P, np.zeros((ns, 5))]) for P in Ps]
+    cols[2][:, n] += local[0][1]
+    for k, values, labels in shared:
+        cols[k][np.arange(ns), n + 2 + labels] += values
+    lag = (np.arange(ns)[:, None] - np.arange(ns)[None, :]) % ns
+    Ninv = np.linalg.inv(np.linalg.inv(np.fft.irfft(w[0], n=ns)[lag]))
+    prec, mean = np.concatenate([prior[0], shared_prior[0]]), np.concatenate([prior[1], shared_prior[1]])
+    A = sum(P.T @ Ninv @ P for P in cols)
+    A[n:, n:] += np.diag(prec)
+    b = sum(P.T @ Ninv @ d for P, d in zip(cols, tod))
+    b[n:] += prec * mean
+    C = np.zeros((1, n + 5))
+    C[0, n + 2 : n + 4] = 1
+    Z = np.linalg.svd(C)[2][1:].T
+    ref = Z @ np.linalg.solve(Z.T @ A @ Z, Z.T @ b)
+    assert np.abs(x - ref[:n].reshape(3, npix)).max() < 1e-9 * np.abs(ref).max()
+    assert np.allclose(info["amplitudes"], ref[n : n + 2], rtol=1e-8)
+    assert info["amplitudes"][1] == pytest.approx(-0.7)
+    assert np.allclose(info["shared_amplitudes"], ref[n + 2 :], rtol=1e-8, atol=1e-12)
+    cov = (Z @ np.linalg.solve(Z.T @ A @ Z, Z.T))[n + 2 :, n + 2 :]
+    assert np.allclose(g.shared_covariance(tol=1e-26), cov, rtol=1e-8, atol=1e-10 * np.abs(cov).max())
+    # replaced with the templates; no prior: precision 0
+    g.set_templates(local, shared)
+    assert g.namp == 1 and g.nshared == 3
+    for bad in ((np.array([-1.0]), np.zeros(1)), (np.ones(2), np.zeros(1)), (np.ones(1), np.array([np.nan]))):
+        with pytest.raises(ValueError, match="prior"):
+            g.set_templates(local, shared, prior=bad)
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_prior_tight_mean_converges(shared):
+    """A tight prior with a mean far from 0: precision * mean must not
+    dominate norm(b) and stop the PCG before the maps converge (it did after
+    one iteration, with map errors ~0.2): solve() works on the deviations
+    from the means."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(3)
+    npix, ns, fs, nchunk = 8, 256, 10.0, 4
+    pix = rng.integers(0, npix, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, fs, 1.0, 0.5, 1.0, 0.05), (nchunk, 1))
+    m = rng.normal(size=npix) + 3
+    T = rng.normal(size=(nchunk, ns))
+    tmpl = [(k, T[k], np.zeros(ns, int)) for k in range(nchunk)]
+    prior = (np.array([1e12]), np.array([1.0]))
+    kw = {"shared_templates": tmpl, "shared_prior": prior} if shared else {"templates": tmpl, "prior": prior}
+    x, info = GLS(pix, None, w, template_dtype=np.float64, **kw).solve(m[pix] + T)
+    err = x[0] - m
+    assert info["converged"] and np.abs(err - err.mean()).max() < 1e-10  # the monopole is free with 1/f weights
+    assert info["shared_amplitudes" if shared else "amplitudes"] == pytest.approx([1.0], abs=1e-12)
 
 
 def _calibration_data(nside, n, fs, per):
@@ -759,6 +837,76 @@ def test_tod_templates():
         Template(period_s=10.0, common=True)
     with pytest.raises(ValueError, match="one value per sample"):
         dataclasses.replace(flat[0], templates={"hk": np.zeros(10)})
+
+
+def test_priors():
+    """Prior on template amplitudes and gains, noiseless data. sigma = inf is
+    no prior; a tight prior pins the amplitudes to its mean; a prior whose
+    mean is the truth leaves the solution there, also through the calibration
+    iterations (the prior is on g and a, not on their corrections); the
+    covariance is the posterior one, inv(C_prior) = inv(C) + 1 / sigma^2."""
+    from pysanepic import CalibrationParameters
+
+    nside, n, fs = 16, 120_000, 10.0
+    data, true, _ = _calibration_data(nside, n, fs, n)  # one gain per detector
+    rng = np.random.default_rng(43)
+    t = np.arange(n)
+    a_th = {"d0": 2e-3, "d1": -1e-3, "d2": 5e-4, "d3": 1e-3}
+    a_hk, per_drift = 3e-4, 30_000
+    a_drift = [rng.normal(0, 1e-4, n // per_drift) for _ in data]
+    cal_data, flat = [], []
+    for i, (d, g) in enumerate(zip(data, true)):
+        tt = {"thermal": np.convolve(rng.normal(size=n), np.ones(50) / 50, mode="same"), "hk": rng.normal(size=n),
+              "drift": (t % per_drift) / per_drift - 0.5}
+        extra = a_th[f"d{i}"] * tt["thermal"] + a_hk * tt["hk"] + a_drift[i][t // per_drift] * tt["drift"]
+        dd = dataclasses.replace(d, tod=d.tod + g[0] * extra, name=f"d{i}", templates=tt)
+        cal_data.append(dd)
+        flat.append(dataclasses.replace(dd, tod=dd.tod / g[0] - d.dipole, dipole=None))
+    params = GLSParameters(chunk_s=1200.0, tol=1e-24, covariance_tol=1e-20, min_pol_rcond=0.0, angle_dtype=np.float64)
+
+    def tmpl(th=None, hk=None, drift=None):
+        return {"thermal": Template(prior=th), "hk": Template(common=True, prior=hk),
+                "drift": Template(period_s=per_drift / fs, prior=drift)}
+
+    def run(dd, templates, cal=None, cov=False):
+        return make_maps(dd, nside, coordinates="E", params=params, templates=templates, calibration=cal,
+                         template_covariance=cov)
+
+    ref = run(flat, tmpl(), cov=True)
+    free = run(flat, tmpl(Prior(sigma=np.inf), Prior(sigma=np.inf), Prior(sigma=np.inf)), cov=True)
+    assert max(abs(free.templates["thermal"][k] - v) for k, v in ref.templates["thermal"].items()) < 1e-14
+    assert np.allclose(free.template_covariance["matrix"], ref.template_covariance["matrix"], rtol=1e-8)
+    # posterior covariance; sigma per detector (d3: no prior)
+    sig = {"d0": 1e-4, "d1": 2e-4, "d2": 5e-5, "d3": np.inf}
+    r = run(flat, tmpl(Prior(sigma=sig, mean=a_th), Prior(sigma=1e-4, mean=a_hk)), cov=True)
+    assert max(abs(r.templates["thermal"][k] - v) for k, v in a_th.items()) < 1e-11
+    assert abs(r.templates["hk"] - a_hk) < 1e-11
+    inv = np.linalg.inv(ref.template_covariance["matrix"]) + np.diag([1 / sig[f"d{i}"] ** 2 for i in range(4)] + [1e8])
+    assert np.allclose(np.linalg.inv(inv), r.template_covariance["matrix"], rtol=1e-6)
+    # tight priors at 0: the amplitudes pinned there (the maps take the rest)
+    r = run(flat, tmpl(Prior(sigma=1e-12), drift=Prior(sigma=1e-12)))
+    assert max(abs(v) for v in r.templates["thermal"].values()) < 1e-9
+    assert max(np.abs(x).max() for x in r.templates["drift"]) < 1e-9
+    # calibration: priors at the truth leave it there; tight gain priors at 1 pin the gains
+    cal = CalibrationParameters(gain_period_s=np.inf, n_iter=4,
+                                prior=Prior(sigma=1e-3, mean={f"d{i}": g[0] for i, g in enumerate(true)}))
+    r = run(cal_data, tmpl(Prior(sigma=1e-4, mean=a_th)), cal)
+    assert max(abs(g[0] - g0[0]) for g, g0 in zip(r.gains, true)) < 1e-9
+    assert max(abs(r.templates["thermal"][k] - v) for k, v in a_th.items()) < 1e-10
+    r = run(cal_data, tmpl(), dataclasses.replace(cal, prior=Prior(sigma=1e-12)))
+    assert max(abs(g[0] - 1) for g in r.gains) < 1e-9
+    with pytest.raises(ValueError, match="sigma"):
+        Prior(sigma=0.0)
+    with pytest.raises(ValueError, match="mean"):
+        Prior(sigma=1.0, mean={"d0": np.nan})
+    with pytest.raises(ValueError, match="prior"):
+        Template(fixed=True, prior=Prior(sigma=1.0))
+    with pytest.raises(TypeError, match="Prior"):
+        Template(prior=1.0)
+    with pytest.raises(ValueError, match="'d1'"):  # a detector without a value
+        run(flat, tmpl(drift=Prior(sigma={"d0": 1.0})))
+    with pytest.raises(ValueError, match="common"):  # one value per detector for a common amplitude
+        run(flat, tmpl(hk=Prior(sigma=sig)))
 
 
 def test_pol_angle_template():

@@ -887,6 +887,18 @@ class GLS:
         Constraints on the shared amplitudes: those of each group sum to zero
         (imposed by projecting the PCG vectors), e.g. the amplitudes of a sky
         template per detector, whose common part is degenerate with the map.
+    prior, shared_prior : (precision, mean) or None
+        Independent Gaussian priors on the amplitudes of `templates` (labels
+        0, 1, ... of this rank) and of `shared_templates` (the same on every
+        rank): a ~ N(mean, 1 / precision), two arrays with one value per label
+        (precision 0: no prior). They add diag(precision) to the operator and
+        precision * mean to P^T N^-1 d, so solve() gives the maximum of the
+        posterior and shared_covariance() its covariance. solve() works on
+        the deviations from the means (the TOD minus the templates at their
+        means): with tight priors, precision * mean would otherwise dominate
+        norm(b) and stop the PCG before the maps converge. Labels beyond
+        those of the templates are amplitudes without data (equal to the
+        mean). With `shared_groups`, the prior acts within the constraints.
     overwrite_pix : bool
         Relabel the flagged samples in the int32 `pix` arrays in place instead
         of copying the chunks that have them (make_maps does, as it owns them).
@@ -914,7 +926,7 @@ class GLS:
         counts use identity. No dense basis is stored in either case.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None):
         self.comm = comm
         if flag_method not in ("marginalize", "act", "fill"):
             raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'fill' (offsets use repeated negative pixel labels)")
@@ -1067,7 +1079,7 @@ class GLS:
                     _cut_diagonal(self._cuts[k], c, self._locprec, self.nthreads, w[0])
         self._flagprec = self._inverse(self._locprec)
         self._solved = None  # the full Q/U mask, for the templates
-        self.set_templates(templates, shared_templates)
+        self.set_templates(templates, shared_templates, prior, shared_prior)
         blocks = self._scatter_sum(blocks, by_column=True)
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
@@ -1079,16 +1091,22 @@ class GLS:
             self._set_coarse(coarse, blocks[:, 0])
         del blocks
 
-    def set_templates(self, templates=None, shared_templates=None):
-        """Set (or replace) `templates` and `shared_templates` (see the class),
-        keeping the rest of the setup: pixels, preconditioner, coarse level.
-        Collective with MPI. The constraints `shared_groups` are kept."""
+    def set_templates(self, templates=None, shared_templates=None, prior=None, shared_prior=None):
+        """Set (or replace) `templates`, `shared_templates` and their priors
+        (see the class), keeping the rest of the setup: pixels,
+        preconditioner, coarse level. Collective with MPI. The constraints
+        `shared_groups` are kept."""
         # local amplitudes after the unknowns of flagged samples, then (on rank 0
         # only) the shared ones
-        self._tmpl, self.namp = self._parse_templates(templates)
+        prior, shared_prior = self._check_prior(prior, "prior"), self._check_prior(shared_prior, "shared_prior")
+        self._tmpl, namp = self._parse_templates(templates)
+        self.namp = max(namp, len(prior[0]))
         self._shared, nsh = self._parse_templates(shared_templates)
         comm = self.comm
+        nsh = max(nsh, len(shared_prior[0]))
         self.nshared = nsh if comm is None else max(comm.allgather(nsh))
+        self._prior = self._prior_terms(prior, self.namp)
+        self._shprior = self._prior_terms(shared_prior, self.nshared)
         self._nsh_loc = self.nshared if self._root else 0  # the shared amplitudes in this rank's PCG vectors
         self._shv = np.zeros(self.nshared)  # the shared amplitudes for P, set by _apply
         if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)) + self.nshared:  # collective
@@ -1103,9 +1121,30 @@ class GLS:
                         tmpl[:] = [(np.where(bad.reshape(-1, *[1] * (v.ndim - 1)), 0, v).astype(v.dtype, copy=False)
                                     if np.any(v[bad] != 0) else v, lab) for v, lab in tmpl]
         diag = self._template_diag(self._shared, self.nshared)
-        diag = diag if comm is None else comm.allreduce(diag)
-        self._locprec = np.concatenate([self._flagprec, self._inverse(self._template_diag(self._tmpl, self.namp)),
-                                        self._inverse(diag)[: self._nsh_loc]])
+        diag = (diag if comm is None else comm.allreduce(diag)) + self._shprior[0]
+        local = self._template_diag(self._tmpl, self.namp) + self._prior[0]
+        self._locprec = np.concatenate([self._flagprec, self._inverse(local), self._inverse(diag)[: self._nsh_loc]])
+
+    @staticmethod
+    def _check_prior(prior, name):
+        """(precision, mean) as two float arrays, checked; empty ones for None."""
+        if prior is None:
+            return np.zeros(0), np.zeros(0)
+        prec, mean = (np.asarray(x, dtype=float) for x in prior)
+        if prec.ndim != 1 or prec.shape != mean.shape:
+            raise ValueError(f"{name}: (precision, mean), two 1D arrays of the same length")
+        if not (np.all(np.isfinite(prec)) and np.all(prec >= 0) and np.all(np.isfinite(mean))):
+            raise ValueError(f"{name}: the precisions must be finite and >= 0, the means finite")
+        return prec, mean
+
+    @staticmethod
+    def _prior_terms(prior, n):
+        """(precision, mean) of n amplitudes (2, n), zero without a prior."""
+        prec, mean = prior
+        out = np.zeros((2, n))
+        out[0, : prec.size] = prec
+        out[1, : prec.size] = mean
+        return out
 
     def _parse_templates(self, templates):
         """Per chunk, the (values, labels) of its templates (0 where not applied;
@@ -1424,8 +1463,9 @@ class GLS:
         ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, out=out, nthreads=nthreads)
         return out[:n]
 
-    def _apply(self, v=None, tod=None, exact=False):
-        """P^T N^-1 P v or P^T N^-1 tod, one chunk at a time. v and the result
+    def _apply(self, v=None, tod=None, exact=False, prior=True):
+        """P^T N^-1 P v (+ the precisions of the priors times v, unless not
+        `prior`) or P^T N^-1 tod (without the priors), one chunk at a time. v and the result
         are flat PCG vectors: this rank's pixels (ncomp, nloc) raveled, then the
         unknowns of its flagged samples. FFTs in float32 only for P^T N^-1 P v
         with fft_dtype=np.float32 and not `exact`."""
@@ -1460,6 +1500,9 @@ class GLS:
             for chunks, U, M in self._groups:
                 self._apply_group(chunks, U, M, v, tod, loc, buf)
         sh = self._shbuf if self.comm is None or not self.nshared else self.comm.allreduce(self._shbuf)
+        if v is not None and prior:  # precision * v
+            self._locbuf[self.nflag :] += self._prior[0] * loc[self.nflag : self.nflag + self.namp]
+            sh = sh + self._shprior[0] * self._shv
         return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf,
                                self._project_shared(sh)[: self._nsh_loc]])
 
@@ -1625,10 +1668,22 @@ class GLS:
         and "shared_amplitudes" (on every rank).
         """
         b = self._apply(tod=_chunks(tod))
+        # the deviations from the means of the priors, x = xp + x': A x' = b + precision * mean - A xp
+        a0 = self._nsky + self.nflag
+        xp = np.zeros_like(b)
+        xp[a0 : a0 + self.namp] = self._prior[1]
+        if self._nsh_loc:
+            xp[a0 + self.namp :] = self._project_shared(self._shprior[1].copy())
+        shifted = int(np.any(xp))
+        if (shifted if self.comm is None else self.comm.allreduce(shifted)) > 0:
+            b -= self._apply(xp, exact=True, prior=False)  # the TOD minus the templates at the means
+            if self._nsh_loc:  # the part of the means out of the constraints
+                b[a0 + self.namp :] += self._project_shared(self._shprior[0] * (self._shprior[1] - xp[a0 + self.namp :]))
         x = np.zeros_like(b)
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
         x, it, history = self._pcg(b, x, x0 is not None, tol, maxiter, recompute_every, verbose)
+        x += xp
         a0 = self._nsky + self.nflag
         shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),

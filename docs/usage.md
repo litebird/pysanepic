@@ -339,6 +339,7 @@ result.gains  # one array per DetectorData: gain of each 20-minute period
 | `cache_model` | Keep the TOD of the sky model and of the sky templates in memory between the iterations, instead of computing them again (default `False`; 8 bytes per sample each) |
 | `covariance_fixed_gains` | With `template_covariance=True`: the covariance with the gains fixed at their fitted values instead of marginalized over (default `False`). The gains couple to the sky templates through the sky signal in the gain template and slow down the solves of the covariance; fixed, the errors were 0.05–0.13% smaller in a test, and the covariance of a 1-year e2e run took 3 times fewer PCG iterations |
 | `mask` | HEALPix map (output nside and coordinates), 1 for pixels used and 0 for pixels left out of the gain fit (e.g. the Galactic plane), as the usual masks; also the mask of the templates without their own (`Template.mask`, see [below](#masks)). Samples left out of every fit are flagged in the iterations, then one more solve makes the maps with all the samples |
+| `prior` | A Gaussian {class}`~pysanepic.Prior` on the gains $g$ (mean 1 by default), see [priors](#priors) |
 
 The absolute calibration comes from the orbital dipole: a gain common to all
 periods would otherwise just rescale the map. Signal that the map cannot
@@ -414,6 +415,30 @@ result.template_covariance        # {"labels": [("thermal", "d0"), ..., ("hk", N
 With calibration the templates are inside the gain,
 $d = g\,(P m + D + S + \sum_k a_k T_k) + n$: the amplitudes are in the units
 of the calibrated TOD.
+
+### Priors
+
+`Template(prior=Prior(sigma=..., mean=...))` and
+`CalibrationParameters(prior=...)` put an independent Gaussian prior on each
+amplitude or gain, $a \sim \mathcal{N}(\bar a, \sigma^2)$: the GLS operator
+gets $1/\sigma^2$ on the diagonal of the amplitudes and the right-hand side
+$\bar a / \sigma^2$, so `make_maps` gives the maximum of the posterior and
+`template_covariance` its covariance. `sigma` and `mean` are one value, or
+`{detector name: value}` (each period of a detector has its value; a common
+amplitude takes one value); `sigma=inf` is no prior, and `mean=None` the
+nominal value (0 for the amplitudes, 1 for the gains). With calibration the
+prior is on $g$ and $a$, not on their corrections in each iteration; with
+`sum_zero=True` it acts within the constraint (give means summing to zero).
+
+```python
+from pysanepic import Prior
+
+templates = {
+    "fg_deriv1": Template(sky=dF_dnu, sum_zero=True, prior=Prior(sigma=0.5)),  # band shifts of ~0.5 GHz
+    "thermal": Template(prior=Prior(sigma={"d0": 1e-3, "d1": 2e-3}, mean={"d0": 0.01, "d1": 0.02})),
+}
+cal = CalibrationParameters(gain_period_s=3600.0, prior=Prior(sigma=0.01))  # g ~ N(1, 0.01^2)
+```
 
 ### Covariance of the amplitudes
 

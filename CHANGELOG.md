@@ -4,6 +4,19 @@
 
 Changes on `main` that are not in a release yet.
 
+- Gaussian priors on the fitted systematics: `Prior(sigma=..., mean=...)`,
+  passed as `Template(prior=...)` for template amplitudes and
+  `CalibrationParameters(prior=...)` for the gains, with one value or one per
+  detector (`sigma=inf`: no prior, `mean=None`: 0 for amplitudes, 1 for
+  gains). `make_maps` returns the maximum of the posterior and
+  `template_covariance` the posterior covariance. Through the calibration
+  iterations the prior acts on `g` and `a`, not on their linearized
+  corrections. Low level: `GLS(prior=, shared_prior=)` and
+  `GLS.set_templates` take `(precision, mean)` arrays, added to the
+  operator, the right-hand side and the preconditioner. `solve()` works on
+  the deviations from the means, so that with tight priors `precision * mean`
+  does not dominate the PCG stopping criterion before the maps converge.
+
 ## 0.6.3 (2026-11-01)
 
 - Fix nondeterministic chunk-worker reductions: a dynamic buffer queue
