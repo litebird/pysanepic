@@ -149,6 +149,64 @@ def test_tod_templates_mpi():
     assert np.abs(c - c0).max() < 1e-6 * np.abs(c0).max()
 
 
+def test_priors_mpi():
+    """Priors on shared amplitudes (sum_zero with means not summing to zero, a
+    tight common prior with a non-zero mean: the shift of solve() on rank 0),
+    on amplitudes per period and on the gains (a rank without data): the
+    serial result, also for the posterior covariance."""
+    import dataclasses
+
+    import healpy as hp
+
+    from pysanepic import CalibrationParameters, GLSParameters, Prior, Template, make_maps
+    from test_mapmaker import _calibration_data
+
+    comm = MPI.COMM_WORLD
+    n, per = 60_000, 12_000
+    data, true, _ = _calibration_data(16, n, 10.0, per)
+    rng = np.random.default_rng(53)
+    t = np.arange(n)
+    halves = []
+    for i, (d, g) in enumerate(zip(data, true)):
+        tt = {"thermal": rng.normal(size=n), "hk": rng.normal(size=n), "drift": (t % 6000) / 6000.0}
+        flat = d.tod / g[t // per] - d.dipole + 1e-3 * (i - 1.5) * tt["thermal"] + 2e-4 * tt["hk"] + 1e-4 * tt["drift"]
+        for sl in (slice(0, n // 2), slice(n // 2, n)):
+            p = d.pointing
+            halves.append(dataclasses.replace(d, tod=flat[sl], dipole=None, name=f"d{i}",
+                                              templates={k: v[sl] for k, v in tt.items()},
+                                              pointing=dataclasses.replace(p, theta=p.theta[sl], phi=p.phi[sl],
+                                                                           psi=p.psi[sl])))
+    templates = {"thermal": Template(sum_zero=True, prior=Prior(sigma={f"d{i}": 1e-4 * (i + 1) for i in range(4)},
+                                                                mean={f"d{i}": 1e-3 * i for i in range(4)})),
+                 "hk": Template(common=True, prior=Prior(sigma=1e-10, mean=2e-4)),
+                 "drift": Template(period_s=600.0, prior=Prior(sigma=5e-5, mean=1e-4))}
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20, covariance_tol=1e-20),
+              template_covariance=True, templates=templates)
+    res = make_maps(halves[comm.rank :: comm.size], 16, comm=comm, **kw)
+    ref = make_maps(halves, 16, **kw)
+    assert all(abs(res.templates["thermal"][k] - v) < 1e-9 for k, v in ref.templates["thermal"].items())
+    assert abs(res.templates["hk"] - ref.templates["hk"]) < 1e-12 and abs(ref.templates["hk"] - 2e-4) < 1e-12
+    for a, b in zip(res.templates["drift"], ref.templates["drift"][comm.rank :: comm.size]):
+        assert np.abs(a - b).max() < 1e-9
+    seen = ref.maps != hp.UNSEEN
+    assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
+    c, c0 = res.template_covariance["matrix"], ref.template_covariance["matrix"]
+    assert np.abs(c - c0).max() < 1e-6 * np.abs(c0).max()
+
+    cal_data = data[:3]  # with 4 ranks, one has no data
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
+              calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=4,
+                                                prior=Prior(sigma=1e-3, mean={"d0": 1.01, "d1": 0.99, "d2": 1.0})))
+    cal_data = [dataclasses.replace(d, name=f"d{i}") for i, d in enumerate(cal_data)]
+    res = make_maps(cal_data[comm.rank :: comm.size], 16, comm=comm, **kw)
+    gains = comm.gather(res.gains)
+    if comm.rank == 0:
+        ref = make_maps(cal_data, 16, **kw).gains
+        for r in range(comm.size):
+            for g, g0 in zip(gains[r], ref[r :: comm.size]):
+                assert np.abs(g - g0).max() < 1e-9
+
+
 def test_more_ranks_than_pixels():
     """With MPI some ranks may own no pixels at all: same result as serial."""
     comm = MPI.COMM_WORLD
@@ -330,5 +388,6 @@ if __name__ == "__main__":
     test_calibration_mpi()
     test_bandpass_mpi()
     test_tod_templates_mpi()
+    test_priors_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")
