@@ -589,6 +589,10 @@ _project_1, _add_template_1, _add_scaled_1, _add_columns_1, _cos_sin_1, _backpro
 # x 48 workers: 3.6 GB); above it, P^T by pixel ranges; make it a parameter if needed
 _PRIVATE_MAPS_BYTES = 4e9
 
+# Coverage accumulators are larger than I/Q/U maps (7 float64 columns).
+# Keep at least one, even when a single full-sky accumulator exceeds the budget.
+_COVERAGE_BYTES = 512 * 1024**2
+
 
 @numba.njit(parallel=True, cache=True)
 def _reduce_maps(maps, buf):
@@ -1262,14 +1266,16 @@ class GLS:
     def _chunk_coverage(self):
         """The coverage (nobs, 7) of this rank's chunks (see _coverage): the
         chunks in parallel, worker j on chunks j, j + nw, ... into its own
-        array, summed in a fixed order (8 workers at most: 56 bytes per pixel
-        each)."""
-        nw = min(self.nthreads, len(self.ip), 8)
-        covs = np.zeros((max(nw, 1), self.nobs, 7))
-        nmax = max((ip.size for ip in self.ip), default=0)
+        array, summed in place in a fixed order. At most 8 workers, limited
+        by _COVERAGE_BYTES (56 bytes per pixel each, at least one array)."""
+        max_workers = max(1, _COVERAGE_BYTES // max(56 * self.nobs, 1))
+        nw = min(self.nthreads, len(self.ip), 8, max_workers)
+        # Separate allocations: returning covs[0] must not retain the others.
+        covs = [np.zeros((self.nobs, 7)) for _ in range(max(nw, 1))]
         dtype = self._c2.dtype if self.pol else np.float32
 
         def work(j):
+            nmax = max(ip.size for ip in self.ip[j::nw])
             c2, s2 = (np.empty(nmax, dtype), np.empty(nmax, dtype)) if self.pol else (self._dummy, self._dummy)
             for k in range(j, len(self.ip), max(nw, 1)):
                 n = self.ip[k].size
@@ -1278,7 +1284,9 @@ class GLS:
                 _coverage(self.ip[k], c2[:n] if self.pol else c2, s2[:n] if self.pol else s2, self.pol, covs[j])
 
         list(map(work, range(nw)) if nw <= 1 else self._workers(nw).map(work, range(nw)))
-        return covs.sum(axis=0) if nw > 1 else covs[0]
+        for cov in covs[1:]:
+            covs[0] += cov
+        return covs[0]
 
     def _workers(self, nw):
         """The thread pool of the chunk workers, with at least `nw` threads."""
@@ -1445,8 +1453,8 @@ class GLS:
         m, n, w = self._nfft[k], t.size, self.weights[k]
         real, cplx = (np.float32, np.complex64) if single else (np.float64, np.complex128)
         bufs, nthreads = (self._fftbuf, self.nthreads) if slot is None else (slot["fft"], slot["nthreads"])
-        if real not in bufs:
-            mmax = max(self._nfft)
+        if real not in bufs or bufs[real][0].size < m:
+            mmax = max(self._nfft) if slot is None else slot["nfft"]
             bufs[real] = (np.empty(mmax, real), np.empty(mmax // 2 + 1, cplx), np.empty(mmax, real))
         tin, f, out = (b[:size] for b, size in zip(bufs[real], (m, m // 2 + 1, m)))
         if m == n and not single and t.flags.c_contiguous:
@@ -1520,15 +1528,32 @@ class GLS:
         The unknowns of flagged samples belong to one chunk each: the workers
         add to them in place, without private copies (they can be ~20% of
         the samples, e.g. a Galactic mask during the calibration).
-        Each worker keeps ~40 bytes per sample of the longest chunk."""
+        Each worker keeps ~40 bytes per sample of its longest assigned chunk
+        with float64 FFTs (both precisions are kept with float32 FFTs)."""
         nw = min(self.nthreads, len(ks))
         pool = self._workers(nw)
-        while len(self._slots) < nw:
-            nmax = max(ip.size for ip in self.ip)
-            c2, s2 = (np.empty(nmax, self._c2.dtype), np.empty(nmax, self._c2.dtype)) if self.pol else (None, None)
-            self._slots.append(dict(c2=c2, s2=s2, t=np.empty(nmax), fft={}))
-        slots = self._slots[:nw]
         private = nw * buf.nbytes <= _PRIVATE_MAPS_BYTES
+        if private:
+            # Preserve deterministic largest-first assignment and input order.
+            batches = [[] for _ in range(nw)]
+            loads = [(0, j) for j in range(nw)]
+            for k in sorted(ks, key=lambda k: -self._nfft[k]):
+                load, j = heapq.heappop(loads)
+                batches[j].append(k)
+                heapq.heappush(loads, (load + self._nfft[k], j))
+            batches = [sorted(batch) for batch in batches]
+        else:
+            batches = [ks[j::nw] for j in range(nw)]
+        for j, batch in enumerate(batches):
+            nmax = max(self.ip[k].size for k in batch)
+            if len(self._slots) <= j:
+                self._slots.append(dict(fft={}))
+            slot = self._slots[j]
+            if "t" not in slot or slot["t"].size < nmax:
+                c2, s2 = (np.empty(nmax, self._c2.dtype), np.empty(nmax, self._c2.dtype)) if self.pol else (None, None)
+                slot.update(c2=c2, s2=s2, t=np.empty(nmax))
+            slot["nfft"] = max(self._nfft[k] for k in batch)
+        slots = self._slots[:nw]
         if private and (self._maps is None or self._maps.shape[0] < nw):
             self._maps = np.zeros((nw, *buf.shape))  # zeroed again by _reduce_maps
         flag = self._locbuf[: self.nflag]  # disjoint labels for each chunk
@@ -1555,15 +1580,8 @@ class GLS:
             # Give each worker a fixed set of chunks and preserve their input
             # order. Largest-first greedy assignment balances heterogeneous
             # FFT lengths without allocating a private map for every chunk.
-            batches = [[] for _ in slots]
-            loads = [(0, j) for j in range(nw)]
-            for k in sorted(ks, key=lambda k: -self._nfft[k]):
-                load, j = heapq.heappop(loads)
-                batches[j].append(k)
-                heapq.heappush(loads, (load + self._nfft[k], j))
-
             def work_batch(j):
-                for k in sorted(batches[j]):
+                for k in batches[j]:
                     work((k, slots[j]))
 
             list(pool.map(work_batch, range(nw)))
@@ -1670,20 +1688,21 @@ class GLS:
         b = self._apply(tod=_chunks(tod))
         # the deviations from the means of the priors, x = xp + x': A x' = b + precision * mean - A xp
         a0 = self._nsky + self.nflag
-        xp = np.zeros_like(b)
-        xp[a0 : a0 + self.namp] = self._prior[1]
-        if self._nsh_loc:
-            xp[a0 + self.namp :] = self._project_shared(self._shprior[1].copy())
-        shifted = int(np.any(xp))
+        shared_mean = self._project_shared(self._shprior[1].copy()) if self._nsh_loc else np.empty(0)
+        mean = np.concatenate([self._prior[1], shared_mean])
+        shifted = int(np.any(mean))
         if (shifted if self.comm is None else self.comm.allreduce(shifted)) > 0:
+            xp = np.zeros_like(b)
+            xp[a0:] = mean
             b -= self._apply(xp, exact=True, prior=False)  # the TOD minus the templates at the means
             if self._nsh_loc:  # the part of the means out of the constraints
-                b[a0 + self.namp :] += self._project_shared(self._shprior[0] * (self._shprior[1] - xp[a0 + self.namp :]))
+                b[a0 + self.namp :] += self._project_shared(self._shprior[0] * (self._shprior[1] - shared_mean))
+            del xp  # only the amplitude means are needed during the PCG
         x = np.zeros_like(b)
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
         x, it, history = self._pcg(b, x, x0 is not None, tol, maxiter, recompute_every, verbose)
-        x += xp
+        x[a0:] += mean
         a0 = self._nsky + self.nflag
         shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),

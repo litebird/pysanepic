@@ -4,6 +4,14 @@
 
 Changes on `main` that are not in a release yet.
 
+- Reduce GLS memory: coverage workers share a 512 MiB accumulator budget
+  per process (at least one full-sky array), with an in-place reduction;
+  chunk-worker workspaces are sized for their own assigned chunks rather
+  than the longest chunk of the process. Deterministic chunk assignment
+  and accumulation order are retained. Prior shift vectors are allocated
+  only for nonzero means and released before PCG, keeping only amplitude
+  means during iterations. Public APIs and the statistical model are unchanged.
+
 - Gaussian priors on the fitted systematics: `Prior(sigma=..., mean=...)`,
   passed as `Template(prior=...)` for template amplitudes and
   `CalibrationParameters(prior=...)` for the gains, with one value or one per
