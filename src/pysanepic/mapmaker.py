@@ -352,6 +352,11 @@ class MapResult:
         number of CG iterations of a gap fill (over the chunks or DetectorGroup
         chunks of every rank; with calibration, of the last pass), to compare
         with GapFill.maxiter. None otherwise.
+    gradient : with GLSParameters.subpixel_gradient, (2, npix) the gradient
+        of I in each pixel, in K per pixel side sqrt(4 pi / npix), along
+        theta (south) and phi (east) at the center of the pixel; 0 where it
+        is not solved (see GLS `offsets`), hp.UNSEEN where I is not. None
+        otherwise.
     """
 
     maps: np.ndarray
@@ -366,6 +371,7 @@ class MapResult:
     template_covariance: dict | None = None
     calibration_iterations: int | None = None
     gap_fill_iterations: int | None = None
+    gradient: np.ndarray | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -533,6 +539,16 @@ class GLSParameters:
         before it is processed (a generator yields `sample_batch` items at
         a time). The samples are the same within the epsilon of the
         interpolation (1e-10, or 1e-6 for complex64 alm).
+    subpixel_gradient : sub-pixel gradient pointing: each sample sees I at
+        the center of its pixel plus the gradient of I times its offset from
+        the center (GLS `offsets`), two more unknowns per pixel. The maps
+        are then the values at the centers of the pixels, not the means of
+        their samples (no pixel window, to first order), and the error of
+        the structure of the sky below the pixel size, in the maps and in
+        the gains, drops to second order (~ the curvature of the sky times
+        the pixel size^2). Needs a Pointing with angles. Costs 8 bytes per
+        sample (the offsets in angle_dtype) and ~1.5-2x the PCG time.
+        Polarization has no gradient.
     """
 
     chunk_s: float = 3600.0
@@ -551,6 +567,7 @@ class GLSParameters:
     coarse_nside: int | None = 0
     template_dtype: type = np.float32
     sample_batch: int = 1
+    subpixel_gradient: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -789,6 +806,37 @@ def _rotate(theta, phi, psi, R, out):
         bx, by, bz = -vz * vx, -vz * vy, 1.0 - vz * vz
         cx, cy, cz = by * az - bz * ay, bz * ax - bx * az, bx * ay - by * ax
         out[2, i] = psi[i] + np.arctan2(cx * vx + cy * vy + cz * vz, bx * ax + by * ay + bz * az)
+
+
+@numba.njit(parallel=True, cache=True)
+def _offsets(loc, center, scale, gx, gy):
+    """Offsets of the samples at loc (n, 2) (theta, phi) from the centers of
+    their pixels `center` (n, 2), along e_theta and e_phi at the center,
+    times `scale` (1 / pixel side): (v - v_c) . e, v the unit vectors."""
+    for i in numba.prange(loc.shape[0]):
+        st, ct = np.sin(loc[i, 0]), np.cos(loc[i, 0])
+        sc, cc = np.sin(center[i, 0]), np.cos(center[i, 0])
+        sp, cp = np.sin(loc[i, 1]), np.cos(loc[i, 1])
+        spc, cpc = np.sin(center[i, 1]), np.cos(center[i, 1])
+        dx, dy, dz = st * cp - sc * cpc, st * sp - sc * spc, ct - cc
+        gx[i] = scale * (cc * cpc * dx + cc * spc * dy - sc * dz)
+        gy[i] = scale * (-spc * dx + cpc * dy)
+
+
+def _pixel_offsets(pix, loc, nside, dtype, nthreads):
+    """(gx, gy) of the samples (see _offsets) in pixel sides, as `dtype`."""
+    center = ducc0.healpix.Healpix_Base(nside, "RING").pix2ang(np.asarray(pix, dtype=np.int64), nthreads=nthreads)
+    gx, gy = np.empty(len(pix)), np.empty(len(pix))
+    with numba_threads(nthreads):
+        _offsets(np.ascontiguousarray(loc, dtype=float), center, nside * np.sqrt(3.0 / np.pi), gx, gy)
+    return gx.astype(dtype, copy=False), gy.astype(dtype, copy=False)
+
+
+def _gradient_tod(grad, pix, gx, gy):
+    """Ix gx + Iy gy of the gradient maps `grad` (2, npix), UNSEEN as 0."""
+    g = grad[:, pix]
+    g[g == hp.UNSEEN] = 0.0
+    return g[0] * gx + g[1] * gy
 
 
 def _pixels_and_angles(d, nside, coordinates, nthreads, loc=False):
@@ -1212,18 +1260,18 @@ def _combine(iqu, d, angle, nthreads):
 def _sample_batch(fields, dets, nside, coordinates, nthreads):
     """The TODs of the sky model and templates `fields` ({key: maps, alm or
     None}) for several DetectorData, with one synthesis_general call per alm
-    field for all of them; returns, per DetectorData, (pix, angle, {key: TOD})."""
+    field for all of them; returns, per DetectorData, (pix, angle, {key: TOD}, loc)."""
     geo = [_pixels_and_angles(d, nside, coordinates, nthreads, loc=True) for d in dets]
     loc = np.concatenate([g[2] for g in geo]) if len(geo) > 1 else geo[0][2]
     bounds = np.cumsum([0] + [len(g[0]) for g in geo])
-    out = [(pix, angle, {}) for pix, angle, _ in geo]
+    out = [(pix, angle, {}, xy) for pix, angle, xy in geo]
     for key, x in fields.items():
         if x is None or not np.iscomplexobj(x):
-            for d, (pix, angle, tods) in zip(dets, out):
+            for d, (pix, angle, tods, _) in zip(dets, out):
                 tods[key] = _sample(x, d, pix, angle, None, nthreads)
             continue
         i, q, u = _synthesis(x, loc, nthreads)
-        for j, (d, (_, angle, tods)) in enumerate(zip(dets, out)):
+        for j, (d, (_, angle, tods, _)) in enumerate(zip(dets, out)):
             sl = slice(bounds[j], bounds[j + 1])
             tods[key] = _combine((i[sl], None if q is None else q[sl], None if u is None else u[sl]), d, angle, nthreads)
     return out
@@ -1282,8 +1330,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     flag_rng = np.random.default_rng(np.random.SeedSequence([0 if fill is None else fill.seed, rank]))
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
     pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
+    gx_c, gy_c = [], []  # offsets from the pixel centers (subpixel_gradient)
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
+    npol = 3 if params.pol else 1
     common_modes = []
     templates, shared, model_c = [], [], []  # local and shared templates (chunk, values, labels), sky model TOD
     gains, offsets = [], []  # gains of each DetectorData and their first label
@@ -1306,11 +1356,15 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         sample = fit is not None and (fit.cache is None or ndata not in fit.cache)
         batch = presampled.pop(ndata, None)  # from _sample_batch (GLSParameters.sample_batch > 1)
         if batch is not None:
-            pix, angle, tods = batch
-            loc = None
+            pix, angle, tods, loc = batch
         else:
-            # the (theta, phi) only for alm models, not to keep them otherwise
-            pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=sample and fit.alm)
+            # the (theta, phi) only for alm models or offsets, not to keep them otherwise
+            pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads,
+                                                 loc=(sample and fit.alm) or params.subpixel_gradient)
+        if params.subpixel_gradient:
+            if loc is None:
+                raise ValueError("GLSParameters.subpixel_gradient needs a Pointing with angles (theta, phi), not pixels")
+            gx, gy = _pixel_offsets(pix, loc, nside, dtype, nthreads)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
         flags, tod_all, tmpl, ttod, tlab = d.flags, d.tod, None, {}, {}
@@ -1375,7 +1429,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 tmpl = d.dipole + known
                 if fit.residual is not None:
                     with numba_threads(nthreads):
-                        _axpy(tmpl, 1.0, _project_maps(fit.residual, pix, angle, d.pol_efficiency, nthreads))
+                        _axpy(tmpl, 1.0, _project_maps(fit.residual[:npol], pix, angle, d.pol_efficiency, nthreads))
+                        if params.subpixel_gradient:
+                            _axpy(tmpl, 1.0, _gradient_tod(fit.residual[npol:], pix, gx, gy))
             if cal is not None:
                 tod_all = np.empty(len(d.tod))
                 with numba_threads(nthreads):
@@ -1457,6 +1513,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     g = np.zeros(n, dtype)
                     g[m : n - m] = d.pol_efficiency
                     gamma_c.append(g)
+            if params.subpixel_gradient:
+                gx_c.append(_padded(gx, a, b, m, dtype))
+                gy_c.append(_padded(gy, a, b, m, dtype))
             p = pix[a:b].astype(np.int32)
             if flagged is not None and flagged.any():
                 p[flagged] = -1 if isinstance(method, (ACTCuts, GapFill)) else _flag_labels(flagged, method)
@@ -1521,10 +1580,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
         gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior,
-                       params, nside, comm, nthreads, fit, fs_c)
+                       params, nside, comm, nthreads, fit, fs_c, (gx_c, gy_c) if params.subpixel_gradient else None)
         if fit is not None and fit.fit:
             fit.gls = gls
-    del pix_c, a2_c, gamma_c
+    del pix_c, a2_c, gamma_c, gx_c, gy_c
     gap_iterations = None
     if conditional:
         gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, fill, flag_rng, nthreads)
@@ -1555,6 +1614,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     n = min(npix, gls.nobs)
     hit_map[:n] = gls.full(gls.hits)[:n]
     maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
+    maps, gradient = (maps[:npol], maps[npol:]) if params.subpixel_gradient else (maps, None)
     if verbose and rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
@@ -1569,6 +1629,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         residuals=info["residuals"],
         gains=None if fit is None else fit.gains,
         gap_fill_iterations=gap_iterations,
+        gradient=gradient,
     ), gls
 
 
@@ -1582,7 +1643,7 @@ def _padded(x, a, b, m, dtype):
 
 
 def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior, params, nside, comm,
-             nthreads, fit, fs_c):
+             nthreads, fit, fs_c, offsets=None):
     method = _flag_treatment(params.flag_method)
     nc = params.coarse_nside
     return GLS(
@@ -1609,13 +1670,18 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         flag_method="act" if isinstance(method, ACTCuts) else "fill" if isinstance(method, GapFill) else "marginalize",
         flag_sampling_rate_hz=fs_c if isinstance(method, ACTCuts) else None,
         act_ncoeff=method.ncoeff if isinstance(method, ACTCuts) else None,
+        offsets=offsets,
     )
 
 
-def _model_tod(d, maps, nside, coordinates, nthreads):
-    """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0)."""
-    pix, angle, _ = _pixels_and_angles(d, nside, coordinates, nthreads)
-    return _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
+def _model_tod(d, maps, nside, coordinates, nthreads, gradient=None):
+    """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0),
+    with the sub-pixel `gradient` of I (MapResult.gradient), if any."""
+    pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=gradient is not None)
+    tod = _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
+    if gradient is not None:
+        tod += _gradient_tod(gradient, pix, *_pixel_offsets(pix, loc, nside, float, nthreads))
+    return tod
 
 
 def _project_maps(maps, pix, angle, pol_efficiency, nthreads=1):
@@ -1671,7 +1737,7 @@ def _group_cross_spectra(g, result, chunk_s, nbins, nthreads, acc):
     if any(d.name is None for d in dets):
         raise ValueError("estimate_noise: the detectors of a DetectorGroup need a name")
     key, n, fs = tuple(d.name for d in dets), len(dets), dets[0].sampling_rate_hz
-    res = np.array([np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads) for d in dets])
+    res = np.array([np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads, result.gradient) for d in dets])
     good = np.ones(res.shape, bool)
     for i, d in enumerate(dets):
         if d.flags is not None:
@@ -1768,7 +1834,8 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
             continue
         key = i if d.name is None else d.name
         fs = d.sampling_rate_hz
-        res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads)
+        res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads,
+                                                          result.gradient)
         if d.flags is not None:
             res[d.flags] = 0.0
         edges = np.geomspace(1.0 / chunk_s, fs / 2, nbins + 1)

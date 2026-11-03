@@ -370,6 +370,36 @@ gains. With maps the result only changes in pixels whose Q/U are not solved
 (their polarization is removed) and in the calibration template. Without
 calibration the dipole is not used.
 
+## Sub-pixel gradient
+
+The sky model removes only the structure below the pixel size of the model;
+that of the true sky minus the model still leaks through the 1/f weights. With
+`GLSParameters(subpixel_gradient=True)` each sample sees, instead of the value
+of its pixel, $I_p + \nabla I_p \cdot (x - x_p)$: the I map gets a gradient
+per pixel (two more unknowns; Q/U have none, their structure is orders of
+magnitude fainter), fitted with the offsets of each sample from the center of
+its pixel. The leakage drops to the second order, $\sim \nabla^2 I\,
+\theta_\text{pix}^2$, smaller by $\sim(\theta_\text{pix} /
+\text{FWHM})^2$; it is the gradient (Taylor) form of the bilinear pointing of
+ACT (Naess), local to each pixel, so the block preconditioner is still exact.
+
+- **Output**: the maps are the values at the **centers** of the pixels, not
+  the means of their samples: to first order they have no pixel window
+  (compare them with the input sampled at the centers, `hp.alm2map` without
+  `pixwin`). `MapResult.gradient` (2, npix) holds the gradient along
+  $\theta$ and $\phi$ in K per pixel side $\sqrt{4\pi/N_\text{pix}}$.
+- **Where**: the gradient is solved in pixels with at least 8 hits whose
+  offsets span the pixel (reciprocal condition number of
+  $\sum (1, x, y)^T (1, x, y)$ at least 1e-2; GLS `min_grad_hits`,
+  `min_grad_rcond`); elsewhere the pixel is as without it, and still leaks.
+  In a test (nside 16, beam of 4 pixels) the leakage fell 27x in I and 9x in
+  Q/U with every pixel solved, only 2.5x with 6% of them unsolved.
+- **Needs** a `Pointing` with angles. **Costs** 8 bytes per sample (the
+  offsets, in `angle_dtype`) and a larger PCG product and preconditioner
+  (5x5 blocks with polarization).
+- With the sky model, calibration and `estimate_noise`, the gradient is part
+  of the model of the TOD like the maps.
+
 ## Templates
 
 `make_maps(templates={name: Template(...), ...})` fits templates of the TOD

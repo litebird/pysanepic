@@ -4,6 +4,15 @@
 
 Changes on `main` that are not in a release yet.
 
+- Sub-pixel gradient pointing, `GLSParameters(subpixel_gradient=True)`
+  (GLS `offsets`): an I gradient per pixel fitted with the offsets of the
+  samples from the pixel centers, so the structure of the sky below the
+  pixel size leaks to second order only; the maps are the values at the
+  pixel centers, and `MapResult.gradient` the gradient. The per-pixel
+  kernels, coverage, block preconditioner and binned maps take any set of
+  pointing weights (1, c2, s2, gx, gy); `_block_circulant` sums each pixel
+  in O(hits^2 ncomp) instead of O(hits^2 ncomp^2).
+
 - Reduce GLS memory: coverage workers share a 512 MiB accumulator budget
   per process (at least one full-sky array), with an in-place reduction;
   chunk-worker workspaces are sized for their own assigned chunks rather

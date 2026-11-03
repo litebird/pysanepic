@@ -183,7 +183,8 @@ def test_contiguous_run_kernel():
     c = rng.normal(size=(1, ns))
     c = c + c[:, (-np.arange(ns)) % ns]  # symmetric, like a circulant correlation
     fast = np.zeros((3, 6))
-    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, fast, 3, np.zeros(0))
+    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, np.zeros((1, 1)), np.zeros((1, 1)), False, fast, 3,
+                     np.zeros(0))
     fast = fast[:, 0]
     t = np.arange(ns)
     brute = [c[0, (t[ip[0] == q][:, None] - t[ip[0] == q][None, :]) % ns].sum() for q in range(3)]
@@ -686,6 +687,81 @@ def test_sky_model():
     ref = make_maps(data, nside, coordinates="E", params=p0)
     as_maps = make_maps(data, nside, coordinates="E", params=p0, sky_model=hp.alm2map(alm, nside))
     assert diff(as_maps, ref) < 1e-8
+
+
+def test_gradient_exact_gls():
+    """A TOD linear in the offsets in each pixel, I + gamma (Q cos + U sin) +
+    Ix gx + Iy gy, noiseless: 1/f GLS and binned maps recover all the
+    components, also with chunk workers and the Jacobi preconditioner; a
+    pixel whose offsets lie on a line has no gradient."""
+    from pysanepic.gls import GLS
+
+    rng = np.random.default_rng(0)
+    npix, ns, nchunk, fs = 40, 4000, 3, 10.0
+    pix = [rng.integers(0, npix, ns) for _ in range(nchunk)]
+    psi = [rng.uniform(0, np.pi, ns) for _ in range(nchunk)]
+    gx = [rng.uniform(-0.5, 0.5, ns) for _ in range(nchunk)]
+    gy = [np.where(p == 7, 0.0, rng.uniform(-0.5, 0.5, ns)) for p in pix]
+    w = one_over_f_weights(ns, fs, 1.0, 0.5, 1.5, fmin_hz=0.05)
+    sky = rng.normal(size=(5, npix))
+    sky[3:, 7] = 0.0
+    for pol in (False, True):
+        m = sky if pol else sky[[0, 3, 4]]
+        tod = [m[0, p] + m[-2, p] * x + m[-1, p] * y for p, x, y in zip(pix, gx, gy)]
+        if pol:
+            tod = [t + m[1, p] * np.cos(2 * a) + m[2, p] * np.sin(2 * a) for t, p, a in zip(tod, pix, psi)]
+        for nthreads, pre in [(1, "block"), (4, "block"), (1, "jacobi")]:
+            g = GLS(pix, psi if pol else None, [w] * nchunk, offsets=(gx, gy), angle_dtype=np.float64,
+                    nthreads=nthreads, preconditioner=pre)
+            assert g.ncomp == m.shape[0]
+            assert not g.mask[-2:, 7].any() and g.mask[:, np.arange(npix) != 7].all()
+            x, info = g.solve(tod, tol=1e-26)
+            assert info["converged"]
+            assert np.abs(x - m).max() < 1e-10, (pol, nthreads, pre)
+            assert np.abs(g.binned(tod) - m).max() < 1e-12
+
+
+def test_subpixel_gradient():
+    """GLSParameters.subpixel_gradient: noiseless 1/f maps of a sky with
+    structure below the pixel size (smoothed by a beam of 4 pixels, faint
+    polarization) leak it much less than without (against the white-noise
+    maps; the pixels without a gradient still leak, so the sky is fully
+    covered), and the gradient is that of the sky."""
+    nside, n, fs = 16, 240_000, 10.0
+    rng = np.random.default_rng(3)
+    pixsize = np.sqrt(np.pi / 3) / nside
+    lmax = 128
+    cl = 1e-8 / (1 + np.arange(lmax + 1)) ** 1.5 * hp.gauss_beam(4 * pixsize, lmax) ** 2
+    alm = np.array([hp.synalm(cl, lmax=lmax) for _ in range(3)])
+    alm[1:] *= 0.03
+    data = []
+    for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
+        theta, phi, psi = _scan(n, rng)
+        tod = _observe(alm, theta, phi, psi + pol_angle)
+        data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                                 sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
+                                 pol_angle_rad=pol_angle, name=f"d{i}"))
+    white = [dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=40.0)) for d in data]
+    leak = {}
+    for grad in (False, True):
+        params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64, subpixel_gradient=grad)
+        res = make_maps(data, nside, coordinates="E", params=params)
+        ref = make_maps(white, nside, coordinates="E", params=params)
+        assert res.converged and (res.gradient is not None) == grad
+        seen = res.maps[1] != hp.UNSEEN
+        e = (res.maps - ref.maps)[:, seen]
+        e[0] -= e[0].mean()  # I monopole unconstrained with 1/f weights
+        leak[grad] = np.sqrt((e**2).mean(axis=1))
+    assert np.all(leak[True] < 0.15 * leak[False]), leak  # I 27x, Q/U 9x
+    _, dth, dph = hp.alm2map_der1(alm[0], nside, lmax=lmax)
+    solved = res.gradient[0] != hp.UNSEEN
+    assert solved[seen].mean() > 0.99
+    for g, ref in zip(res.gradient, (dth, dph)):
+        assert np.std(g[solved] - pixsize * ref[solved]) < 0.3 * np.std(pixsize * ref[solved])
+    d_pix = dataclasses.replace(data[0], pointing=Pointing(pix=hp.ang2pix(nside, *data[0].pointing.angles("E")[:2]),
+                                                          psi=data[0].pointing.psi, nside=nside, coordinates="E"))
+    with pytest.raises(ValueError, match="subpixel_gradient needs a Pointing with angles"):
+        make_maps([d_pix], nside, coordinates="E", params=GLSParameters(subpixel_gradient=True))
 
 
 def _bandpass_data(nside, n, fs, per, amp):
