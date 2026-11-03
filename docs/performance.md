@@ -31,8 +31,12 @@ oversubscription when several MPI processes share a node: set
 With several chunks per process, the products of the PCG and the
 preconditioner of the templates process **one chunk per thread**: each
 thread computes $N^{-1} P v$ of its chunk with single-threaded FFTs and the
-serial numba kernels, in its own buffers (~40 bytes per sample of the
-longest chunk), and adds $P^T$ to a private map, summed at the end.
+serial numba kernels, in its own buffers (~40 bytes per sample of its
+longest assigned chunk with float64 FFTs), and adds $P^T$ to a private map,
+summed at the end. With `fft_dtype=np.float32`, workers retain both float32
+and float64 FFT buffers (the RHS and true residual use float64): about
+52 bytes per sample with the default angle precision, rather than a memory
+saving. FFT extension can increase these estimates.
 Chunks are assigned deterministically to workers, balancing the total FFT
 length per worker, with a fixed accumulation order inside each worker.
 Repeated calls with the same inputs, thread count and chunk layout give
@@ -67,6 +71,14 @@ chosen so that the ranges hold the same number of this process's samples,
 reads the pixel indices of the whole chunk but adds only the samples of its
 own pixels, so the threads share one map without races. Chunks of a
 `DetectorGroup` (common modes) are always processed this way.
+
+During setup, coverage uses at most 8 workers and a separate budget of
+512 MiB per process for their full-sky accumulators (56 bytes per pixel
+each). At least one accumulator is required even if it exceeds the budget.
+Workers are summed in place into the first accumulator; the others are
+released, without allocating another full coverage array. At high nside
+this reduces coverage parallelism to limit memory. Different worker counts
+can change the grouping of floating-point sums.
 
 ## Sampling alm models
 
@@ -152,12 +164,87 @@ without SVML calls a slow scalar libm, 10 times slower). With padding
   All detectors of a common-mode group are processed together. It is not
   guaranteed faster than exact marginalization; long gaps can slow this
   inner solve too. No gap unknowns persist in the map PCG.
+- Prior means are kept only for template amplitudes during PCG. A full
+  shift vector is allocated only for nonzero means, collectively with MPI,
+  and released before PCG starts. This saves one float64 vector of the
+  whole system during iterations, including 8 bytes per flagged unknown.
 - Pixel indices are int32, enough up to nside 8192. With MPI, the maps
   exchanged are limited by the int32 counts of MPI to nside 4096.
 
 See the [memory notebook](notebooks/memory).
 
 ## Benchmarks
+
+### Comparing memory implementations
+
+`tools/benchmark_memory.py` compares two source snapshots in separate Linux
+processes, with identical seeded inputs and alternating execution order:
+
+```bash
+python tools/benchmark_memory.py --baseline-src baseline/src \
+    --optimized-src optimized/src --output-dir results --nthreads 48 --repeats 2
+```
+
+It isolates high-resolution coverage and runs complete GLS solves with
+uniform chunks, heterogeneous chunks (float64 and float32 FFTs), and
+flagged samples with a nonzero template prior. These are synthetic memory
+and numerical checks, not a mission simulation. Tiny inputs are available
+with `--quick`. `tools/cluster/benchmark_memory.slurm` follows the G100 job
+environment; launch it from an isolated directory containing the two
+snapshots, tests, benchmark tool and checksum manifest.
+For longer operator timings, use `--cases uniform heterogeneous64
+--operator-products 80 --repeats 3`; the repeated products are timed in five
+batches after warming the actual chunk layout. The Slurm script accepts
+`timing` as its first argument to run this comparison only.
+
+`results/comparison.json` records timings, convergence, full-array numerical
+comparisons, source paths, versions, and both RSS and virtual memory. Phase
+peaks are sampled every 20 ms; process peak RSS comes from the kernel's
+lifetime high-water mark, including input generation and a small JIT warmup
+outside the timed phases. Unused `np.empty` buffer capacity can reduce
+virtual allocations without reducing RSS by the same amount. Coverage
+arrays are compared in blocks; their output I/O is outside the timed phase.
+
+### G100 memory comparison (2026-11-03)
+
+Job 23186465 completed on `r507c07n03` (`g100_usr_prod`, one node, 48 cores).
+The baseline was commit `ece6b95156a5285e7eb10ed3ee3fc534f8f62900`; the optimized
+source was a frozen snapshot of the `memory_optimization` working tree.
+Both used NumPy 2.5.4, Numba 0.68.0 and ducc0 0.42.0. Two fresh processes
+per version and case were run in alternating order. Median process peak RSS
+in decimal GB:
+
+| synthetic case | baseline | optimized | RSS reduction |
+|---|---:|---:|---:|
+| coverage only, nside 1024, 8.4 million samples | 6.70 | 1.03 | 84.7% |
+| uniform chunks, float64 FFTs, 25.2 million samples | 1.56 | 1.56 | 0.3% |
+| heterogeneous chunks, float64 FFTs, 29.1 million samples | 2.02 | 1.88 | 7.0% |
+| heterogeneous chunks, float32 FFTs, 29.1 million samples | 2.32 | 1.95 | 15.9% |
+| 20% flags, nonzero shared prior, 25.2 million samples | 2.33 | 2.28 | 1.8% |
+
+The isolated coverage calculation also fell from 1.32 to 0.47 seconds.
+For heterogeneous chunks, allocated worker workspaces fell from 8.05 to
+0.66 GB (float64 FFTs), or 10.47 to 0.86 GB (float32 FFTs); RSS savings are
+smaller because much of the oversized `np.empty` capacity was never touched.
+The flagged case saved about 42 MB of peak RSS, consistent with removing
+one 41.4 MB vector of 5,180,545 system unknowns during PCG.
+
+All compared coverage arrays, maps and shared amplitudes had zero maximum
+absolute difference in these tests. Solves converged at `tol=1e-12` in 4
+iterations, or 12 with flags, with identical final residuals. All 19 memory/thread
+tests passed, plus the two MPI tests for priors and pixel distribution on
+four ranks. These short solves alone do not establish a speedup or regression
+of the iterative operator.
+
+A longer timing check, job 23186606 on `r511c02n03` (`g100_usr_dbg`, 48 cores),
+used 80 normal products per process and three fresh processes per version
+and case. Median times per product were 0.0820 to 0.0790 seconds with uniform
+chunks and 0.30886 to 0.30862 seconds with heterogeneous float64 chunks.
+The operator timing is therefore comparable in these cases; the apparent
+15% slowdown of the first, short uniform solve was not reproduced.
+All final map and amplitude comparisons again had zero maximum difference.
+
+### LiteBIRD scaling
 
 On G100 (CINECA; nodes with 48 cores and 375 GB), LiteBIRD channel M2_L
 (75 Hz, IMO 1/f noise: $f_\text{knee}$ = 20 mHz, α = 1), no HWP, simulated
