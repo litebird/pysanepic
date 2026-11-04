@@ -363,14 +363,20 @@ def _cut_diagonal(cuts, c, out, nthreads, dc_weight):
                 prev, cur = cur, ((2 * j + 1) * x * cur - j * prev) / (j + 1)
 
 
+# <x^2> = <y^2> over a uniformly covered square pixel of side 1: the quadratic
+# sub-pixel weights are centred on it (a well conditioned basis; make_maps
+# recentres I on the geometric moments of each HEALPix pixel)
+_Q2 = 1.0 / 12.0
+
+
 @numba.njit(parallel=True, cache=True)
 def _project(ip, m, c2, s2, pol, gx, gy, grad, loc, out):
-    """out[i] = I[p] + c2[i] Q[p] + s2[i] U[p] (+ gx[i] Ix[p] + gy[i] Iy[p]
-    with `grad`: the I gradient, the last two columns of m), p = ip[i]; m is
-    (nobs, ncomp). Labels p >= nobs are local unknowns; p < 0 has no pixel
-    response (an ACT polynomial, if any, is applied separately)."""
+    """out[i] = I[p] + c2[i] Q[p] + s2[i] U[p] (+ the sub-pixel terms of
+    order `grad`, see _weights, with the columns of m after I/Q/U), p = ip[i];
+    m is (nobs, ncomp). Labels p >= nobs are local unknowns; p < 0 has no
+    pixel response (an ACT polynomial, if any, is applied separately)."""
     nobs = m.shape[0]
-    g = m.shape[1] - 2
+    g = 3 if pol else 1
     for i in numba.prange(ip.size):
         p = ip[i]
         if p < 0:
@@ -383,7 +389,10 @@ def _project(ip, m, c2, s2, pol, gx, gy, grad, loc, out):
         if pol:
             v += m[p, 1] * c2[i] + m[p, 2] * s2[i]
         if grad:
-            v += m[p, g] * gx[i] + m[p, g + 1] * gy[i]
+            x, y = gx[i], gy[i]
+            v += m[p, g] * x + m[p, g + 1] * y
+            if grad > 1:
+                v += m[p, g + 2] * (x * x - _Q2) + m[p, g + 3] * x * y + m[p, g + 4] * (y * y - _Q2)
         out[i] = v
 
 
@@ -395,7 +404,7 @@ def _backproject(ip, t, c2, s2, pol, gx, gy, grad, edges, buf, locbuf):
     races and without private copies. Flagged samples (labels p >= nobs) go to
     locbuf[p - nobs], written by thread 0."""
     nobs = buf.shape[0]
-    g = buf.shape[1] - 2
+    g = 3 if pol else 1
     for th in numba.prange(edges.size - 1):
         lo, hi = edges[th], edges[th + 1]
         for i in range(ip.size):
@@ -409,8 +418,13 @@ def _backproject(ip, t, c2, s2, pol, gx, gy, grad, edges, buf, locbuf):
                     buf[p, 1] += t[i] * c2[i]
                     buf[p, 2] += t[i] * s2[i]
                 if grad:
-                    buf[p, g] += t[i] * gx[i]
-                    buf[p, g + 1] += t[i] * gy[i]
+                    x, y = gx[i], gy[i]
+                    buf[p, g] += t[i] * x
+                    buf[p, g + 1] += t[i] * y
+                    if grad > 1:
+                        buf[p, g + 2] += t[i] * (x * x - _Q2)
+                        buf[p, g + 3] += t[i] * x * y
+                        buf[p, g + 4] += t[i] * (y * y - _Q2)
 
 
 @numba.njit(parallel=True, cache=True)
@@ -654,8 +668,9 @@ def _mul(out, a, b):
 
 @numba.njit(nogil=True, cache=True)
 def _weights(i, c2, s2, pol, gx, gy, grad, w):
-    """w[:n] = the pointing weights (1, c2, s2, gx, gy) of sample i (c2, s2
-    only with `pol`, gx, gy only with `grad`); returns n."""
+    """w[:n] = the pointing weights (1, c2, s2, gx, gy, gx^2 - 1/12, gx gy,
+    gy^2 - 1/12) of sample i (c2, s2 only with `pol`, gx, gy with `grad` >= 1,
+    the quadratic ones with `grad` = 2); returns n."""
     w[0] = 1.0
     n = 1
     if pol:
@@ -663,9 +678,15 @@ def _weights(i, c2, s2, pol, gx, gy, grad, w):
         w[2] = s2[i]
         n = 3
     if grad:
-        w[n] = gx[i]
-        w[n + 1] = gy[i]
+        x, y = gx[i], gy[i]
+        w[n] = x
+        w[n + 1] = y
         n += 2
+        if grad > 1:
+            w[n] = x * x - _Q2
+            w[n + 1] = x * y
+            w[n + 2] = y * y - _Q2
+            n += 3
     return n
 
 
@@ -676,7 +697,7 @@ def _coverage(ip, c2, s2, pol, gx, gy, grad, out):
     weights (see _weights): with pol only, c2, s2, c2^2, c2 s2, s2^2 (the
     angle-coverage matrix). Serial: the chunks are summed in parallel into
     private arrays (GLS._chunk_coverage)."""
-    w = np.empty(5)
+    w = np.empty(8)
     for i in range(ip.size):
         p = ip[i]
         if p < 0 or p >= out.shape[0]:  # flagged sample
@@ -724,7 +745,7 @@ def _block_circulant(ip, c, c2, s2, pol, gx, gy, grad, out, nlabels, locout):
     """Exact per-pixel blocks of P^T C P, C circulant per chunk.
 
     For each pixel, sums c[(t - t') mod ns] w_t w_t'^T over all sample pairs
-    that fall in it, with w the pointing weights (1, c2, s2, gx, gy) (see
+    that fall in it, with w the pointing weights (1, c2, s2, gx, gy, ...) (see
     _weights), and adds them to out (nobs, ncomp (ncomp + 1) / 2), the upper
     triangle row by row: II, IQ, IU, QQ, QU, UU with pol only. Labels are
     < nlabels; those >= nobs (unknowns of flagged samples, intensity only) add
@@ -766,7 +787,9 @@ def _block_circulant(ip, c, c2, s2, pol, gx, gy, grad, out, nlabels, locout):
             n = stop - start
             local = p >= nobs  # an unknown of flagged samples: no Q/U
             # Contiguous run of samples with no polarization nor offsets (e.g. the
-            # padding of a chunk): sum over lags in O(n) instead of O(n^2)
+            # padding of a chunk): sum over lags in O(n) instead of O(n^2); II
+            # only (with grad = 2 the quadratic weights are -1/12 there, but such
+            # pixels have no gradient, hence no Hessian: their blocks are unused)
             unpol = True
             if (pol or grad) and not local:
                 for a in range(start, stop):
@@ -792,11 +815,11 @@ def _block_circulant(ip, c, c2, s2, pol, gx, gy, grad, out, nlabels, locout):
                 continue
             # B_jl = sum_a w_j(a) S_l(a), S_l(a) = sum_b c[a - b] w_l(b):
             # O(hits^2 ncomp) instead of O(hits^2 ncomp^2)
-            W = np.empty((n, 5))
+            W = np.empty((n, 8))
             nw = 1
             for a in range(n):
                 nw = _weights(order[start + a], c2[k], s2[k], pol, gx[k], gy[k], grad, W[a])
-            S = np.empty(5)
+            S = np.empty(8)
             blk = np.zeros(out.shape[1])
             for a in range(n):
                 ta = order[start + a]
@@ -884,6 +907,20 @@ class GLS:
         whose matrix sum_t (1, gx, gy)^T (1, gx, gy) has a reciprocal
         condition number >= `min_grad_rcond` (elsewhere Ix = Iy = 0: the
         mean of the samples, as without offsets).
+    hessian : bool
+        With `offsets`, also the second order: m_p + Ix gx + Iy gy + Hxx
+        (gx^2 - 1/12) + Hxy gx gy + Hyy (gy^2 - 1/12), three more components
+        (Hxx = Ixx / 2, Hxy = Ixy, Hyy = Iyy / 2, last in the maps). The
+        quadratic terms average to zero over a uniformly covered square pixel
+        of side 1 (offsets in pixel sides), so I is the mean over the pixel
+        whatever the distribution of the samples in it: the error of the
+        structure below the pixel size drops to third order and the maps
+        have the pixel window of uniformly covered square pixels (make_maps
+        reports the mean over each HEALPix pixel instead). Solved in pixels
+        with a gradient, at least `min_hess_hits` hits and a reciprocal
+        condition number of the white-noise block of (1, gx, gy, the three
+        quadratic weights), scaled to a unit diagonal, >= `min_hess_rcond`
+        (elsewhere 0).
     fft_lengths : int or list of int (one per chunk), or None
         Length m >= ns of the FFT used to apply N^-1 to each chunk (the chunk is
         zero-extended and the result truncated: the weight is the ns x ns block
@@ -987,7 +1024,7 @@ class GLS:
         counts use identity. No dense basis is stored in either case.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, hessian=False, min_hess_hits=20, min_hess_rcond=1e-2):
         self.comm = comm
         if flag_method not in ("marginalize", "act", "fill"):
             raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'fill' (offsets use repeated negative pixel labels)")
@@ -1082,9 +1119,11 @@ class GLS:
         self._shgroups = [np.asarray(g, dtype=np.int64) for g in shared_groups or []]
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self.pol = psi is not None or pol_angles is not None
-        self.grad = offsets is not None
-        self.npol = 3 if self.pol else 1  # I/Q/U or I, then the gradient Ix, Iy with offsets
-        self.ncomp = self.npol + 2 * self.grad
+        if hessian and offsets is None:
+            raise ValueError("GLS: hessian needs offsets")
+        self.grad = 0 if offsets is None else 2 if hessian else 1  # order of the sub-pixel terms
+        self.npol = 3 if self.pol else 1  # I/Q/U or I, then the gradient Ix, Iy and the Hessian with offsets
+        self.ncomp = self.npol + (0, 2, 5)[self.grad]
         self._ncov = 1 + self.ncomp * (self.ncomp + 1) // 2  # columns of the coverage (see _coverage)
         self._dummy = np.zeros(1, angle_dtype)
         if pol_angles is not None:
@@ -1134,6 +1173,10 @@ class GLS:
             self.mask[g:] &= self.hits >= max(min_grad_hits, 3)
             if min_grad_rcond > 0:
                 self.mask[g:] &= self._rcond(cov, [0, g, g + 1], self.mask[g]) >= min_grad_rcond
+            if self.grad > 1:
+                self.mask[g + 2 :] &= self.hits >= max(min_hess_hits, 6)
+                if min_hess_rcond > 0:
+                    self.mask[g + 2 :] &= self._rcond(cov, [0, *range(g, g + 5)], self.mask[g + 2], scaled=True) >= min_hess_rcond
         self._cov = cov  # this rank's pixels, kept for binned
 
         blocks = np.zeros((self.nobs, self.ncomp * (self.ncomp + 1) // 2))
@@ -1430,13 +1473,17 @@ class GLS:
         `rows` from their coverage, (n, ncomp, ncomp)."""
         return _symmetric(np.column_stack([cov[rows, 0], cov[rows, 2:]]), self.ncomp)
 
-    def _rcond(self, cov, comps, seen):
+    def _rcond(self, cov, comps, seen, scaled=False):
         """Reciprocal condition number of the white-noise block of the
         components `comps` in the pixels `seen` (0 elsewhere): for I/Q/U the
         angle-coverage matrix, for I and the gradient the spread of the
-        offsets."""
+        offsets; `scaled`: of the block scaled to a unit diagonal."""
         rcond = np.zeros(self.nloc)
         M = self._white(cov, seen)[:, comps][:, :, comps]
+        if scaled:
+            d = np.sqrt(np.einsum("nii->ni", M))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                M = np.nan_to_num(M / d[:, :, None] / d[:, None, :])
         with np.errstate(divide="ignore"):
             rcond[seen] = 1.0 / np.linalg.cond(M)
         return rcond
@@ -1527,8 +1574,8 @@ class GLS:
         """(gx, gy, grad) of chunk k (the offsets, see `offsets`), in the
         order of the kernels' arguments."""
         if not self.grad:
-            return self._dummy, self._dummy, False
-        return self.gx[k], self.gy[k], True
+            return self._dummy, self._dummy, 0
+        return self.gx[k], self.gy[k], self.grad
 
     def _filter(self, t, k, single, slot=None):
         """N^-1 t for chunk k: irfft(rfft(t) * w) on an FFT of length m >= t.size

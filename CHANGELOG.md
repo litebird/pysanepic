@@ -13,6 +13,14 @@ Changes on `main` that are not in a release yet.
   pointing weights (1, c2, s2, gx, gy); `_block_circulant` sums each pixel
   in O(hits^2 ncomp) instead of O(hits^2 ncomp^2).
 
+- Sub-pixel Hessian, `GLSParameters(subpixel_hessian=True)` (GLS
+  `hessian`): with the gradient, also the second derivatives of I per pixel;
+  the error of the structure below the pixel size drops to third order and
+  I is the mean of the sky over each pixel, from the geometric moments of
+  the HEALPix pixels (compare with the input through `hp.pixwin`).
+  `MapResult.hessian` the second derivatives. The docstring of
+  `MapResult.gradient` now says hp.UNSEEN (not 0) where it is not solved.
+
 - Reduce GLS memory: coverage workers share a 512 MiB accumulator budget
   per process (at least one full-sky array), with an in-place reduction;
   chunk-worker workspaces are sized for their own assigned chunks rather
