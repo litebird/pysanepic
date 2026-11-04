@@ -541,14 +541,15 @@ class GLSParameters:
         interpolation (1e-10, or 1e-6 for complex64 alm).
     subpixel_gradient : sub-pixel gradient pointing: each sample sees I at
         the center of its pixel plus the gradient of I times its offset from
-        the center (GLS `offsets`), two more unknowns per pixel. The maps
-        are then the values at the centers of the pixels, not the means of
-        their samples (no pixel window, to first order), and the error of
-        the structure of the sky below the pixel size, in the maps and in
-        the gains, drops to second order (~ the curvature of the sky times
-        the pixel size^2). Needs a Pointing with angles. Costs 8 bytes per
-        sample (the offsets in angle_dtype) and ~1.5-2x the PCG time.
-        Polarization has no gradient.
+        the center (GLS `offsets`), two more unknowns per pixel. The maps no
+        longer depend, to first order, on where the samples fall in the
+        pixels, and the error of the structure of the sky below the pixel
+        size, in the maps and in the gains, drops to second order (~ the
+        curvature of the sky times the pixel size^2). The pixel window stays
+        (it is second order: compare with the input through it). Needs a
+        Pointing with angles. Costs 8 bytes per sample (the offsets in
+        angle_dtype) and ~1.3-1.5x the PCG time. Polarization has no
+        gradient.
     """
 
     chunk_s: float = 3600.0

@@ -875,9 +875,11 @@ class GLS:
         pixel sides, along two orthogonal directions of the tangent plane;
         0 in virtual pixels). The I map gets a gradient per pixel,
         m_p + Ix_p gx + Iy_p gy: the maps have ncomp = 3 (or 1) + 2
-        components, I, Q, U, Ix, Iy, and I is the value at the center of the
-        pixel instead of the mean of its samples; the error of the structure
-        below the pixel size drops to second order in the offsets. The
+        components, I, Q, U, Ix, Iy. I no longer depends, to first order,
+        on where the samples fall in the pixel: the error of the structure
+        below the pixel size drops to second order in the offsets. It is
+        not the value at the center either: the center and the mean over
+        the pixel differ at second order (the pixel window). The
         gradient is solved only in pixels with at least `min_grad_hits` hits
         whose matrix sum_t (1, gx, gy)^T (1, gx, gy) has a reciprocal
         condition number >= `min_grad_rcond` (elsewhere Ix = Iy = 0: the

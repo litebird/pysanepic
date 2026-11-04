@@ -383,11 +383,25 @@ its pixel. The leakage drops to the second order, $\sim \nabla^2 I\,
 \text{FWHM})^2$; it is the gradient (Taylor) form of the bilinear pointing of
 ACT (Naess), local to each pixel, so the block preconditioner is still exact.
 
-- **Output**: the maps are the values at the **centers** of the pixels, not
-  the means of their samples: to first order they have no pixel window
-  (compare them with the input sampled at the centers, `hp.alm2map` without
-  `pixwin`). `MapResult.gradient` (2, npix) holds the gradient along
-  $\theta$ and $\phi$ in K per pixel side $\sqrt{4\pi/N_\text{pix}}$.
+- **Output**: the maps no longer depend, to first order, on where the
+  samples fall in each pixel. They still have the **pixel window**: the
+  linear term averages to zero over a pixel, so the value at the center and
+  the mean over the pixel differ only at second order, which the gradient
+  does not model. Compare them with the input through the pixel window, as
+  the maps without the gradient. `MapResult.gradient` (2, npix) holds the
+  gradient along $\theta$ and $\phi$ in K per pixel side
+  $\sqrt{4\pi/N_\text{pix}}$.
+- **What it removes**: on G100 (16 detectors, 1 year, 1/f noise at
+  net_scale 0.01, CMB and foregrounds through circular Gaussian beams of
+  22.6', nside 512; e2e/test_pysanepic_subgrad_1f) the leakage of the
+  structure below the pixel size through the 1/f weights (1/f GLS minus
+  the noiseless binned sky) goes down to the noise: TT excess at
+  $\ell \sim 20-500$ gone, I rms on $|b| < 20°$ from 0.080 to 0.051 µK
+  (the noise). The binned maps minus the input through the pixel window
+  fall from 0.32 to 0.27 µK in I at $|b| > 20°$ and from 0.65 to 0.30 µK on
+  the plane; the rest, with the shape of the sky spectrum at
+  $\ell \sim 200-600$, is second order (the HEALPix pixel window is the
+  azimuthal average over pixels of different shapes) and stays.
 - **Where**: the gradient is solved in pixels with at least 8 hits whose
   offsets span the pixel (reciprocal condition number of
   $\sum (1, x, y)^T (1, x, y)$ at least 1e-2; GLS `min_grad_hits`,
@@ -396,7 +410,8 @@ ACT (Naess), local to each pixel, so the block preconditioner is still exact.
   Q/U with every pixel solved, only 2.5x with 6% of them unsolved.
 - **Needs** a `Pointing` with angles. **Costs** 8 bytes per sample (the
   offsets, in `angle_dtype`) and a larger PCG product and preconditioner
-  (5x5 blocks with polarization).
+  (5x5 blocks with polarization): 1.33x the time of the GLS in the test
+  above, same iterations.
 - With the sky model, calibration and `estimate_noise`, the gradient is part
   of the model of the TOD like the maps.
 
