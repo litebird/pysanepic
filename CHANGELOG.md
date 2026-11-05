@@ -4,6 +4,19 @@
 
 Changes on `main` that are not in a release yet.
 
+- Sub-pixel terms of I, `GLSParameters(subpixel_order=1 or 2)` (GLS
+  `offsets`, `subpixel_order`): the gradient (1), and the Hessian too (2),
+  of I per pixel, fitted with the offsets of the samples from the pixel
+  centers, so the structure of the sky below the pixel size leaks to second
+  (third) order only. I is the mean of the fitted model over each pixel,
+  from the geometric moments of the HEALPix pixels: compare with the input
+  averaged over each pixel, not through `hp.pixwin`. `MapResult.gradient`
+  and `MapResult.hessian` hold the derivatives (hp.UNSEEN where not
+  solved). The per-pixel kernels, coverage, block preconditioner and binned
+  maps take any set of pointing weights (1, c2, s2, gx, gy and the
+  quadratic ones); `_block_circulant` sums each pixel in O(hits^2 ncomp)
+  instead of O(hits^2 ncomp^2).
+
 - Reduce GLS memory: coverage workers share a 512 MiB accumulator budget
   per process (at least one full-sky array), with an in-place reduction;
   chunk-worker workspaces are sized for their own assigned chunks rather

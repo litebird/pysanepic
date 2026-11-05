@@ -183,7 +183,8 @@ def test_contiguous_run_kernel():
     c = rng.normal(size=(1, ns))
     c = c + c[:, (-np.arange(ns)) % ns]  # symmetric, like a circulant correlation
     fast = np.zeros((3, 6))
-    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, fast, 3, np.zeros(0))
+    _block_circulant(ip, c, np.zeros((1, 1)), np.zeros((1, 1)), False, np.zeros((1, 1)), np.zeros((1, 1)), False, fast, 3,
+                     np.zeros(0))
     fast = fast[:, 0]
     t = np.arange(ns)
     brute = [c[0, (t[ip[0] == q][:, None] - t[ip[0] == q][None, :]) % ns].sum() for q in range(3)]
@@ -686,6 +687,194 @@ def test_sky_model():
     ref = make_maps(data, nside, coordinates="E", params=p0)
     as_maps = make_maps(data, nside, coordinates="E", params=p0, sky_model=hp.alm2map(alm, nside))
     assert diff(as_maps, ref) < 1e-8
+
+
+def test_gradient_exact_gls():
+    """A TOD linear in the offsets in each pixel, I + gamma (Q cos + U sin) +
+    Ix gx + Iy gy, noiseless: 1/f GLS and binned maps recover all the
+    components, also with chunk workers and the Jacobi preconditioner; a
+    pixel whose offsets lie on a line has no gradient."""
+    from pysanepic.gls import GLS
+
+    rng = np.random.default_rng(0)
+    npix, ns, nchunk, fs = 40, 4000, 3, 10.0
+    pix = [rng.integers(0, npix, ns) for _ in range(nchunk)]
+    psi = [rng.uniform(0, np.pi, ns) for _ in range(nchunk)]
+    gx = [rng.uniform(-0.5, 0.5, ns) for _ in range(nchunk)]
+    gy = [np.where(p == 7, 0.0, rng.uniform(-0.5, 0.5, ns)) for p in pix]
+    w = one_over_f_weights(ns, fs, 1.0, 0.5, 1.5, fmin_hz=0.05)
+    sky = rng.normal(size=(5, npix))
+    sky[3:, 7] = 0.0
+    for pol in (False, True):
+        m = sky if pol else sky[[0, 3, 4]]
+        tod = [m[0, p] + m[-2, p] * x + m[-1, p] * y for p, x, y in zip(pix, gx, gy)]
+        if pol:
+            tod = [t + m[1, p] * np.cos(2 * a) + m[2, p] * np.sin(2 * a) for t, p, a in zip(tod, pix, psi)]
+        for nthreads, pre in [(1, "block"), (4, "block"), (1, "jacobi")]:
+            g = GLS(pix, psi if pol else None, [w] * nchunk, offsets=(gx, gy), angle_dtype=np.float64,
+                    nthreads=nthreads, preconditioner=pre)
+            assert g.ncomp == m.shape[0]
+            assert not g.mask[-2:, 7].any() and g.mask[:, np.arange(npix) != 7].all()
+            x, info = g.solve(tod, tol=1e-26)
+            assert info["converged"]
+            assert np.abs(x - m).max() < 1e-10, (pol, nthreads, pre)
+            assert np.abs(g.binned(tod) - m).max() < 1e-12
+
+
+def test_subpixel_gradient():
+    """GLSParameters.subpixel_order=1: noiseless 1/f maps of a sky with
+    structure below the pixel size (smoothed by a beam of 4 pixels, faint
+    polarization) leak it much less than without (against the white-noise
+    maps; the pixels without a gradient still leak, so the sky is fully
+    covered), and the gradient is that of the sky."""
+    nside, n, fs = 16, 240_000, 10.0
+    rng = np.random.default_rng(3)
+    pixsize = np.sqrt(np.pi / 3) / nside
+    lmax = 128
+    cl = 1e-8 / (1 + np.arange(lmax + 1)) ** 1.5 * hp.gauss_beam(4 * pixsize, lmax) ** 2
+    alm = np.array([hp.synalm(cl, lmax=lmax) for _ in range(3)])
+    alm[1:] *= 0.03
+    data = []
+    for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
+        theta, phi, psi = _scan(n, rng)
+        tod = _observe(alm, theta, phi, psi + pol_angle)
+        data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                                 sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
+                                 pol_angle_rad=pol_angle, name=f"d{i}"))
+    white = [dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=40.0)) for d in data]
+    leak = {}
+    for grad in (False, True):
+        params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64, subpixel_order=int(grad))
+        res = make_maps(data, nside, coordinates="E", params=params)
+        ref = make_maps(white, nside, coordinates="E", params=params)
+        assert res.converged and (res.gradient is not None) == grad
+        seen = res.maps[1] != hp.UNSEEN
+        e = (res.maps - ref.maps)[:, seen]
+        e[0] -= e[0].mean()  # I monopole unconstrained with 1/f weights
+        leak[grad] = np.sqrt((e**2).mean(axis=1))
+    assert np.all(leak[True] < 0.15 * leak[False]), leak  # I 27x, Q/U 9x
+    _, dth, dph = hp.alm2map_der1(alm[0], nside, lmax=lmax)
+    solved = res.gradient[0] != hp.UNSEEN
+    assert solved[seen].mean() > 0.99
+    for g, ref in zip(res.gradient, (dth, dph)):
+        assert np.std(g[solved] - pixsize * ref[solved]) < 0.3 * np.std(pixsize * ref[solved])
+    d_pix = dataclasses.replace(data[0], pointing=Pointing(pix=hp.ang2pix(nside, *data[0].pointing.angles("E")[:2]),
+                                                          psi=data[0].pointing.psi, nside=nside, coordinates="E"))
+    with pytest.raises(ValueError, match="subpixel_order needs a Pointing with angles"):
+        make_maps([d_pix], nside, coordinates="E", params=GLSParameters(subpixel_order=1))
+
+
+def test_hessian_exact_gls():
+    """A TOD quadratic in the offsets, I + gamma (Q cos + U sin) + Ix gx +
+    Iy gy + Hxx (gx^2 - 1/12) + Hxy gx gy + Hyy (gy^2 - 1/12), noiseless: 1/f
+    GLS and binned maps recover all the components; a pixel whose offsets lie
+    on a line has neither gradient nor Hessian, one with too few hits a
+    gradient only."""
+    from pysanepic.gls import GLS
+
+    rng = np.random.default_rng(1)
+    npix, ns, nchunk, fs = 40, 6000, 3, 10.0
+    pix = [rng.integers(0, npix, ns) for _ in range(nchunk)]
+    pix = [np.where((p == 11) & (np.arange(ns) % 4 > 0), 12, p) for p in pix]  # pixel 11: ~ 110 hits, the others ~ 450
+    psi = [rng.uniform(0, np.pi, ns) for _ in range(nchunk)]
+    gx = [rng.uniform(-0.5, 0.5, ns) for _ in range(nchunk)]
+    gy = [np.where(p == 7, 0.0, rng.uniform(-0.5, 0.5, ns)) for p in pix]
+    w = one_over_f_weights(ns, fs, 1.0, 0.5, 1.5, fmin_hz=0.05)
+    sky = rng.normal(size=(8, npix))
+    sky[3:, 7] = 0.0
+    sky[5:, 11] = 0.0
+    for pol in (False, True):
+        m = sky if pol else sky[[0, 3, 4, 5, 6, 7]]
+        tod = [m[0, p] + m[-5, p] * x + m[-4, p] * y + m[-3, p] * (x * x - 1 / 12) + m[-2, p] * x * y
+               + m[-1, p] * (y * y - 1 / 12) for p, x, y in zip(pix, gx, gy)]
+        if pol:
+            tod = [t + m[1, p] * np.cos(2 * a) + m[2, p] * np.sin(2 * a) for t, p, a in zip(tod, pix, psi)]
+        for nthreads, pre in [(1, "block"), (4, "block"), (1, "jacobi")]:
+            g = GLS(pix, psi if pol else None, [w] * nchunk, offsets=(gx, gy), subpixel_order=2, angle_dtype=np.float64,
+                    nthreads=nthreads, preconditioner=pre, min_hess_hits=200)
+            assert g.ncomp == m.shape[0]
+            others = ~np.isin(np.arange(npix), [7, 11])
+            assert not g.mask[-5:, 7].any() and g.mask[-5:-3, 11].all() and not g.mask[-3:, 11].any()
+            assert g.mask[:, others].all()
+            x, info = g.solve(tod, tol=1e-26)
+            assert info["converged"]
+            assert np.abs(x - m).max() < 1e-9, (pol, nthreads, pre)
+            assert np.abs(g.binned(tod) - m).max() < 1e-11
+    with pytest.raises(ValueError, match="subpixel_order >= 1 needs offsets"):
+        GLS(pix, None, [w] * nchunk, subpixel_order=2)
+    assert GLS(pix, None, [w] * nchunk, offsets=(gx, gy), subpixel_order=0).ncomp == 1
+
+
+def test_subpixel_hessian():
+    """GLSParameters.subpixel_order=2: the I maps of a sky with structure
+    below the pixel size are its means over the pixels much more closely
+    than with the gradient only, with white and 1/f noise weights alike; the
+    Hessian is that of the sky and the model of the TOD (estimate_noise)
+    includes it. The geometric moments of the pixels are those of a fine
+    grid."""
+    from pysanepic import estimate_noise
+    from pysanepic.mapmaker import _pixel_mean_shift, _pixel_moments
+
+    nside, n, fs = 16, 400_000, 10.0
+    rng = np.random.default_rng(4)
+    pixsize = np.sqrt(np.pi / 3) / nside
+    lmax = 96
+    cl = 1e-8 / (1 + np.arange(lmax + 1)) ** 1.5 * hp.gauss_beam(4 * pixsize, lmax) ** 2
+    np.random.seed(1)  # hp.synalm draws from the global state
+    alm = np.array([hp.synalm(cl, lmax=lmax) for _ in range(3)])
+    alm[1:] *= 0.03
+    data = []
+    for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
+        theta, phi, psi = _scan(n, rng)
+        tod = _observe(alm, theta, phi, psi + pol_angle)
+        data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
+                                 sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
+                                 pol_angle_rad=pol_angle, name=f"d{i}"))
+    white = [dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=40.0)) for d in data]
+    ref = hp.ud_grade(hp.alm2map(alm[0], nside * 16, lmax=lmax), nside)  # the means over the pixels
+    mom = _pixel_moments(nside)
+    assert np.abs(mom[2:] - _pixel_moments(nside, k=32)[2:]).max() < 1e-3
+    belt = np.abs(np.cos(hp.pix2ang(nside, np.arange(hp.nside2npix(nside)))[0])) < 0.5  # diamonds of area 1 on the axes
+    assert np.allclose(mom[2, belt] * mom[4, belt], 1 / 144, rtol=0.03) and np.abs(mom[3, belt]).max() < 1e-3
+    # I is recentred on the pixel mean: first order where the gradient is solved, second where the Hessian is
+    g, h = rng.normal(size=(2, mom.shape[1])), rng.normal(size=(3, mom.shape[1]))
+    g[:, 0], h[:, :2] = hp.UNSEEN, hp.UNSEEN
+    first = g[0] * mom[0] + g[1] * mom[1]
+    second = h[0] * (mom[2] - 1 / 12) / 2 + h[1] * mom[3] + h[2] * (mom[4] - 1 / 12) / 2
+    assert np.allclose(_pixel_mean_shift(nside, g, None, 1)[1:], first[1:]) and _pixel_mean_shift(nside, g, h, 1)[0] == 0
+    assert np.allclose(_pixel_mean_shift(nside, g, h, 1)[1:], (first + np.where(np.arange(len(first)) < 2, 0, second))[1:])
+    lap = hp.alm2map(hp.almxfl(alm[0], -np.arange(lmax + 1) * (np.arange(lmax + 1) + 1.0)), nside, lmax=lmax)
+    err = {}
+    for hess in (True, False):  # the pixels with a Hessian first
+        params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64, subpixel_order=1 + hess)
+        for name, d in (("white", white), ("1/f", data)):
+            res = make_maps(d, nside, coordinates="E", params=params)
+            assert res.converged and (res.hessian is not None) == hess
+            if hess:
+                solved = res.hessian[0] != hp.UNSEEN
+                assert solved.mean() > 0.9
+                h = res.hessian[:, solved]
+                assert np.corrcoef(h[0] + h[2], pixsize**2 * lap[solved])[0, 1] > 0.99
+            e = (res.maps[0] - ref)[solved]
+            err[hess, name] = np.std(e - (e.mean() if name == "1/f" else 0))  # I monopole free with 1/f weights
+    # 3x; 2x with 1/f weights (the third order and the pixels without a Hessian leak); the gradient only, recentred
+    # on the first moments of the pixels, is itself 3x closer to the pixel means than its constant term at nside 16
+    assert err[True, "white"] < 0.45 * err[False, "white"] and err[True, "1/f"] < 0.65 * err[False, "1/f"], err
+    # estimate_noise: the residual is the noise, as without sky (the maps absorb part of it), with the Hessian
+    sigma = 5e-6  # the sky beyond the model adds a few % to its PSD with the Hessian, ~15% without
+    noise = [sigma * rng.normal(size=n) for _ in white]
+    ratio = {}
+    for hess in (False, True):
+        params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64, subpixel_order=1 + hess)
+        psd = []
+        for sky in (1, 0):
+            dets = [dataclasses.replace(d, tod=sky * d.tod + x) for d, x in zip(white, noise)]
+            est = estimate_noise(dets, make_maps(dets, nside, coordinates="E", params=params), chunk_s=4000.0, nbins=8)
+            psd.append(np.median([s.psd for s in est.values()]))
+        ratio[hess] = psd[0] / psd[1]
+    assert abs(ratio[True] - 1) < 0.08 and ratio[False] > 1.1, ratio
+    with pytest.raises(ValueError, match="subpixel_order must be 0, 1 or 2"):
+        GLSParameters(subpixel_order=3)
 
 
 def _bandpass_data(nside, n, fs, per, amp):

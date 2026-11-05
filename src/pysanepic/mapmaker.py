@@ -22,7 +22,7 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
-from .gls import _GapFilledTOD, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
+from .gls import _GapFilledTOD, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
 from .gapfill import conditional_gap_fill, _validate_gap_solve, _validate_gap_preconditioner
 
 
@@ -352,6 +352,19 @@ class MapResult:
         number of CG iterations of a gap fill (over the chunks or DetectorGroup
         chunks of every rank; with calibration, of the last pass), to compare
         with GapFill.maxiter. None otherwise.
+    gradient : with GLSParameters.subpixel_order >= 1, (2, npix) the
+        gradient of I in each pixel, in K per pixel side sqrt(4 pi / npix),
+        along theta (south) and phi (east) at the center of the pixel;
+        hp.UNSEEN where it is not solved (see GLS `offsets`) or I is not.
+        Where it is, I is the mean of the sky over the pixel, to first order
+        (to second order with the Hessian): compare with the input averaged
+        over each pixel (e.g. hp.ud_grade from a finer map); hp.pixwin, the
+        window averaged over the pixels, misses the shapes of the HEALPix
+        pixels. None otherwise.
+    hessian : with GLSParameters.subpixel_order = 2, (3, npix) the second
+        derivatives of I (Ixx, Ixy, Iyy), in K per pixel side^2, along the
+        axes of `gradient`; hp.UNSEEN where they are not solved (see GLS
+        `subpixel_order`) or I is not. None otherwise.
     """
 
     maps: np.ndarray
@@ -366,6 +379,8 @@ class MapResult:
     template_covariance: dict | None = None
     calibration_iterations: int | None = None
     gap_fill_iterations: int | None = None
+    gradient: np.ndarray | None = None
+    hessian: np.ndarray | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -533,6 +548,20 @@ class GLSParameters:
         before it is processed (a generator yields `sample_batch` items at
         a time). The samples are the same within the epsilon of the
         interpolation (1e-10, or 1e-6 for complex64 alm).
+    subpixel_order : 0, 1 or 2, the sub-pixel terms of I (GLS `offsets`,
+        `subpixel_order`). 0 (default): none, each pixel is a constant and the
+        maps are means of their samples, which depend on where the samples
+        fall in the pixels. 1: the gradient of I per pixel, two more unknowns:
+        the error of the structure of the sky below the pixel size, in the
+        maps and in the gains, drops to second order (~ the curvature of the
+        sky times the pixel size^2). 2: also the Hessian, three more unknowns:
+        the error drops to third order. With 1 or 2, I is the mean of the
+        fitted model over each pixel, from the geometric moments of the
+        HEALPix pixels (compare with the input averaged over each pixel).
+        Needs a Pointing with angles. Costs 8 bytes per sample (the offsets
+        in angle_dtype) and ~1.3-1.5x the PCG time with 1, ~1.15-1.3x more
+        with 2 (no memory per sample); the white noise of I grows by <~1%.
+        Polarization has no sub-pixel terms.
     """
 
     chunk_s: float = 3600.0
@@ -551,6 +580,11 @@ class GLSParameters:
     coarse_nside: int | None = 0
     template_dtype: type = np.float32
     sample_batch: int = 1
+    subpixel_order: int = 0
+
+    def __post_init__(self):
+        if self.subpixel_order not in (0, 1, 2):
+            raise ValueError(f"GLSParameters.subpixel_order must be 0, 1 or 2, not {self.subpixel_order!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -789,6 +823,89 @@ def _rotate(theta, phi, psi, R, out):
         bx, by, bz = -vz * vx, -vz * vy, 1.0 - vz * vz
         cx, cy, cz = by * az - bz * ay, bz * ax - bx * az, bx * ay - by * ax
         out[2, i] = psi[i] + np.arctan2(cx * vx + cy * vy + cz * vz, bx * ax + by * ay + bz * az)
+
+
+@numba.njit(parallel=True, cache=True)
+def _offsets(loc, center, scale, gx, gy):
+    """Offsets of the samples at loc (n, 2) (theta, phi) from the centers of
+    their pixels `center` (n, 2), along e_theta and e_phi at the center,
+    times `scale` (1 / pixel side): (v - v_c) . e, v the unit vectors."""
+    for i in numba.prange(loc.shape[0]):
+        st, ct = np.sin(loc[i, 0]), np.cos(loc[i, 0])
+        sc, cc = np.sin(center[i, 0]), np.cos(center[i, 0])
+        sp, cp = np.sin(loc[i, 1]), np.cos(loc[i, 1])
+        spc, cpc = np.sin(center[i, 1]), np.cos(center[i, 1])
+        dx, dy, dz = st * cp - sc * cpc, st * sp - sc * spc, ct - cc
+        gx[i] = scale * (cc * cpc * dx + cc * spc * dy - sc * dz)
+        gy[i] = scale * (-spc * dx + cpc * dy)
+
+
+def _pixel_offsets(pix, loc, nside, dtype, nthreads):
+    """(gx, gy) of the samples (see _offsets) in pixel sides, as `dtype`."""
+    center = ducc0.healpix.Healpix_Base(nside, "RING").pix2ang(np.asarray(pix, dtype=np.int64), nthreads=nthreads)
+    gx, gy = np.empty(len(pix)), np.empty(len(pix))
+    with numba_threads(nthreads):
+        _offsets(np.ascontiguousarray(loc, dtype=float), center, nside * np.sqrt(3.0 / np.pi), gx, gy)
+    return gx.astype(dtype, copy=False), gy.astype(dtype, copy=False)
+
+
+def _subpixel_tod(sub, pix, gx, gy):
+    """The sub-pixel terms of the maps `sub` (2 or 5, npix), the GLS
+    components after I/Q/U (see GLS `offsets`, `subpixel_order`), UNSEEN as 0."""
+    g = sub[:, pix]
+    g[g == hp.UNSEEN] = 0.0
+    tod = g[0] * gx + g[1] * gy
+    if len(sub) > 2:
+        tod += g[2] * (gx * gx - _Q2) + g[3] * gx * gy + g[4] * (gy * gy - _Q2)
+    return tod
+
+
+@functools.lru_cache(maxsize=4)
+def _pixel_moments(nside, k=8, nthreads=1):
+    """Geometric moments of the pixels in the offsets of _offsets (pixel
+    sides): (5, npix) mean of x, y, x^2, x y, y^2 over each pixel, from the
+    centres of its k^2 children at nside * k (the second ones divided by 1 -
+    1 / k^2, the moments of the children themselves). Computed in one
+    quarter of each ring: a rotation by pi / 2 in phi keeps e_theta, e_phi."""
+    npix = 12 * nside**2
+    base = ducc0.healpix.Healpix_Base(nside, "RING")
+    ang = base.pix2ang(np.arange(npix), nthreads=nthreads)
+    ang[:, 1] = np.fmod(ang[:, 1], np.pi / 2)
+    reps, which = np.unique(base.ang2pix(ang, nthreads=nthreads), return_inverse=True)
+    children = ducc0.healpix.Healpix_Base(nside * k, "NEST")
+    out = np.empty((5, len(reps)))
+    step = max(1, 2**22 // k**2)
+    for a in range(0, len(reps), step):
+        r = reps[a : a + step]
+        loc = children.pix2ang((base.ring2nest(r)[:, None] * k**2 + np.arange(k**2)).ravel(), nthreads=nthreads)
+        gx, gy = (g.reshape(len(r), k**2) for g in _pixel_offsets(np.repeat(r, k**2), loc, nside, float, nthreads))
+        out[:, a : a + len(r)] = gx.mean(1), gy.mean(1), (gx * gx).mean(1), (gx * gy).mean(1), (gy * gy).mean(1)
+    out[2:] /= 1 - 1 / k**2
+    return out[:, which]
+
+
+def _pixel_mean_shift(nside, gradient, hessian, nthreads):
+    """I_mean - I_p per pixel (npix,): the geometric centring of the sub-pixel
+    terms (MapResult.gradient, .hessian or None), Ix <x> + Iy <y> where the
+    gradient is solved, + Ixx (<x^2> - 1/12) / 2 + Ixy <x y> + Iyy (<y^2> -
+    1/12) / 2 where the Hessian is, the moments over the pixel (see
+    _pixel_moments)."""
+    mom = _pixel_moments(nside, nthreads=nthreads)
+    shift = np.zeros(gradient.shape[1])
+    solved = gradient[0] != hp.UNSEEN
+    shift[solved] = (gradient[0] * mom[0] + gradient[1] * mom[1])[solved]
+    if hessian is not None:
+        solved = hessian[0] != hp.UNSEEN
+        shift[solved] += (hessian[0] * (mom[2] - _Q2) / 2 + hessian[1] * mom[3] + hessian[2] * (mom[4] - _Q2) / 2)[solved]
+    return shift
+
+
+def _subpixel_maps(gradient, hessian):
+    """The GLS sub-pixel components of MapResult.gradient and .hessian."""
+    if hessian is None:
+        return gradient
+    h = np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian * np.array([0.5, 1.0, 0.5])[:, None])
+    return np.concatenate([gradient, h])
 
 
 def _pixels_and_angles(d, nside, coordinates, nthreads, loc=False):
@@ -1212,18 +1329,18 @@ def _combine(iqu, d, angle, nthreads):
 def _sample_batch(fields, dets, nside, coordinates, nthreads):
     """The TODs of the sky model and templates `fields` ({key: maps, alm or
     None}) for several DetectorData, with one synthesis_general call per alm
-    field for all of them; returns, per DetectorData, (pix, angle, {key: TOD})."""
+    field for all of them; returns, per DetectorData, (pix, angle, {key: TOD}, loc)."""
     geo = [_pixels_and_angles(d, nside, coordinates, nthreads, loc=True) for d in dets]
     loc = np.concatenate([g[2] for g in geo]) if len(geo) > 1 else geo[0][2]
     bounds = np.cumsum([0] + [len(g[0]) for g in geo])
-    out = [(pix, angle, {}) for pix, angle, _ in geo]
+    out = [(pix, angle, {}, xy) for pix, angle, xy in geo]
     for key, x in fields.items():
         if x is None or not np.iscomplexobj(x):
-            for d, (pix, angle, tods) in zip(dets, out):
+            for d, (pix, angle, tods, _) in zip(dets, out):
                 tods[key] = _sample(x, d, pix, angle, None, nthreads)
             continue
         i, q, u = _synthesis(x, loc, nthreads)
-        for j, (d, (_, angle, tods)) in enumerate(zip(dets, out)):
+        for j, (d, (_, angle, tods, _)) in enumerate(zip(dets, out)):
             sl = slice(bounds[j], bounds[j + 1])
             tods[key] = _combine((i[sl], None if q is None else q[sl], None if u is None else u[sl]), d, angle, nthreads)
     return out
@@ -1282,8 +1399,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     flag_rng = np.random.default_rng(np.random.SeedSequence([0 if fill is None else fill.seed, rank]))
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
     pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
+    gx_c, gy_c = [], []  # offsets from the pixel centers (subpixel_order >= 1)
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
+    npol = 3 if params.pol else 1
     common_modes = []
     templates, shared, model_c = [], [], []  # local and shared templates (chunk, values, labels), sky model TOD
     gains, offsets = [], []  # gains of each DetectorData and their first label
@@ -1306,11 +1425,15 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         sample = fit is not None and (fit.cache is None or ndata not in fit.cache)
         batch = presampled.pop(ndata, None)  # from _sample_batch (GLSParameters.sample_batch > 1)
         if batch is not None:
-            pix, angle, tods = batch
-            loc = None
+            pix, angle, tods, loc = batch
         else:
-            # the (theta, phi) only for alm models, not to keep them otherwise
-            pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=sample and fit.alm)
+            # the (theta, phi) only for alm models or offsets, not to keep them otherwise
+            pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads,
+                                                 loc=(sample and fit.alm) or params.subpixel_order > 0)
+        if params.subpixel_order:
+            if loc is None:
+                raise ValueError("GLSParameters.subpixel_order needs a Pointing with angles (theta, phi), not pixels")
+            gx, gy = _pixel_offsets(pix, loc, nside, dtype, nthreads)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
         flags, tod_all, tmpl, ttod, tlab = d.flags, d.tod, None, {}, {}
@@ -1375,7 +1498,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 tmpl = d.dipole + known
                 if fit.residual is not None:
                     with numba_threads(nthreads):
-                        _axpy(tmpl, 1.0, _project_maps(fit.residual, pix, angle, d.pol_efficiency, nthreads))
+                        _axpy(tmpl, 1.0, _project_maps(fit.residual[:npol], pix, angle, d.pol_efficiency, nthreads))
+                        if params.subpixel_order:
+                            _axpy(tmpl, 1.0, _subpixel_tod(fit.residual[npol:], pix, gx, gy))
             if cal is not None:
                 tod_all = np.empty(len(d.tod))
                 with numba_threads(nthreads):
@@ -1457,6 +1582,9 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     g = np.zeros(n, dtype)
                     g[m : n - m] = d.pol_efficiency
                     gamma_c.append(g)
+            if params.subpixel_order:
+                gx_c.append(_padded(gx, a, b, m, dtype))
+                gy_c.append(_padded(gy, a, b, m, dtype))
             p = pix[a:b].astype(np.int32)
             if flagged is not None and flagged.any():
                 p[flagged] = -1 if isinstance(method, (ACTCuts, GapFill)) else _flag_labels(flagged, method)
@@ -1521,10 +1649,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
         gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior,
-                       params, nside, comm, nthreads, fit, fs_c)
+                       params, nside, comm, nthreads, fit, fs_c, (gx_c, gy_c) if params.subpixel_order else None)
         if fit is not None and fit.fit:
             fit.gls = gls
-    del pix_c, a2_c, gamma_c
+    del pix_c, a2_c, gamma_c, gx_c, gy_c
     gap_iterations = None
     if conditional:
         gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, fill, flag_rng, nthreads)
@@ -1555,6 +1683,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     n = min(npix, gls.nobs)
     hit_map[:n] = gls.full(gls.hits)[:n]
     maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
+    sub, maps = maps[npol:], maps[:npol]
+    gradient = sub[:2] if params.subpixel_order else None
+    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * np.array([2.0, 1.0, 2.0])[:, None]) if params.subpixel_order > 1 else None
+    if gradient is not None:
+        maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
     if verbose and rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
@@ -1569,6 +1702,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         residuals=info["residuals"],
         gains=None if fit is None else fit.gains,
         gap_fill_iterations=gap_iterations,
+        gradient=gradient,
+        hessian=hessian,
     ), gls
 
 
@@ -1582,7 +1717,7 @@ def _padded(x, a, b, m, dtype):
 
 
 def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior, params, nside, comm,
-             nthreads, fit, fs_c):
+             nthreads, fit, fs_c, offsets=None):
     method = _flag_treatment(params.flag_method)
     nc = params.coarse_nside
     return GLS(
@@ -1609,13 +1744,22 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         flag_method="act" if isinstance(method, ACTCuts) else "fill" if isinstance(method, GapFill) else "marginalize",
         flag_sampling_rate_hz=fs_c if isinstance(method, ACTCuts) else None,
         act_ncoeff=method.ncoeff if isinstance(method, ACTCuts) else None,
+        offsets=offsets,
+        subpixel_order=params.subpixel_order,
     )
 
 
-def _model_tod(d, maps, nside, coordinates, nthreads):
-    """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0)."""
-    pix, angle, _ = _pixels_and_angles(d, nside, coordinates, nthreads)
-    return _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
+def _model_tod(d, maps, nside, coordinates, nthreads, gradient=None, hessian=None):
+    """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0),
+    with the sub-pixel `gradient` and `hessian` of I (MapResult), if any."""
+    pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=gradient is not None)
+    if gradient is not None:
+        maps = maps.copy()
+        maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    tod = _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
+    if gradient is not None:
+        tod += _subpixel_tod(_subpixel_maps(gradient, hessian), pix, *_pixel_offsets(pix, loc, nside, float, nthreads))
+    return tod
 
 
 def _project_maps(maps, pix, angle, pol_efficiency, nthreads=1):
@@ -1671,7 +1815,8 @@ def _group_cross_spectra(g, result, chunk_s, nbins, nthreads, acc):
     if any(d.name is None for d in dets):
         raise ValueError("estimate_noise: the detectors of a DetectorGroup need a name")
     key, n, fs = tuple(d.name for d in dets), len(dets), dets[0].sampling_rate_hz
-    res = np.array([np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads) for d in dets])
+    res = np.array([np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads, result.gradient,
+                                                                  result.hessian) for d in dets])
     good = np.ones(res.shape, bool)
     for i, d in enumerate(dets):
         if d.flags is not None:
@@ -1768,7 +1913,8 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
             continue
         key = i if d.name is None else d.name
         fs = d.sampling_rate_hz
-        res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads)
+        res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads,
+                                                          result.gradient, result.hessian)
         if d.flags is not None:
             res[d.flags] = 0.0
         edges = np.geomspace(1.0 / chunk_s, fs / 2, nbins + 1)

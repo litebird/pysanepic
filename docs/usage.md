@@ -370,6 +370,121 @@ gains. With maps the result only changes in pixels whose Q/U are not solved
 (their polarization is removed) and in the calibration template. Without
 calibration the dipole is not used.
 
+## Sub-pixel gradient
+
+The sky model removes only the structure below the pixel size of the model;
+that of the true sky minus the model still leaks through the 1/f weights. With
+`GLSParameters(subpixel_order=1)` each sample sees, instead of the value
+of its pixel, $I_p + \nabla I_p \cdot (x - x_p)$: the I map gets a gradient
+per pixel (two more unknowns; Q/U have none, their structure is orders of
+magnitude fainter), fitted with the offsets of each sample from the center of
+its pixel. The leakage drops to the second order, $\sim \nabla^2 I\,
+\theta_\text{pix}^2$, smaller by $\sim(\theta_\text{pix} /
+\text{FWHM})^2$; it is the gradient (Taylor) form of the bilinear pointing of
+ACT (Naess), local to each pixel, so the block preconditioner is still exact.
+
+- **Output**: the maps no longer depend, to first order, on where the
+  samples fall in each pixel. The reported I is the mean of the fitted model
+  over the pixel, $I_p + I_x\langle x\rangle + I_y\langle y\rangle$ with the
+  geometric first moments of each HEALPix pixel (see the Hessian below; they
+  are ~1e-4 pixel sides at nside 512, up to 0.09 in a few pixels near the
+  poles). Compare the maps with the input averaged over each pixel (e.g.
+  `hp.ud_grade` from nside x 8). `MapResult.gradient` (2, npix) holds the
+  gradient along $\theta$ and $\phi$ in K per pixel side
+  $\sqrt{4\pi/N_\text{pix}}$. The G100 numbers below compare the constant
+  term $I_p$ (the convention before the recentring) with the input through
+  the pixel window.
+- **What it removes**: on G100 (16 detectors, 1 year, 1/f noise at
+  net_scale 0.01, CMB and foregrounds through circular Gaussian beams of
+  22.6', nside 512; e2e/test_pysanepic_subgrad_1f) the leakage of the
+  structure below the pixel size through the 1/f weights (1/f GLS minus
+  the noiseless binned sky) goes down to the noise: TT excess at
+  $\ell \sim 20-500$ gone, I rms on $|b| < 20°$ from 0.080 to 0.051 µK
+  (the noise). The binned maps minus the input through the pixel window
+  fall from 0.32 to 0.27 µK in I at $|b| > 20°$ and from 0.65 to 0.30 µK on
+  the plane; the rest, with the shape of the sky spectrum at
+  $\ell \sim 200-600$, is second order (the HEALPix pixel window is the
+  azimuthal average over pixels of different shapes) and stays.
+- **Where**: the gradient is solved in pixels with at least 8 hits whose
+  offsets span the pixel (reciprocal condition number of
+  $\sum (1, x, y)^T (1, x, y)$ at least 1e-2; GLS `min_grad_hits`,
+  `min_grad_rcond`); elsewhere the pixel is as without it, and still leaks.
+  In a test (nside 16, beam of 4 pixels) the leakage fell 27x in I and 9x in
+  Q/U with every pixel solved, only 2.5x with 6% of them unsolved.
+- **Needs** a `Pointing` with angles. **Costs** 8 bytes per sample (the
+  offsets, in `angle_dtype`) and a larger PCG product and preconditioner
+  (5x5 blocks with polarization): 1.33x the time of the GLS in the test
+  above, same iterations.
+- With the sky model, calibration and `estimate_noise`, the gradient is part
+  of the model of the TOD like the maps.
+
+### Second order: the Hessian
+
+The rest of the binned maps minus the input is the curvature of the sky times
+the uneven distribution of the samples in each pixel: per pixel
+$\tfrac12 \sum_{ij} \partial_i\partial_j I\,(\langle\delta_i\delta_j\rangle_\text{samples}
+- \langle\delta_i\delta_j\rangle_\text{uniform})$. In the G100 run above
+(e2e/test_pysanepic_subpix2nd) this prediction reproduces the TT residual at
+$\ell \sim 200-600$ of the maps with the gradient (correlation 0.99998).
+`GLSParameters(subpixel_order=2)` fits it:
+each sample sees
+
+$$I_p + I_x x + I_y y + \tfrac12 I_{xx} (x^2 - \tfrac1{12}) + I_{xy}\, x y
++ \tfrac12 I_{yy} (y^2 - \tfrac1{12}),$$
+
+$x, y$ the offsets in pixel sides: three more unknowns per pixel, computed
+from the offsets (no memory per sample).
+
+- **Output**: the reported I is the mean of the fitted model over the
+  pixel, $I_p + I_x\langle x\rangle + I_y\langle y\rangle + \tfrac12 I_{xx}
+  (\langle x^2\rangle - \tfrac1{12}) + I_{xy}\langle xy\rangle + \tfrac12
+  I_{yy}(\langle y^2\rangle - \tfrac1{12})$, with the geometric moments of
+  each HEALPix pixel (from its 64 children at nside x 8, a second at nside
+  512): the mean of the sky over the pixel, to second order, whatever the
+  samples. Compare the maps with the input averaged over each pixel (e.g.
+  `hp.ud_grade` from nside x 8), not through `hp.pixwin`: the window averaged
+  over the pixels misses their shapes, 0.27 µK rms in I and the TT excess at
+  $\ell \sim 200-600$ of the run above, intrinsic to any map of pixel means.
+  The fitted model is the same as with the uniform-square centring
+  $\tfrac1{12}$ of the weights; only the reported combination changes, and
+  with it the noise: $\tfrac1{12}$ gives an isotropic window ($1 -
+  \ell(\ell+1)\Omega_\text{pix}/24$, no TT excess) but extrapolates in the
+  non-square pixels of the polar caps (x1.6 the variance of I there at the
+  median, x3 at the 99th percentile); the geometric moments cost x1.0005
+  (x1.013 at the 99th percentile). `MapResult.hessian` (3, npix) holds
+  $I_{xx}, I_{xy}, I_{yy}$ in K per pixel side$^2$.
+- **What it removes** (G100, same TOD, jobs 23194655 and 23198211): the
+  noiseless binned I minus the input averaged over each pixel drops from
+  0.055 to 0.014 µK rms at |b| > 20° (TT at $\ell$ 200-600 from 3.7e-8 to
+  6.4e-9 µK², below the noise of the 1/f GLS map, 1.0e-8); the 1/f GLS map
+  is then the pixel means plus its noise.
+- **With all systematics and calibration** (G100, the configuration of
+  master_16det_ref: 16 detectors, 1 year, beams, bandpasses, angles, pointing
+  offsets, gain drifts, templates; jobs 23140001, 23192046, 23199705), I
+  minus the input averaged over each pixel, rms at |b| > 20° / < 20°:
+
+  | | none | gradient | gradient + Hessian |
+  |---|---|---|---|
+  | I [µK] | 0.183 / 0.584 | 0.074 / 0.070 | 0.052 / 0.058 |
+  | TT $\ell$ 200-600 [µK²] | 1.5e-7 | 4.6e-8 | 1.6e-8 |
+  | gain fit / true - 1 | 3.2e-6 | 4.5e-7 | 4.4e-7 |
+  | GLS time [s] | 7316 | 6592 | 8505 |
+
+  With the Hessian the error of I is the white noise (0.050 µK expected)
+  and its TT the noise spectrum at every $\ell$; Q/U and the templates do
+  not change.
+- **Where**: in pixels with a gradient, at least 20 hits and a reciprocal
+  condition number of the white-noise block of
+  $(1, x, y, x^2 - \tfrac1{12}, xy, y^2 - \tfrac1{12})$, scaled to a unit
+  diagonal, at least 1e-2 (GLS `min_hess_hits`, `min_hess_rcond`): 99.4% of
+  the pixels in a LiteBIRD year at nside 512; elsewhere the pixel has the
+  gradient only.
+- **Costs**: the noise variance of I x1.0005 (median) to x1.013 (99th
+  percentile) that with the gradient only (1/f GLS, G100); a larger PCG
+  product and preconditioner (8x8 blocks with polarization): 1.15x the GLS
+  time of the gradient only with 1/f noise, 1.29x with calibration (the PCG
+  of the second calibration iteration took 65 iterations instead of 34).
+
 ## Templates
 
 `make_maps(templates={name: Template(...), ...})` fits templates of the TOD
