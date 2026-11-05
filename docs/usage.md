@@ -370,6 +370,16 @@ gains. With maps the result only changes in pixels whose Q/U are not solved
 (their polarization is removed) and in the calibration template. Without
 calibration the dipole is not used.
 
+The binned map of the model weights each detector by its white-noise level,
+$1/\sigma^2$ from `DetectorData.noise`, as the GLS weights its samples
+(`GLSParameters.binned_weights="noise"`, the default). `"equal"` weights all
+the samples alike (pysanepic <= 0.6.4), and a dict `{detector name: weight}`
+sets the weights by hand, e.g. the same weight $2/(\sigma_a^2 + \sigma_b^2)$
+for the two detectors of a horn, so that their difference cancels the
+intensity in Q/U as in pair differencing. The GLS itself always weights by
+`DetectorData.noise`: to weight a pair alike there too, give its two detectors
+the same noise model.
+
 ## Sub-pixel gradient
 
 The sky model removes only the structure below the pixel size of the model;
