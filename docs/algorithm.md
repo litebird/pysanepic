@@ -210,7 +210,10 @@ the MPI processes) is below it.
 
 A sky model $S$ is subtracted from the TOD, $d - S(t) = P\,m_\text{res} + n$,
 and the maps are $m_\text{res} + \bar S$, with $\bar S$ the binned map of
-$S(t)$ ($(P^T P)^{-1} P^T S$, white weights). For a model sampled in the pixel
+$S(t)$, $(P^T W P)^{-1} P^T W S$ with $W$ the white-noise weight $1/\sigma^2$
+of each detector (`GLSParameters.binned_weights`: "noise" by default, "equal"
+for $W = 1$, or one weight per detector name, e.g. per pair of detectors in a
+horn). For a model sampled in the pixel
 $S(t) = P\,\bar S$ and nothing changes where Q/U are solved; for alm
 interpolated at the pointing, $S(t) - P\,\bar S$ is the structure of the
 model below the pixel size, which the GLS would otherwise spread through the

@@ -58,8 +58,10 @@ arrays by label, add Gaussian priors on the amplitudes (the posterior; see
 {class}`~pysanepic.Prior` for `make_maps`). `apply_A` and `rhs` are not available with templates.
 `shared_covariance()` gives the covariance of the shared amplitudes (one PCG
 solve each), `set_templates` replaces the templates keeping the rest of the setup, and
-`binned(tod)` gives the binned (white-noise) map of timelines laid out like
-`pix`.
+`binned(tod, weights="equal")` gives the binned map of timelines laid out like
+`pix`, with all the samples alike, each chunk weighted by its white-noise
+level (`weights="noise"`, 1/σ² from `white_weights()`, the inverse PSD at high
+frequency) or by one weight per chunk (an array).
 
 ```python
 import numpy as np

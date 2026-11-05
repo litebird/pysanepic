@@ -562,6 +562,15 @@ class GLSParameters:
         in angle_dtype) and ~1.3-1.5x the PCG time with 1, ~1.15-1.3x more
         with 2 (no memory per sample); the white noise of I grows by <~1%.
         Polarization has no sub-pixel terms.
+    binned_weights : weights of the binned map of the sky model put back in
+        the maps (make_maps' `sky_model`; unused without it): "noise"
+        (default) weights each detector by its white-noise level 1 /
+        sigma^2 (the high-frequency inverse PSD of DetectorData.noise, see
+        GLS.white_weights), as the GLS weights its samples; "equal": every
+        sample alike (pysanepic <= 0.6.4); or {detector name: weight > 0}
+        for every DetectorData.name, e.g. one weight per pair of detectors
+        in a horn, 2 / (sigma_a^2 + sigma_b^2) for both, so that their
+        difference cancels the intensity in Q/U as in the pair.
     """
 
     chunk_s: float = 3600.0
@@ -581,10 +590,17 @@ class GLSParameters:
     template_dtype: type = np.float32
     sample_batch: int = 1
     subpixel_order: int = 0
+    binned_weights: str | dict = "noise"
 
     def __post_init__(self):
         if self.subpixel_order not in (0, 1, 2):
             raise ValueError(f"GLSParameters.subpixel_order must be 0, 1 or 2, not {self.subpixel_order!r}")
+        bw = self.binned_weights
+        if isinstance(bw, dict):
+            if not all(isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(v) and v > 0 for v in bw.values()):
+                raise ValueError("GLSParameters.binned_weights: the weights must be finite and > 0")
+        elif bw not in ("noise", "equal"):
+            raise ValueError(f"GLSParameters.binned_weights must be 'noise', 'equal' or {{detector name: weight}}, not {bw!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1129,6 +1145,13 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                          "(theta, phi), not pixels (or pass them as maps)")
     if calibration is not None and any(d.dipole is None for d in dets):
         raise ValueError("calibration needs DetectorData.dipole")
+    bw = None if params is None else params.binned_weights
+    if sky is not None and isinstance(bw, dict):  # checked on every rank before the collective GLS
+        missing = sorted({str(d.name) for d in dets if d.name not in bw})
+        if comm is not None:
+            missing = sorted(set().union(*comm.allgather(missing)))
+        if missing:
+            raise ValueError(f"GLSParameters.binned_weights has no weight for the detectors {missing} (DetectorData.name)")
     # shared amplitudes: one per template and detector (with the template), or one per template
     fitted = {k: t for k, t in tmpls.items() if not t.fixed}
     per_det = [k for k, t in fitted.items() if t.period_s is None and not t.common]
@@ -1399,6 +1422,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     flag_rng = np.random.default_rng(np.random.SeedSequence([0 if fill is None else fill.seed, rank]))
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
     pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
+    name_c = []  # the detector of each chunk (for binned_weights by name)
     gx_c, gy_c = [], []  # offsets from the pixel centers (subpixel_order >= 1)
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
@@ -1559,6 +1583,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 elif m:  # the padding must not use flagged TOD
                     tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
             tod_c.append(tod if m == 0 else _pad(tod, m, params.pad_fill))
+            name_c.append(d.name)
             if reuse:  # the GLS has pixels, angles and weights already
                 continue
             n = b - a + 2 * m
@@ -1677,7 +1702,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 fit.amp = fit.amp + info["shared_amplitudes"]
         fit.gains = gains if cal is not None else None
         if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky
-            m = m + gls.binned(model_c)
+            bw = params.binned_weights
+            if isinstance(bw, dict):  # every name checked in make_maps
+                bw = np.array([bw[n] for n in name_c], dtype=float)
+            m = m + gls.binned(model_c, weights=bw)
 
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)
