@@ -907,8 +907,9 @@ class GLS:
         whose matrix sum_t (1, gx, gy)^T (1, gx, gy) has a reciprocal
         condition number >= `min_grad_rcond` (elsewhere Ix = Iy = 0: the
         mean of the samples, as without offsets).
-    hessian : bool
-        With `offsets`, also the second order: m_p + Ix gx + Iy gy + Hxx
+    subpixel_order : 0, 1, 2 or None
+        The order of the sub-pixel terms of I: 0 none (`offsets` unused), 1
+        the gradient above, 2 also the second order: m_p + Ix gx + Iy gy + Hxx
         (gx^2 - 1/12) + Hxy gx gy + Hyy (gy^2 - 1/12), three more components
         (Hxx = Ixx / 2, Hxy = Ixy, Hyy = Iyy / 2, last in the maps). The
         quadratic terms average to zero over a uniformly covered square pixel
@@ -920,7 +921,7 @@ class GLS:
         with a gradient, at least `min_hess_hits` hits and a reciprocal
         condition number of the white-noise block of (1, gx, gy, the three
         quadratic weights), scaled to a unit diagonal, >= `min_hess_rcond`
-        (elsewhere 0).
+        (elsewhere 0). None (default): 1 with `offsets`, 0 without.
     fft_lengths : int or list of int (one per chunk), or None
         Length m >= ns of the FFT used to apply N^-1 to each chunk (the chunk is
         zero-extended and the result truncated: the weight is the ns x ns block
@@ -1024,7 +1025,7 @@ class GLS:
         counts use identity. No dense basis is stored in either case.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, hessian=False, min_hess_hits=20, min_hess_rcond=1e-2):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2):
         self.comm = comm
         if flag_method not in ("marginalize", "act", "fill"):
             raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'fill' (offsets use repeated negative pixel labels)")
@@ -1119,9 +1120,13 @@ class GLS:
         self._shgroups = [np.asarray(g, dtype=np.int64) for g in shared_groups or []]
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self.pol = psi is not None or pol_angles is not None
-        if hessian and offsets is None:
-            raise ValueError("GLS: hessian needs offsets")
-        self.grad = 0 if offsets is None else 2 if hessian else 1  # order of the sub-pixel terms
+        if subpixel_order is None:
+            subpixel_order = 0 if offsets is None else 1
+        if subpixel_order not in (0, 1, 2):
+            raise ValueError(f"GLS.subpixel_order must be 0, 1 or 2, not {subpixel_order!r}")
+        if subpixel_order and offsets is None:
+            raise ValueError("GLS: subpixel_order >= 1 needs offsets")
+        self.grad = subpixel_order  # order of the sub-pixel terms
         self.npol = 3 if self.pol else 1  # I/Q/U or I, then the gradient Ix, Iy and the Hessian with offsets
         self.ncomp = self.npol + (0, 2, 5)[self.grad]
         self._ncov = 1 + self.ncomp * (self.ncomp + 1) // 2  # columns of the coverage (see _coverage)

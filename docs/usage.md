@@ -374,7 +374,7 @@ calibration the dipole is not used.
 
 The sky model removes only the structure below the pixel size of the model;
 that of the true sky minus the model still leaks through the 1/f weights. With
-`GLSParameters(subpixel_gradient=True)` each sample sees, instead of the value
+`GLSParameters(subpixel_order=1)` each sample sees, instead of the value
 of its pixel, $I_p + \nabla I_p \cdot (x - x_p)$: the I map gets a gradient
 per pixel (two more unknowns; Q/U have none, their structure is orders of
 magnitude fainter), fitted with the offsets of each sample from the center of
@@ -384,13 +384,16 @@ its pixel. The leakage drops to the second order, $\sim \nabla^2 I\,
 ACT (Naess), local to each pixel, so the block preconditioner is still exact.
 
 - **Output**: the maps no longer depend, to first order, on where the
-  samples fall in each pixel. They still have the **pixel window**: the
-  linear term averages to zero over a pixel, so the value at the center and
-  the mean over the pixel differ only at second order, which the gradient
-  does not model. Compare them with the input through the pixel window, as
-  the maps without the gradient. `MapResult.gradient` (2, npix) holds the
+  samples fall in each pixel. The reported I is the mean of the fitted model
+  over the pixel, $I_p + I_x\langle x\rangle + I_y\langle y\rangle$ with the
+  geometric first moments of each HEALPix pixel (see the Hessian below; they
+  are ~1e-4 pixel sides at nside 512, up to 0.09 in a few pixels near the
+  poles). Compare the maps with the input averaged over each pixel (e.g.
+  `hp.ud_grade` from nside x 8). `MapResult.gradient` (2, npix) holds the
   gradient along $\theta$ and $\phi$ in K per pixel side
-  $\sqrt{4\pi/N_\text{pix}}$.
+  $\sqrt{4\pi/N_\text{pix}}$. The G100 numbers below compare the constant
+  term $I_p$ (the convention before the recentring) with the input through
+  the pixel window.
 - **What it removes**: on G100 (16 detectors, 1 year, 1/f noise at
   net_scale 0.01, CMB and foregrounds through circular Gaussian beams of
   22.6', nside 512; e2e/test_pysanepic_subgrad_1f) the leakage of the
@@ -423,7 +426,7 @@ $\tfrac12 \sum_{ij} \partial_i\partial_j I\,(\langle\delta_i\delta_j\rangle_\tex
 - \langle\delta_i\delta_j\rangle_\text{uniform})$. In the G100 run above
 (e2e/test_pysanepic_subpix2nd) this prediction reproduces the TT residual at
 $\ell \sim 200-600$ of the maps with the gradient (correlation 0.99998).
-`GLSParameters(subpixel_hessian=True)` (with `subpixel_gradient`) fits it:
+`GLSParameters(subpixel_order=2)` fits it:
 each sample sees
 
 $$I_p + I_x x + I_y y + \tfrac12 I_{xx} (x^2 - \tfrac1{12}) + I_{xy}\, x y

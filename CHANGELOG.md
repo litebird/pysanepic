@@ -4,22 +4,18 @@
 
 Changes on `main` that are not in a release yet.
 
-- Sub-pixel gradient pointing, `GLSParameters(subpixel_gradient=True)`
-  (GLS `offsets`): an I gradient per pixel fitted with the offsets of the
-  samples from the pixel centers, so the structure of the sky below the
-  pixel size leaks to second order only (the pixel window stays: it is
-  second order), and `MapResult.gradient` the gradient. The per-pixel
-  kernels, coverage, block preconditioner and binned maps take any set of
-  pointing weights (1, c2, s2, gx, gy); `_block_circulant` sums each pixel
-  in O(hits^2 ncomp) instead of O(hits^2 ncomp^2).
-
-- Sub-pixel Hessian, `GLSParameters(subpixel_hessian=True)` (GLS
-  `hessian`): with the gradient, also the second derivatives of I per pixel;
-  the error of the structure below the pixel size drops to third order and
-  I is the mean of the sky over each pixel, from the geometric moments of
-  the HEALPix pixels (compare with the input through `hp.pixwin`).
-  `MapResult.hessian` the second derivatives. The docstring of
-  `MapResult.gradient` now says hp.UNSEEN (not 0) where it is not solved.
+- Sub-pixel terms of I, `GLSParameters(subpixel_order=1 or 2)` (GLS
+  `offsets`, `subpixel_order`): the gradient (1), and the Hessian too (2),
+  of I per pixel, fitted with the offsets of the samples from the pixel
+  centers, so the structure of the sky below the pixel size leaks to second
+  (third) order only. I is the mean of the fitted model over each pixel,
+  from the geometric moments of the HEALPix pixels: compare with the input
+  averaged over each pixel, not through `hp.pixwin`. `MapResult.gradient`
+  and `MapResult.hessian` hold the derivatives (hp.UNSEEN where not
+  solved). The per-pixel kernels, coverage, block preconditioner and binned
+  maps take any set of pointing weights (1, c2, s2, gx, gy and the
+  quadratic ones); `_block_circulant` sums each pixel in O(hits^2 ncomp)
+  instead of O(hits^2 ncomp^2).
 
 - Reduce GLS memory: coverage workers share a 512 MiB accumulator budget
   per process (at least one full-sky array), with an in-place reduction;

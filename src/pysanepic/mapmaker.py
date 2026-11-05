@@ -352,19 +352,19 @@ class MapResult:
         number of CG iterations of a gap fill (over the chunks or DetectorGroup
         chunks of every rank; with calibration, of the last pass), to compare
         with GapFill.maxiter. None otherwise.
-    gradient : with GLSParameters.subpixel_gradient, (2, npix) the gradient
-        of I in each pixel, in K per pixel side sqrt(4 pi / npix), along
-        theta (south) and phi (east) at the center of the pixel; hp.UNSEEN
-        where it is not solved (see GLS `offsets`) or I is not. None
-        otherwise.
-    hessian : with GLSParameters.subpixel_hessian, (3, npix) the second
+    gradient : with GLSParameters.subpixel_order >= 1, (2, npix) the
+        gradient of I in each pixel, in K per pixel side sqrt(4 pi / npix),
+        along theta (south) and phi (east) at the center of the pixel;
+        hp.UNSEEN where it is not solved (see GLS `offsets`) or I is not.
+        Where it is, I is the mean of the sky over the pixel, to first order
+        (to second order with the Hessian): compare with the input averaged
+        over each pixel (e.g. hp.ud_grade from a finer map); hp.pixwin, the
+        window averaged over the pixels, misses the shapes of the HEALPix
+        pixels. None otherwise.
+    hessian : with GLSParameters.subpixel_order = 2, (3, npix) the second
         derivatives of I (Ixx, Ixy, Iyy), in K per pixel side^2, along the
         axes of `gradient`; hp.UNSEEN where they are not solved (see GLS
-        `hessian`) or I is not. Where they are, I is the mean of the sky over
-        the pixel, to second order: compare with the input averaged over each
-        pixel (e.g. hp.ud_grade from a finer map); hp.pixwin, the window
-        averaged over the pixels, misses the shapes of the HEALPix pixels.
-        None otherwise.
+        `subpixel_order`) or I is not. None otherwise.
     """
 
     maps: np.ndarray
@@ -548,24 +548,20 @@ class GLSParameters:
         before it is processed (a generator yields `sample_batch` items at
         a time). The samples are the same within the epsilon of the
         interpolation (1e-10, or 1e-6 for complex64 alm).
-    subpixel_gradient : sub-pixel gradient pointing: each sample sees I at
-        the center of its pixel plus the gradient of I times its offset from
-        the center (GLS `offsets`), two more unknowns per pixel. The maps no
-        longer depend, to first order, on where the samples fall in the
-        pixels, and the error of the structure of the sky below the pixel
-        size, in the maps and in the gains, drops to second order (~ the
-        curvature of the sky times the pixel size^2). The pixel window stays
-        (it is second order: compare with the input through it). Needs a
-        Pointing with angles. Costs 8 bytes per sample (the offsets in
-        angle_dtype) and ~1.3-1.5x the PCG time. Polarization has no
-        gradient.
-    subpixel_hessian : with subpixel_gradient, also the second order: the
-        Hessian of I per pixel, three more unknowns (GLS `hessian`). The error
-        of the structure below the pixel size drops to third order and I is
-        the mean of the sky over each pixel (the pixel window of its own
-        shape, whatever the distribution of the samples), from the
-        geometric moments of the pixel. Costs no memory per sample and
-        ~1.15x the PCG time; the white noise of I grows by <~1%.
+    subpixel_order : 0, 1 or 2, the sub-pixel terms of I (GLS `offsets`,
+        `subpixel_order`). 0 (default): none, each pixel is a constant and the
+        maps are means of their samples, which depend on where the samples
+        fall in the pixels. 1: the gradient of I per pixel, two more unknowns:
+        the error of the structure of the sky below the pixel size, in the
+        maps and in the gains, drops to second order (~ the curvature of the
+        sky times the pixel size^2). 2: also the Hessian, three more unknowns:
+        the error drops to third order. With 1 or 2, I is the mean of the
+        fitted model over each pixel, from the geometric moments of the
+        HEALPix pixels (compare with the input averaged over each pixel).
+        Needs a Pointing with angles. Costs 8 bytes per sample (the offsets
+        in angle_dtype) and ~1.3-1.5x the PCG time with 1, ~1.15-1.3x more
+        with 2 (no memory per sample); the white noise of I grows by <~1%.
+        Polarization has no sub-pixel terms.
     """
 
     chunk_s: float = 3600.0
@@ -584,12 +580,11 @@ class GLSParameters:
     coarse_nside: int | None = 0
     template_dtype: type = np.float32
     sample_batch: int = 1
-    subpixel_gradient: bool = False
-    subpixel_hessian: bool = False
+    subpixel_order: int = 0
 
     def __post_init__(self):
-        if self.subpixel_hessian and not self.subpixel_gradient:
-            raise ValueError("GLSParameters.subpixel_hessian needs subpixel_gradient=True")
+        if self.subpixel_order not in (0, 1, 2):
+            raise ValueError(f"GLSParameters.subpixel_order must be 0, 1 or 2, not {self.subpixel_order!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -856,7 +851,7 @@ def _pixel_offsets(pix, loc, nside, dtype, nthreads):
 
 def _subpixel_tod(sub, pix, gx, gy):
     """The sub-pixel terms of the maps `sub` (2 or 5, npix), the GLS
-    components after I/Q/U (see GLS `offsets`, `hessian`), UNSEEN as 0."""
+    components after I/Q/U (see GLS `offsets`, `subpixel_order`), UNSEEN as 0."""
     g = sub[:, pix]
     g[g == hp.UNSEEN] = 0.0
     tod = g[0] * gx + g[1] * gy
@@ -891,14 +886,17 @@ def _pixel_moments(nside, k=8, nthreads=1):
 
 def _pixel_mean_shift(nside, gradient, hessian, nthreads):
     """I_mean - I_p per pixel (npix,): the geometric centring of the sub-pixel
-    terms (MapResult.hessian), Ix <x> + Iy <y> + Ixx (<x^2> - 1/12) / 2 + Ixy
-    <x y> + Iyy (<y^2> - 1/12) / 2, the moments over the pixel (see
-    _pixel_moments); 0 where the Hessian is not solved."""
+    terms (MapResult.gradient, .hessian or None), Ix <x> + Iy <y> where the
+    gradient is solved, + Ixx (<x^2> - 1/12) / 2 + Ixy <x y> + Iyy (<y^2> -
+    1/12) / 2 where the Hessian is, the moments over the pixel (see
+    _pixel_moments)."""
     mom = _pixel_moments(nside, nthreads=nthreads)
-    solved = hessian[0] != hp.UNSEEN
-    shift = np.zeros(hessian.shape[1])
-    shift[solved] = (gradient[0] * mom[0] + gradient[1] * mom[1] + hessian[0] * (mom[2] - _Q2) / 2 + hessian[1] * mom[3]
-                     + hessian[2] * (mom[4] - _Q2) / 2)[solved]
+    shift = np.zeros(gradient.shape[1])
+    solved = gradient[0] != hp.UNSEEN
+    shift[solved] = (gradient[0] * mom[0] + gradient[1] * mom[1])[solved]
+    if hessian is not None:
+        solved = hessian[0] != hp.UNSEEN
+        shift[solved] += (hessian[0] * (mom[2] - _Q2) / 2 + hessian[1] * mom[3] + hessian[2] * (mom[4] - _Q2) / 2)[solved]
     return shift
 
 
@@ -1401,7 +1399,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     flag_rng = np.random.default_rng(np.random.SeedSequence([0 if fill is None else fill.seed, rank]))
     n_virtual = 0  # padding margins on this rank; labels are unique across ranks
     pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
-    gx_c, gy_c = [], []  # offsets from the pixel centers (subpixel_gradient)
+    gx_c, gy_c = [], []  # offsets from the pixel centers (subpixel_order >= 1)
     weights = {}  # chunks with the same length and noise share one array
     dtype = params.angle_dtype
     npol = 3 if params.pol else 1
@@ -1431,10 +1429,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         else:
             # the (theta, phi) only for alm models or offsets, not to keep them otherwise
             pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads,
-                                                 loc=(sample and fit.alm) or params.subpixel_gradient)
-        if params.subpixel_gradient:
+                                                 loc=(sample and fit.alm) or params.subpixel_order > 0)
+        if params.subpixel_order:
             if loc is None:
-                raise ValueError("GLSParameters.subpixel_gradient needs a Pointing with angles (theta, phi), not pixels")
+                raise ValueError("GLSParameters.subpixel_order needs a Pointing with angles (theta, phi), not pixels")
             gx, gy = _pixel_offsets(pix, loc, nside, dtype, nthreads)
         fs = d.sampling_rate_hz
         m = int(round(params.pad_s * fs))
@@ -1501,7 +1499,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 if fit.residual is not None:
                     with numba_threads(nthreads):
                         _axpy(tmpl, 1.0, _project_maps(fit.residual[:npol], pix, angle, d.pol_efficiency, nthreads))
-                        if params.subpixel_gradient:
+                        if params.subpixel_order:
                             _axpy(tmpl, 1.0, _subpixel_tod(fit.residual[npol:], pix, gx, gy))
             if cal is not None:
                 tod_all = np.empty(len(d.tod))
@@ -1584,7 +1582,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     g = np.zeros(n, dtype)
                     g[m : n - m] = d.pol_efficiency
                     gamma_c.append(g)
-            if params.subpixel_gradient:
+            if params.subpixel_order:
                 gx_c.append(_padded(gx, a, b, m, dtype))
                 gy_c.append(_padded(gy, a, b, m, dtype))
             p = pix[a:b].astype(np.int32)
@@ -1651,7 +1649,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
         gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior,
-                       params, nside, comm, nthreads, fit, fs_c, (gx_c, gy_c) if params.subpixel_gradient else None)
+                       params, nside, comm, nthreads, fit, fs_c, (gx_c, gy_c) if params.subpixel_order else None)
         if fit is not None and fit.fit:
             fit.gls = gls
     del pix_c, a2_c, gamma_c, gx_c, gy_c
@@ -1685,11 +1683,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     n = min(npix, gls.nobs)
     hit_map[:n] = gls.full(gls.hits)[:n]
     maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
-    maps, gradient = (maps[:npol], maps[npol:]) if params.subpixel_gradient else (maps, None)
-    hessian = None
-    if params.subpixel_hessian:
-        gradient, hessian = gradient[:2], gradient[2:]
-        hessian = np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian * np.array([2.0, 1.0, 2.0])[:, None])
+    sub, maps = maps[npol:], maps[:npol]
+    gradient = sub[:2] if params.subpixel_order else None
+    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * np.array([2.0, 1.0, 2.0])[:, None]) if params.subpixel_order > 1 else None
+    if gradient is not None:
         maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
     if verbose and rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
@@ -1748,7 +1745,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         flag_sampling_rate_hz=fs_c if isinstance(method, ACTCuts) else None,
         act_ncoeff=method.ncoeff if isinstance(method, ACTCuts) else None,
         offsets=offsets,
-        hessian=params.subpixel_hessian,
+        subpixel_order=params.subpixel_order,
     )
 
 
@@ -1756,7 +1753,7 @@ def _model_tod(d, maps, nside, coordinates, nthreads, gradient=None, hessian=Non
     """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0),
     with the sub-pixel `gradient` and `hessian` of I (MapResult), if any."""
     pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=gradient is not None)
-    if hessian is not None:
+    if gradient is not None:
         maps = maps.copy()
         maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
     tod = _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
