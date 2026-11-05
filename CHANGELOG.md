@@ -1,8 +1,6 @@
 # Changelog
 
-## HEAD
-
-Changes on `main` that are not in a release yet.
+## 0.6.4 (2026-11-05)
 
 - Sub-pixel terms of I, `GLSParameters(subpixel_order=1 or 2)` (GLS
   `offsets`, `subpixel_order`): the gradient (1), and the Hessian too (2),
@@ -15,7 +13,7 @@ Changes on `main` that are not in a release yet.
   solved). The per-pixel kernels, coverage, block preconditioner and binned
   maps take any set of pointing weights (1, c2, s2, gx, gy and the
   quadratic ones); `_block_circulant` sums each pixel in O(hits^2 ncomp)
-  instead of O(hits^2 ncomp^2).
+  instead of O(hits^2 ncomp^2). (#73)
 
 - Reduce GLS memory: coverage workers share a 512 MiB accumulator budget
   per process (at least one full-sky array), with an in-place reduction;
@@ -24,6 +22,7 @@ Changes on `main` that are not in a release yet.
   and accumulation order are retained. Prior shift vectors are allocated
   only for nonzero means and released before PCG, keeping only amplitude
   means during iterations. Public APIs and the statistical model are unchanged.
+  (#72)
 
 - Gaussian priors on the fitted systematics: `Prior(sigma=..., mean=...)`,
   passed as `Template(prior=...)` for template amplitudes and
@@ -36,7 +35,7 @@ Changes on `main` that are not in a release yet.
   `GLS.set_templates` take `(precision, mean)` arrays, added to the
   operator, the right-hand side and the preconditioner. `solve()` works on
   the deviations from the means, so that with tight priors `precision * mean`
-  does not dominate the PCG stopping criterion before the maps converge.
+  does not dominate the PCG stopping criterion before the maps converge. (#71)
 
 ## 0.6.3 (2026-11-01)
 
@@ -401,27 +400,27 @@ Changes on `main` that are not in a release yet.
   `sanePS` of the IAS SANEPIC). The result has the own noise under each name
   and the list of `CommonMode` under the tuple of the names. On G100 the
   couplings are found within 0.1% and the map with the estimate equals that
-  with the true model within 1% of the noise.
+  with the true model within 1% of the noise. (#32)
 - Two-level preconditioner, `GLSParameters.coarse_nside` (and `GLS(coarse=...)`):
   the PCG also solves exactly for the I map at a coarse resolution, which
   takes care of the slow large-scale modes. With a common mode `coarse_nside=1`
   halves the iterations (46 → 21) and the GLS time drops by 33% on G100. The
   default stays 0 (off): without common modes the setup costs more than the
-  iterations it saves.
+  iterations it saves. (#31)
 - Correlated noise: `DetectorGroup(detectors, modes=[CommonMode(coupling,
   noise)])` for detectors observed at the same times that share common
   modes, $N = D + U \Lambda U^T$ per frequency, applied with the Woodbury
-  identity one detector at a time. `GLS` has a `common_modes` argument.
+  identity one detector at a time. `GLS` has a `common_modes` argument. (#30)
 - `estimate_noise(data, result)`: the noise spectrum of each detector from the
   residual of a first map, as a `TabulatedNoise` (binned periodogram) or, with
   `fit="toast"`/`"keshner"`, a fitted `OneOverFNoise`. `DetectorData.name`
-  groups the `DetectorData` of a detector (also across MPI processes).
+  groups the `DetectorData` of a detector (also across MPI processes). (#29)
 - The FFT work buffers of $N^{-1}$ are allocated once and reused (−9% on the
-  FFTs on G100).
+  FFTs on G100). (#28)
 - `GLSParameters.fft_dtype` (and `GLS(fft_dtype=...)`): `np.float32` runs the
   FFTs on the PCG search directions in single precision (~45% faster FFTs,
   15–21% less GLS time on G100), with the right-hand side and the true
-  residual in float64. The default stays `np.float64`.
+  residual in float64. The default stays `np.float64`. (#28)
 
 ## 0.3.0 (2026-10-15)
 
@@ -430,11 +429,12 @@ Changes on `main` that are not in a release yet.
   `alpha`, `fmin_hz`: `OneOverFNoise(net_ukrts, fknee_hz, alpha, fmin_hz,
   model)` or `TabulatedNoise(freqs_hz, psd)`. Each checks its values and gives
   the inverse PSD of a chunk with `weights(ns, fs)`; one object can serve all
-  the time spans of a detector.
+  the time spans of a detector. (#22, #23)
 - `OneOverFNoise.model="keshner"` (the spectrum of litebird_sim's noise with
   `engine="ducc"`) besides the default `"toast"`; `TabulatedNoise`, a
   tabulated one-sided PSD in K²/Hz. For `GLS`, `one_over_f_weights` has a
   `model` argument and `psd_weights` computes the weights of a tabulated PSD.
+  (#20, #22)
 - Flagged samples: `DetectorData.flags` (boolean, `True` = excluded). Their TOD
   is not used (it may be NaN) and they are not hits. `GLSParameters.flag_method`
   chooses `"marginalize"` (default: one unknown per sample, the exact GLS
@@ -442,17 +442,18 @@ Changes on `main` that are not in a release yet.
   longer than `GLSParameters.split_gap_s` (default 300 s) split the chunk and
   are dropped, so that long gaps do not slow down the PCG. In `GLS`, negative
   pixels mark flagged samples, fitted by unknowns local to each process.
+  (#21, #25)
 - FFTs on fast lengths: `make_maps` applies $N^{-1}$ to each chunk with an FFT
   of the smallest even length with small prime factors (`fast_fft_length`),
   zero-extending the chunk. Chunks split at gaps, or observations of awkward
   length, were up to 7 times slower; the maps of chunks that already had a
   fast length (e.g. one day at 75 Hz) do not change. `GLS` has a
-  `fft_lengths` argument.
+  `fft_lengths` argument. (#24)
 
 ## 0.2.1
 
 Packaging for PyPI: metadata, source distribution without the C++ code, and
-publication from GitHub releases. No code changes.
+publication from GitHub releases. No code changes. (#19)
 
 ## 0.2.0 (2026-10-14)
 
