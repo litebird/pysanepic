@@ -455,6 +455,21 @@ from the offsets (no memory per sample).
   0.055 to 0.014 µK rms at |b| > 20° (TT at $\ell$ 200-600 from 3.7e-8 to
   6.4e-9 µK², below the noise of the 1/f GLS map, 1.0e-8); the 1/f GLS map
   is then the pixel means plus its noise.
+- **With all systematics and calibration** (G100, the configuration of
+  master_16det_ref: 16 detectors, 1 year, beams, bandpasses, angles, pointing
+  offsets, gain drifts, templates; jobs 23140001, 23192046, 23199705), I
+  minus the input averaged over each pixel, rms at |b| > 20° / < 20°:
+
+  | | none | gradient | gradient + Hessian |
+  |---|---|---|---|
+  | I [µK] | 0.183 / 0.584 | 0.074 / 0.070 | 0.052 / 0.058 |
+  | TT $\ell$ 200-600 [µK²] | 1.5e-7 | 4.6e-8 | 1.6e-8 |
+  | gain fit / true - 1 | 3.2e-6 | 4.5e-7 | 4.4e-7 |
+  | GLS time [s] | 7316 | 6592 | 8505 |
+
+  With the Hessian the error of I is the white noise (0.050 µK expected)
+  and its TT the noise spectrum at every $\ell$; Q/U and the templates do
+  not change.
 - **Where**: in pixels with a gradient, at least 20 hits and a reciprocal
   condition number of the white-noise block of
   $(1, x, y, x^2 - \tfrac1{12}, xy, y^2 - \tfrac1{12})$, scaled to a unit
@@ -462,9 +477,10 @@ from the offsets (no memory per sample).
   the pixels in a LiteBIRD year at nside 512; elsewhere the pixel has the
   gradient only.
 - **Costs**: the noise variance of I x1.0005 (median) to x1.013 (99th
-  percentile) that with the gradient only (1/f GLS, G100); ~1.15x the GLS
-  time (a larger PCG product and preconditioner, 8x8 blocks with
-  polarization).
+  percentile) that with the gradient only (1/f GLS, G100); a larger PCG
+  product and preconditioner (8x8 blocks with polarization): 1.15x the GLS
+  time of the gradient only with 1/f noise, 1.29x with calibration (the PCG
+  of the second calibration iteration took 65 iterations instead of 34).
 
 ## Templates
 
