@@ -12,6 +12,7 @@ chunks and noise weights itself, with one set of conventions documented here.
 import functools
 import time
 import warnings
+from types import SimpleNamespace
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -1137,29 +1138,8 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                          "(theta, phi), not pixels (or pass them as maps)")
     if calibration is not None and any(d.dipole is None for d in dets):
         raise ValueError("calibration needs DetectorData.dipole")
-    # shared amplitudes: one per template and detector (with the template), or one per template
+    amplitudes = _Amplitudes.build(tmpls, calibration, dets, comm)
     fitted = {k: t for k, t in tmpls.items() if not t.fixed}
-    per_det = [k for k, t in fitted.items() if t.period_s is None and not t.common]
-    if per_det and any(d.name is None for d in dets):
-        raise ValueError(f"templates {per_det} have one amplitude per detector: they need DetectorData.name")
-    names = {k: sorted({d.name for d in dets if k in skies or k in (d.templates or {})}) for k in per_det}
-    if comm is not None:
-        names = {k: sorted(set().union(*comm.allgather(v))) for k, v in names.items()}
-    labels = [(k, n) for k, t in fitted.items() if t.period_s is None for n in names.get(k, [None])]
-    index = {x: i for i, x in enumerate(labels)}
-    # the priors: (precision, mean) of the shared amplitudes; those of the local ones checked here
-    prior = None
-    if any(fitted[k].prior is not None for k, _ in labels):
-        prior = np.array([(0.0, 0.0) if fitted[k].prior is None else fitted[k].prior._terms(n, 0.0, f"templates[{k!r}].prior")
-                          for k, n in labels]).T
-    for k, t in fitted.items():
-        if t.period_s is not None and t.prior is not None:
-            for d in dets:
-                if k in skies or k in (d.templates or {}):
-                    t.prior._terms(d.name, 0.0, f"templates[{k!r}].prior")
-    if calibration is not None and calibration.prior is not None:
-        for d in dets:
-            calibration.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
     mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
     # a template without a mask has that of the gains; equal masks are one array (and one test per sample)
     masks = {k: mask_gain if t.mask is None else _mask(t.mask, nside, f"templates[{k!r}].mask")
@@ -1174,9 +1154,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         warnings.warn("templates with a mask different from that of the gains: their samples are calibrated with "
                       "the gains of the previous iteration and the calibration converges slower (see "
                       "CalibrationParameters.mask)", stacklevel=2)
-    fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, index=index, amp=np.zeros(len(index)), prior=prior,
-               groups=[[index[k, n] for n in names[k]] for k in per_det if tmpls[k].sum_zero],
-               local={k: None for k, t in tmpls.items() if t.period_s is not None},
+    fit = _Fit(calibration=calibration, sky=sky, templates=tmpls, skies=skies, amplitudes=amplitudes,
                mask_gain=mask_gain, masks=masks,
                cache={} if calibration is not None and calibration.cache_model else None)
     n_cal = 0
@@ -1184,7 +1162,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
         n_cal += 1
         if calibration is not None:
-            dg = fit.dg_max if comm is None else max(comm.allgather(fit.dg_max))
+            dg = amplitudes.dg_max if comm is None else max(comm.allgather(amplitudes.dg_max))
             if verbose and (comm is None or comm.rank == 0):
                 print(f"calibration iteration {n_cal}: max |dg| = {dg:.3e}")
             if calibration.gain_tol is not None and dg < calibration.gain_tol:
@@ -1192,28 +1170,215 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
             if n_cal == 1 and calibration.n_iter > 1:
                 _mask_unsolved_pol(fit, res, verbose and (comm is None or comm.rank == 0))
     cov = None
-    if template_covariance and index:
+    if template_covariance and amplitudes.index:
         p = GLSParameters() if params is None else params
         if calibration is not None and calibration.covariance_fixed_gains and fit.no_gains is not None:
             fit.gls.set_templates(*fit.no_gains)  # collective
-        cov = {"labels": labels, "matrix": fit.gls.shared_covariance(tol=p.covariance_tol, maxiter=p.maxiter, verbose=verbose)}
+        cov = {"labels": amplitudes.labels, "matrix": fit.gls.shared_covariance(tol=p.covariance_tol, maxiter=p.maxiter, verbose=verbose)}
     if fit.mask_gain is not None or any(m is not None for m in fit.masks.values()):  # samples may have been left out
         fit.fit, fit.gls = False, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
-    out = {}
-    for k, t in fitted.items():
-        if t.period_s is not None:
-            out[k] = fit.local[k]
-        elif t.common:
-            out[k] = float(fit.amp[index[k, None]])
-        else:
-            out[k] = {n: float(fit.amp[index[k, n]]) for n in names[k]}
-    res.templates = out or None
+    res.templates = amplitudes.result_templates()
     res.template_covariance = cov
     res.calibration_iterations = None if calibration is None else n_cal
     res.calibration = calibration
     res.template_definitions = tmpls or None
     return res
+
+
+class _Amplitudes:
+    """The fitted amplitudes of make_maps:
+
+    - the gains (calibration), one per DetectorData and gain period;
+    - the shared amplitudes of the templates with period_s None, one per
+      template and detector name (or one per template with common), the same
+      on every MPI process; `labels` [(name, detector name or None)];
+    - the local amplitudes of the templates with period_s, one per
+      DetectorData and period.
+
+    The DetectorData are those of make_maps, in the same order (groups
+    expanded): `j` is the position of one among them. The current values are
+    read by _TODModel; in each pass of the GLS, the labels of the local
+    amplitudes (gains first) are assigned DetectorData by DetectorData
+    (start_pass, add), with the priors linearized around the current values,
+    and a solve updates them (update)."""
+
+    def __init__(self, templates, calibration, labels, shared=None, prior=None, groups=(), local=None, gains=None):
+        self.templates = templates  # name -> Template
+        self.calibration = calibration
+        self.labels = labels
+        self.index = {x: i for i, x in enumerate(labels)}
+        self.shared = np.zeros(len(labels)) if shared is None else shared
+        self.prior = prior  # (precision, mean) of the shared amplitudes (2, n), or None
+        self.groups = list(groups)  # shared amplitudes summing to zero
+        # name -> amplitudes per period, one array per DetectorData (None: zeros)
+        self.local = {k: None for k, t in templates.items() if t.period_s is not None} if local is None else local
+        self.gains = gains  # one array per DetectorData (None: ones)
+        self.dg_max = 0.0  # largest |dg| of the last update on this rank
+        self._pass = None
+
+    @classmethod
+    def build(cls, templates, calibration, dets, comm):
+        """The amplitudes of make_maps for `templates` and `calibration`, all 0
+        (gains 1), with the shared labels of the detectors `dets` of all the
+        MPI processes; the priors are checked."""
+        fitted = {k: t for k, t in templates.items() if not t.fixed}
+        per_det = [k for k, t in fitted.items() if t.period_s is None and not t.common]
+        if per_det and any(d.name is None for d in dets):
+            raise ValueError(f"templates {per_det} have one amplitude per detector: they need DetectorData.name")
+
+        def has(k, d):
+            return templates[k].sky is not None or k in (d.templates or {})
+
+        names = {k: sorted({d.name for d in dets if has(k, d)}) for k in per_det}
+        if comm is not None:
+            names = {k: sorted(set().union(*comm.allgather(v))) for k, v in names.items()}
+        labels = [(k, n) for k, t in fitted.items() if t.period_s is None for n in names.get(k, [None])]
+        index = {x: i for i, x in enumerate(labels)}
+        # the priors: (precision, mean) of the shared amplitudes; those of the local ones checked here
+        prior = None
+        if any(fitted[k].prior is not None for k, _ in labels):
+            prior = np.array([(0.0, 0.0) if fitted[k].prior is None else fitted[k].prior._terms(n, 0.0, f"templates[{k!r}].prior")
+                              for k, n in labels]).T
+        for k, t in fitted.items():
+            if t.period_s is not None and t.prior is not None:
+                for d in dets:
+                    if has(k, d):
+                        t.prior._terms(d.name, 0.0, f"templates[{k!r}].prior")
+        if calibration is not None and calibration.prior is not None:
+            for d in dets:
+                calibration.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
+        groups = [[index[k, n] for n in names[k]] for k in per_det if templates[k].sum_zero]
+        return cls(templates, calibration, labels, prior=prior, groups=groups)
+
+    @classmethod
+    def from_result(cls, result):
+        """The final amplitudes of a MapResult of make_maps."""
+        templates = dict(result.template_definitions or {})
+        amps = result.templates or {}
+        labels, shared = [], []
+        for k, t in templates.items():
+            if t.fixed or t.period_s is not None or k not in amps:
+                continue
+            a = amps[k] if t.common else None
+            for n, v in ([(None, a)] if t.common else amps[k].items()):
+                labels.append((k, n))
+                shared.append(v)
+        local = {k: amps.get(k) for k, t in templates.items() if t.period_s is not None}
+        gains = result.gains if result.calibration is not None else None
+        return cls(templates, result.calibration, labels, np.array(shared, dtype=float), local=local, gains=gains)
+
+    @property
+    def count(self):
+        """The number of DetectorData of the gains or amplitudes per period, or None."""
+        if self.calibration is not None and self.gains is not None:
+            return len(self.gains)
+        return next((len(v) for v in self.local.values() if v is not None), None)
+
+    # the current values
+
+    def gain(self, d, j):
+        """(gains, period of each sample) of DetectorData d at j, or None without calibration."""
+        if self.calibration is None:
+            return None
+        p = _periods(len(d.tod), d.sampling_rate_hz, self.calibration.gain_period_s)
+        return (np.ones(p[-1] + 1) if self.gains is None else self.gains[j]), p
+
+    def shared_label(self, k, d):
+        """The label of the shared amplitude of template k for d, or None."""
+        return self.index.get((k, None if self.templates[k].common else d.name))
+
+    def shared_value(self, k, d):
+        """The shared amplitude of template k for d, or None."""
+        i = self.shared_label(k, d)
+        return None if i is None else float(self.shared[i])
+
+    def local_value(self, k, d, j):
+        """(amplitudes, period of each sample) of template k for d at j (empty: no amplitudes)."""
+        p = _periods(len(d.tod), d.sampling_rate_hz, self.templates[k].period_s)
+        amps = self.local[k]
+        return (np.zeros(p[-1] + 1) if amps is None else amps[j]), p
+
+    # a pass of the GLS
+
+    def start_pass(self, fit):
+        """A new pass: labels from 0; with `fit` False the amplitudes are fixed (no priors, no update)."""
+        cal = self.calibration
+        priors = fit and ((cal is not None and cal.prior is not None)
+                          or any(self.templates[k].prior is not None for k in self.local))
+        # gains and (current amplitudes, first label) of each DetectorData; (precision, mean) of the
+        # local amplitudes in the order of their labels, with a prior on some of them
+        self._pass = SimpleNamespace(fit=fit, nlab=0, gains=[], offsets=[], local={k: [] for k in self.local},
+                                     priors=[] if priors else None)
+
+    def add(self, d, gain, local):
+        """The labels of the local amplitudes of DetectorData d in this pass,
+        in the order of `data`: (labels of the gains or None, {name: labels});
+        `gain` from gain(), `local` {name: local_value()} of the templates of d."""
+        ps, cal = self._pass, self.calibration
+        gain_labels, labels = None, {}
+        if gain is not None:
+            ps.offsets.append(ps.nlab)
+            ps.nlab += gain[0].size
+            ps.gains.append(gain[0])
+            gain_labels = ps.offsets[-1] + gain[1]
+            if ps.priors is not None:
+                prec, g0 = (0.0, 1.0) if cal.prior is None else cal.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
+                # g (1 + dg) ~ N(g0, 1 / prec): dg ~ N((g0 - g) / g, 1 / (prec g^2))
+                ps.priors.append((prec * gain[0]**2, (g0 - gain[0]) / gain[0]))
+        for k, amps in ps.local.items():
+            if k not in local:
+                amps.append((np.zeros(0), ps.nlab))
+                continue
+            amp, p = local[k]
+            amps.append((amp, ps.nlab))
+            if ps.priors is not None:
+                tp = self.templates[k].prior
+                prec, a0 = (0.0, 0.0) if tp is None else tp._terms(d.name, 0.0, f"templates[{k!r}].prior")
+                ps.priors.append((np.full(amp.size, prec), a0 - amp))  # on a + da
+            labels[k] = ps.nlab + p
+            ps.nlab += amp.size
+        return gain_labels, labels
+
+    def gls_priors(self):
+        """(prior of the local amplitudes, prior of the shared ones) of this
+        pass for GLS: (precision, mean of the correction), or None."""
+        ps = self._pass
+        local = None if not ps.priors else tuple(np.concatenate(x) for x in zip(*ps.priors))
+        shared = None if not ps.fit or self.prior is None else (self.prior[0], self.prior[1] - self.shared)
+        return local, shared
+
+    def update(self, info):
+        """After the solve of this pass: g (1 + dg), a + da and A + dA from
+        info["amplitudes"] and info["shared_amplitudes"] (or None: fixed
+        amplitudes, the gains of the pass are kept)."""
+        ps = self._pass
+        gains = ps.gains
+        if info is not None:
+            if self.calibration is not None:
+                dg = [info["amplitudes"][o : o + g.size] for g, o in zip(gains, ps.offsets)]
+                self.dg_max = max((float(np.abs(x).max()) for x in dg if x.size), default=0.0)
+                gains = [g * (1 + x) for g, x in zip(gains, dg)]
+            for k, amps in ps.local.items():
+                self.local[k] = [a + info["amplitudes"][o : o + a.size] for a, o in amps]
+            if self.index:
+                self.shared = self.shared + info["shared_amplitudes"]
+        self.gains = gains if self.calibration is not None else None
+
+    def result_templates(self):
+        """MapResult.templates: name -> one array per DetectorData (period_s),
+        a number (common) or {detector name: amplitude}; None without templates."""
+        out = {}
+        for k, t in self.templates.items():
+            if t.fixed:
+                continue
+            if t.period_s is not None:
+                out[k] = self.local[k]
+            elif t.common:
+                out[k] = float(self.shared[self.index[k, None]])
+            else:
+                out[k] = {n: float(self.shared[i]) for (kk, n), i in self.index.items() if kk == k}
+        return out or None
 
 
 @dataclass
@@ -1224,15 +1389,9 @@ class _Fit:
     sky: np.ndarray | None  # sky model (maps or alm), subtracted and put back
     templates: dict  # name -> Template
     skies: dict  # name -> map or alm of the templates given as a sky signal
-    index: dict  # (template name, detector name or None) -> shared amplitude
-    amp: np.ndarray  # current shared amplitudes
-    prior: np.ndarray | None  # (precision, mean) of the shared amplitudes (2, n), or None
-    groups: list  # shared amplitudes summing to zero
-    local: dict  # name -> current amplitudes per period, one array per DetectorData (None at the start)
+    amplitudes: "_Amplitudes"  # the gains and the amplitudes of the templates: current values, labels, priors
     mask_gain: np.ndarray | None
     masks: dict  # name -> mask of the template, or None
-    gains: list | None = None  # current gains, one array per DetectorData
-    dg_max: float = 0.0  # largest |dg| of the last iteration on this rank
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
@@ -1425,14 +1584,8 @@ class _ChunkBuilder:
         self.tod, self.model_tod = [], []
         self.templates, self.shared = [], []  # local and shared templates (chunk, values, labels)
         self.gain_ids = set()  # ids of the gain templates in `templates`
-        self.gains, self.offsets = [], []  # gains of each DetectorData and their first label
-        self.local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
-        self.nlab = 0  # local amplitudes so far
-        # (precision, mean) of the local amplitudes, in the order of their labels, with a prior on some of them
-        self.priors = None
-        if fit is not None and fit.fit and ((self.cal is not None and self.cal.prior is not None)
-                                            or any(fit.templates[k].prior is not None for k in fit.local)):
-            self.priors = []
+        if fit is not None:  # labels of the local amplitudes from 0
+            fit.amplitudes.start_pass(fit.fit)
         self.common_modes = []
         # first pass only, one entry per chunk
         self.pix, self.a2, self.gamma, self.w, self.nfft, self.fs = [], [], [], [], [], []
@@ -1530,27 +1683,7 @@ class _ChunkBuilder:
         known, amps_d = model.known(d, j, sky_tod, ttod)
         gain = model.gain(d, j)
         det = _DetectorTOD(None, d.flags, sky_tod, templates=ttod)
-        if cal is not None:
-            self.offsets.append(self.nlab)
-            self.nlab += gain[0].size
-            self.gains.append(gain[0])
-            det.gain_labels = self.offsets[-1] + gain[1]
-            if self.priors is not None:
-                prec, g0 = (0.0, 1.0) if cal.prior is None else cal.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
-                # g (1 + dg) ~ N(g0, 1 / prec): dg ~ N((g0 - g) / g, 1 / (prec g^2))
-                self.priors.append((prec * gain[0]**2, (g0 - gain[0]) / gain[0]))
-        for k, amps in self.local.items():
-            if k not in amps_d:
-                amps.append((np.zeros(0), self.nlab))
-                continue
-            amp, p = amps_d[k]
-            amps.append((amp, self.nlab))
-            if self.priors is not None:
-                tp = fit.templates[k].prior
-                prec, a0 = (0.0, 0.0) if tp is None else tp._terms(d.name, 0.0, f"templates[{k!r}].prior")
-                self.priors.append((np.full(amp.size, prec), a0 - amp))  # on a + da
-            det.labels[k] = self.nlab + p
-            self.nlab += amp.size
+        det.gain_labels, det.labels = fit.amplitudes.add(d, gain, amps_d)
         if cal is not None and fit.fit:
             det.gain = d.dipole + known
             if fit.residual is not None:
@@ -1595,7 +1728,7 @@ class _ChunkBuilder:
                         if name in det.labels:
                             self.templates.append((k, _padded(t, a, b, m, dt), _padded(det.labels[name], a, b, m, np.int32)))
                         else:
-                            cols.append((t, fit.index[name, None if fit.templates[name].common else d.name]))
+                            cols.append((t, fit.amplitudes.shared_label(name, d)))
                     if len(cols) == 1:
                         self.shared.append((k, _padded(cols[0][0], a, b, m, dt), cols[0][1]))
                     elif cols:
@@ -1679,12 +1812,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     for j, d in chunks.items(data):  # one detector (or group) at a time: only its pointings are in memory (but a batch)
         chunks.add_item(j, d)
     reuse, conditional, cal = chunks.reuse, chunks.conditional, chunks.cal
-    priors, templates, shared, gain_ids = chunks.priors, chunks.templates, chunks.shared, chunks.gain_ids
-    tod_c, model_c, common_modes, gains, local = chunks.tod, chunks.model_tod, chunks.common_modes, chunks.gains, chunks.local
+    templates, shared, gain_ids = chunks.templates, chunks.shared, chunks.gain_ids
+    tod_c, model_c, common_modes = chunks.tod, chunks.model_tod, chunks.common_modes
 
     t1 = time.perf_counter()
-    prior = None if not priors else tuple(np.concatenate(x) for x in zip(*priors))
-    shared_prior = None if fit is None or not fit.fit or fit.prior is None else (fit.prior[0], fit.prior[1] - fit.amp)
+    prior, shared_prior = (None, None) if fit is None else fit.amplitudes.gls_priors()
     if fit is not None and fit.fit and cal is not None and cal.covariance_fixed_gains:
         # the same arrays: no copies
         fit.no_gains = ([t for t in templates if id(t) not in gain_ids], shared, prior, shared_prior)
@@ -1712,15 +1844,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         fit.x0 = m
         if fit.fit:
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
-            if cal is not None:
-                dg = [info["amplitudes"][o : o + g.size] for g, o in zip(gains, chunks.offsets)]
-                fit.dg_max = max((float(np.abs(x).max()) for x in dg if x.size), default=0.0)
-                gains = [g * (1 + x) for g, x in zip(gains, dg)]
-            for k, amps in local.items():
-                fit.local[k] = [a + info["amplitudes"][o : o + a.size] for a, o in amps]
-            if fit.index:
-                fit.amp = fit.amp + info["shared_amplitudes"]
-        fit.gains = gains if cal is not None else None
+        fit.amplitudes.update(info if fit.fit else None)  # g (1 + dg), a + da, A + dA
         if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky
             m = m + gls.binned(model_c)
 
@@ -1745,7 +1869,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         iterations=info["iterations"],
         converged=info["converged"],
         residuals=info["residuals"],
-        gains=None if fit is None else fit.gains,
+        gains=None if fit is None else fit.amplitudes.gains,
         gap_fill_iterations=gap_iterations,
         gradient=gradient,
         hessian=hessian,
@@ -1784,7 +1908,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         shared_templates=shared,
         prior=prior,
         shared_prior=shared_prior,
-        shared_groups=fit.groups if fit is not None and fit.fit else None,
+        shared_groups=fit.amplitudes.groups if fit is not None and fit.fit else None,
         template_dtype=params.template_dtype,
         flag_method="act" if isinstance(method, ACTCuts) else "fill" if isinstance(method, GapFill) else "marginalize",
         flag_sampling_rate_hz=fs_c if isinstance(method, ACTCuts) else None,
@@ -1813,36 +1937,23 @@ class _TODModel:
     expanded): `j` is the position of a DetectorData among them, which picks
     its gains and its amplitudes per period."""
 
-    def __init__(self, templates, skies, sky, calibration, gains, shared, local, nthreads):
+    def __init__(self, templates, skies, sky, amplitudes, nthreads):
         self.templates = templates  # name -> Template
         self.skies = skies  # name -> map or alm (_model) of the templates given as a sky signal
         self.sky = sky  # sky model S (_model) or None
-        self.calibration = calibration
-        self.gains = gains  # one array per DetectorData, or None (ones)
-        self.shared = shared  # (name, DetectorData) -> amplitude of a template with period_s None, or None
-        self.local = local  # name -> amplitudes per period, one array per DetectorData, or None (zeros)
+        self.amplitudes = amplitudes  # _Amplitudes: gains, shared and local amplitudes
+        self.calibration = amplitudes.calibration
         self.nthreads = nthreads
 
     @classmethod
     def from_fit(cls, fit, nthreads):
-        def shared(k, d):
-            return float(fit.amp[fit.index[k, None if fit.templates[k].common else d.name]])
-
-        return cls(fit.templates, fit.skies, fit.sky, fit.calibration, fit.gains, shared, fit.local, nthreads)
+        return cls(fit.templates, fit.skies, fit.sky, fit.amplitudes, nthreads)
 
     @classmethod
     def from_result(cls, result, nthreads):
         templates = dict(result.template_definitions or {})
         skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky") for k, t in templates.items() if t.sky is not None}
-        amps = result.templates or {}
-
-        def shared(k, d):
-            a = amps[k]
-            return a if templates[k].common else a.get(d.name)
-
-        local = {k: amps[k] for k, t in templates.items() if t.period_s is not None}
-        gains = result.gains if result.calibration is not None else None
-        model = cls(templates, skies, None, result.calibration, gains, shared, local, nthreads)
+        model = cls(templates, skies, None, _Amplitudes.from_result(result), nthreads)
         model.result, model.maps = result, result.maps
         if result.gradient is not None:  # the maps at the pixel centers, once
             model.maps = result.maps.copy()
@@ -1854,13 +1965,6 @@ class _TODModel:
     def alm(self):
         """Some model is alm: the samples need (theta, phi)."""
         return any(x is not None and np.iscomplexobj(x) for x in (self.sky, *self.skies.values()))
-
-    @property
-    def count(self):
-        """The number of DetectorData of the gains or amplitudes per period, or None."""
-        if self.calibration is not None and self.gains is not None:
-            return len(self.gains)
-        return next((len(v) for v in self.local.values() if v is not None), None)
 
     def sample(self, d, pix, angle, loc):
         """(S, {name: B_k}) of the sky model and the sky templates for d (S None without a sky model)."""
@@ -1877,10 +1981,7 @@ class _TODModel:
 
     def gain(self, d, j):
         """(gains, period of each sample) of d, or None without calibration."""
-        if self.calibration is None:
-            return None
-        p = _periods(len(d.tod), d.sampling_rate_hz, self.calibration.gain_period_s)
-        return (np.ones(p[-1] + 1) if self.gains is None else self.gains[j]), p
+        return self.amplitudes.gain(d, j)
 
     def known(self, d, j, sky, tods):
         """S + F + sum_k a_k B_k of d (a new array) from the B_k `tods` (from
@@ -1893,15 +1994,14 @@ class _TODModel:
                 _axpy(known, 1.0, tods.pop(k))
             for k, t in tods.items():
                 if self.templates[k].period_s is None:
-                    a = self.shared(k, d)
+                    a = self.amplitudes.shared_value(k, d)
                     if a is not None:
-                        _axpy(known, float(a), t)
+                        _axpy(known, a, t)
         local = {}
-        for k, amps in self.local.items():
+        for k in self.amplitudes.local:
             if k not in tods:
                 continue
-            p = _periods(len(d.tod), d.sampling_rate_hz, self.templates[k].period_s)
-            amp = np.zeros(p[-1] + 1) if amps is None else amps[j]
+            amp, p = self.amplitudes.local_value(k, d, j)
             if amp.size:
                 known += amp[p] * tods[k]
             local[k] = amp, p
@@ -1918,7 +2018,7 @@ class _TODModel:
 
     def check(self, n):
         """n DetectorData were used: as many as in make_maps."""
-        count = self.count
+        count = self.amplitudes.count
         if count is not None and n != count:
             raise ValueError(f"estimate_noise: {n} DetectorData, but the MapResult has gains or amplitudes per period "
                              f"for {count}: pass the data of make_maps, in the same order")
@@ -1927,7 +2027,7 @@ class _TODModel:
         """d / g - D - F - sum_k a_k B_k - P m for DetectorData d (a new array;
         from_result only)."""
         r, nthreads = self.result, self.nthreads
-        count = self.count
+        count = self.amplitudes.count
         if count is not None and j >= count:
             self.check(j + 1)
         if self.calibration is not None and d.dipole is None:
@@ -1942,7 +2042,9 @@ class _TODModel:
         for k, t in self.templates.items():
             # a DetectorData may lack a TOD template; not one with amplitudes of its own
             if k not in tods and not t.fixed and (t.period_s is not None or (not t.common and d.templates is None)):
-                a = self.local[k][j] if t.period_s is not None else self.shared(k, d)
+                a = self.amplitudes.local[k] if t.period_s is not None else self.amplitudes.shared_value(k, d)
+                if t.period_s is not None and a is not None:
+                    a = a[j]
                 if a is not None and np.size(a):
                     raise ValueError(f"estimate_noise: DetectorData {d.name!r} has no template {k!r}, fitted by "
                                      "make_maps: pass the DetectorData.templates given to make_maps")
