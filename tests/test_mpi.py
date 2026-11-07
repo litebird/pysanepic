@@ -374,6 +374,26 @@ def test_estimate_common_modes_mpi():
         assert np.allclose(est[names][0].noise.psd, ref[names][0].noise.psd, rtol=1e-8)
         assert all(np.allclose(est[n].psd, ref[n].psd, rtol=1e-8) for n in names)
 
+def test_estimate_noise_calibrated_mpi():
+    """estimate_noise of a calibrated make_maps with templates per period,
+    the DetectorData spread over the ranks (gains and amplitudes of this rank):
+    the serial spectra."""
+    from pysanepic import CalibrationParameters, GLSParameters, Template, estimate_noise, make_maps
+    from test_estimate_noise_model import CHUNK, FS, NSIDE, PERIOD, _data
+
+    comm = MPI.COMM_WORLD
+    data = _data(True, "period")
+    kw = dict(coordinates="E", params=GLSParameters(chunk_s=CHUNK / FS, tol=1e-14),
+              calibration=CalibrationParameters(gain_period_s=CHUNK / FS, n_iter=3),
+              templates={"thermal": Template(period_s=PERIOD / FS)})
+    mine = data[comm.rank :: comm.size]
+    est = estimate_noise(mine, make_maps(mine, NSIDE, comm=comm, **kw), chunk_s=CHUNK / FS, nbins=30, comm=comm)
+    if comm.rank == 0:
+        ref = estimate_noise(data, make_maps(data, NSIDE, **kw), chunk_s=CHUNK / FS, nbins=30)
+        assert sorted(est) == sorted(ref)
+        for k in ref:
+            assert np.allclose(est[k].psd, ref[k].psd, rtol=1e-6)
+
 
 if __name__ == "__main__":
     test_mpi_matches_serial()
@@ -389,5 +409,6 @@ if __name__ == "__main__":
     test_bandpass_mpi()
     test_tod_templates_mpi()
     test_priors_mpi()
+    test_estimate_noise_calibrated_mpi()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")

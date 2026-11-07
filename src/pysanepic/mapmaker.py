@@ -1790,7 +1790,7 @@ class _TODModel:
             self.sub = _subpixel_maps(result.gradient, result.hessian)
         self.count = None if result.calibration is None else len(result.gains)
         if self.count is None:
-            local = [v for k, v in (result.templates or {}).items() if self.templates[k].period_s is not None]
+            local = [result.templates[k] for k, t in self.templates.items() if t.period_s is not None]
             self.count = len(local[0]) if local else None
 
     def check(self, n):
@@ -1815,6 +1815,12 @@ class _TODModel:
         r, nthreads = self.result, self.nthreads
         if self.count is not None and j >= self.count:
             self.check(j + 1)
+        if r.calibration is not None and d.dipole is None:
+            raise ValueError("estimate_noise: the MapResult has gains: the DetectorData need DetectorData.dipole, "
+                             "as in make_maps")
+        if (self.alm or r.gradient is not None) and d.pointing.pix is not None:
+            raise ValueError("estimate_noise: templates as alm and the sub-pixel gradient need Pointing angles "
+                             "(theta, phi), as in make_maps, not pixels")
         pix, angle, loc = _pixels_and_angles(d, r.nside, r.coordinates, nthreads,
                                              loc=self.alm or r.gradient is not None)
         res = np.array(d.tod, dtype=float)
@@ -1822,14 +1828,18 @@ class _TODModel:
             period = _periods(len(res), d.sampling_rate_hz, r.calibration.gain_period_s)
             with numba_threads(nthreads):
                 _calibrated(res, r.gains[j], period, np.asarray(d.dipole, dtype=float), np.zeros(len(res)), res)
-        for k in self.templates:
+        for k, t in self.templates.items():
+            a = self._amplitude(k, d, j)
             if k in self.skies:
                 b = _sample(self.skies[k], d, pix, angle, loc, nthreads)
             elif d.templates is not None and k in d.templates:
                 b = np.asarray(d.templates[k], dtype=float)
             else:
+                # a DetectorData may lack a TOD template; not one with amplitudes of its own
+                if a is not None and (t.period_s is not None or (not t.fixed and not t.common and d.templates is None)):
+                    raise ValueError(f"estimate_noise: DetectorData {d.name!r} has no template {k!r}, fitted by "
+                                     "make_maps: pass the DetectorData.templates given to make_maps")
                 continue
-            a = self._amplitude(k, d, j)
             if a is not None:
                 res -= a * b
         res -= _project_maps(self.maps, pix, angle, d.pol_efficiency, nthreads)

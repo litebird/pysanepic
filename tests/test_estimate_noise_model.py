@@ -98,3 +98,10 @@ def test_estimate_noise_uses_fitted_model(calibration, template):
     if calibration or template == "period":
         with pytest.raises(ValueError, match="same order"):
             estimate_noise(data[:-1], result, **kw)
+    # the dipole and the TOD templates of make_maps are needed (e.g. a wrapper building the data again)
+    if calibration:
+        with pytest.raises(ValueError, match="dipole"):
+            estimate_noise([dataclasses.replace(d, dipole=None) for d in data], result, **kw)
+    if template:
+        with pytest.raises(ValueError, match="no template 'thermal'"):
+            estimate_noise([dataclasses.replace(d, templates=None) for d in data], result, **kw)
