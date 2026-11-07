@@ -1426,6 +1426,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     nchunk = ndata = nlab = 0  # chunks, DetectorData and local amplitudes so far
     gain_ids = set()  # ids of the gain templates in `templates`
     t0 = time.perf_counter()  # the time of each step, with verbose
+    model = None if fit is None else _TODModel.from_fit(fit, nthreads)  # the TOD model with the current estimates
 
     def add(d, split=True):
         """Chunks of one DetectorData; returns their indices."""
@@ -1459,44 +1460,26 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                     sky_tod = tods.pop(None)
                     ttod = tods
                 else:
-                    sky_tod = _sample(fit.sky, d, pix, angle, loc, nthreads)
-                    ttod = {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in fit.skies.items()}
+                    sky_tod, ttod = model.sample(d, pix, angle, loc)
                 if fit.cache is not None:
                     fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in ttod.items()}
-            ttod.update({k: np.array(v, dtype=float) for k, v in (d.templates or {}).items()
-                         if k in fit.templates and k not in fit.skies})
-
-            def period(seconds):  # the period of each sample
-                per = int(round(seconds * fs)) if np.isfinite(seconds) else len(d.tod)
-                return np.arange(len(d.tod)) // max(1, per)
-
-            known = np.array(sky_tod, dtype=float)
-            with numba_threads(nthreads):
-                for k in [k for k in ttod if fit.templates[k].fixed]:
-                    _axpy(known, 1.0, ttod.pop(k))
-                for k, t in ttod.items():
-                    tp = fit.templates[k]
-                    if tp.period_s is None:
-                        _axpy(known, float(fit.amp[fit.index[k, None if tp.common else d.name]]), t)
+            ttod = model.tods(d, ttod)
+            known, amps_d = model.known(d, ndata - 1, sky_tod, ttod)
+            gain = model.gain(d, ndata - 1)
             if cal is not None:
-                p = period(cal.gain_period_s)
-                gain = np.ones(p[-1] + 1) if fit.gains is None else fit.gains[len(gains)]
                 offsets.append(nlab)
-                nlab += gain.size
-                gains.append(gain)
-                gain_period = p
-                labels = offsets[-1] + p
+                nlab += gain[0].size
+                gains.append(gain[0])
+                labels = offsets[-1] + gain[1]
                 if priors is not None:
                     prec, g0 = (0.0, 1.0) if cal.prior is None else cal.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
                     # g (1 + dg) ~ N(g0, 1 / prec): dg ~ N((g0 - g) / g, 1 / (prec g^2))
-                    priors.append((prec * gain**2, (g0 - gain) / gain))
+                    priors.append((prec * gain[0]**2, (g0 - gain[0]) / gain[0]))
             for k, amps in local.items():
-                if k not in ttod:
+                if k not in amps_d:
                     amps.append((np.zeros(0), nlab))
                     continue
-                p = period(fit.templates[k].period_s)
-                amp = np.zeros(p[-1] + 1) if fit.local[k] is None else fit.local[k][ndata - 1]
-                known += amp[p] * ttod[k]
+                amp, p = amps_d[k]
                 amps.append((amp, nlab))
                 if priors is not None:
                     tp = fit.templates[k].prior
@@ -1511,12 +1494,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                         _axpy(tmpl, 1.0, _project_maps(fit.residual[:npol], pix, angle, d.pol_efficiency, nthreads))
                         if params.subpixel_order:
                             _axpy(tmpl, 1.0, _subpixel_tod(fit.residual[npol:], pix, gx, gy))
-            if cal is not None:
-                tod_all = np.empty(len(d.tod))
-                with numba_threads(nthreads):
-                    _calibrated(d.tod, gain, gain_period, d.dipole, known, tod_all)
-            else:
-                tod_all = tod_all - known
+            tod_all = model.calibrated(d, known, gain)
             # masks: samples out of every active fit are flagged; out of some, their templates are 0
             active = [(tmpl, fit.mask_gain)] if tmpl is not None else []
             active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
@@ -1767,55 +1745,135 @@ def _periods(n, fs, seconds):
 
 
 class _TODModel:
-    """The TOD model fitted by make_maps, from its MapResult:
-    d = g (P m + D + F + sum_k a_k B_k) + n, with the maps m (and their
-    sub-pixel gradient and Hessian), the gains g, the dipole D, the fixed
-    templates F and the fitted templates B_k with amplitudes a_k. The sky
-    model is in m (put back as its binned map).
+    """The TOD model of make_maps, d = g (P m + D + S + F + sum_k a_k B_k) + n:
+    gains g, dipole D, sky model S, fixed templates F and fitted templates
+    B_k with amplitudes a_k. Two sources of the estimates: the current ones
+    of the fit iterations (from_fit, used by _make_maps) and the final ones
+    of a MapResult (from_result, used by estimate_noise; S is then in the
+    maps, put back as its binned map).
 
     The DetectorData are those given to make_maps, in the same order (groups
     expanded): `j` is the position of a DetectorData among them, which picks
     its gains and its amplitudes per period."""
 
-    def __init__(self, result, nthreads):
-        self.result, self.nthreads = result, nthreads
-        self.templates = dict(result.template_definitions or {})
-        self.skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky")
-                      for k, t in self.templates.items() if t.sky is not None}
-        self.alm = any(np.iscomplexobj(x) for x in self.skies.values())
-        self.maps = result.maps
+    def __init__(self, templates, skies, sky, calibration, gains, shared, local, nthreads):
+        self.templates = templates  # name -> Template
+        self.skies = skies  # name -> map or alm (_model) of the templates given as a sky signal
+        self.sky = sky  # sky model S (_model) or None
+        self.calibration = calibration
+        self.gains = gains  # one array per DetectorData, or None (ones)
+        self.shared = shared  # (name, DetectorData) -> amplitude of a template with period_s None, or None
+        self.local = local  # name -> amplitudes per period, one array per DetectorData, or None (zeros)
+        self.nthreads = nthreads
+
+    @classmethod
+    def from_fit(cls, fit, nthreads):
+        def shared(k, d):
+            return float(fit.amp[fit.index[k, None if fit.templates[k].common else d.name]])
+
+        return cls(fit.templates, fit.skies, fit.sky, fit.calibration, fit.gains, shared, fit.local, nthreads)
+
+    @classmethod
+    def from_result(cls, result, nthreads):
+        templates = dict(result.template_definitions or {})
+        skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky") for k, t in templates.items() if t.sky is not None}
+        amps = result.templates or {}
+
+        def shared(k, d):
+            a = amps[k]
+            return a if templates[k].common else a.get(d.name)
+
+        local = {k: amps[k] for k, t in templates.items() if t.period_s is not None}
+        gains = result.gains if result.calibration is not None else None
+        model = cls(templates, skies, None, result.calibration, gains, shared, local, nthreads)
+        model.result, model.maps = result, result.maps
         if result.gradient is not None:  # the maps at the pixel centers, once
-            self.maps = result.maps.copy()
-            self.maps[0] -= _pixel_mean_shift(result.nside, result.gradient, result.hessian, nthreads)
-            self.sub = _subpixel_maps(result.gradient, result.hessian)
-        self.count = None if result.calibration is None else len(result.gains)
-        if self.count is None:
-            local = [result.templates[k] for k, t in self.templates.items() if t.period_s is not None]
-            self.count = len(local[0]) if local else None
+            model.maps = result.maps.copy()
+            model.maps[0] -= _pixel_mean_shift(result.nside, result.gradient, result.hessian, nthreads)
+            model.sub = _subpixel_maps(result.gradient, result.hessian)
+        return model
+
+    @property
+    def alm(self):
+        """Some model is alm: the samples need (theta, phi)."""
+        return any(x is not None and np.iscomplexobj(x) for x in (self.sky, *self.skies.values()))
+
+    @property
+    def count(self):
+        """The number of DetectorData of the gains or amplitudes per period, or None."""
+        if self.calibration is not None and self.gains is not None:
+            return len(self.gains)
+        return next((len(v) for v in self.local.values() if v is not None), None)
+
+    def sample(self, d, pix, angle, loc):
+        """(S, {name: B_k}) of the sky model and the sky templates for d (S None without a sky model)."""
+        nthreads = self.nthreads
+        sky = None if self.sky is None else _sample(self.sky, d, pix, angle, loc, nthreads)
+        return sky, {k: _sample(b, d, pix, angle, loc, nthreads) for k, b in self.skies.items()}
+
+    def tods(self, d, sampled):
+        """{name: B_k} of d: the sky templates `sampled` (from sample, a dict
+        that is updated) and the TOD templates of d fitted by make_maps."""
+        sampled.update({k: np.array(v, dtype=float) for k, v in (d.templates or {}).items()
+                        if k in self.templates and k not in self.skies})
+        return sampled
+
+    def gain(self, d, j):
+        """(gains, period of each sample) of d, or None without calibration."""
+        if self.calibration is None:
+            return None
+        p = _periods(len(d.tod), d.sampling_rate_hz, self.calibration.gain_period_s)
+        return (np.ones(p[-1] + 1) if self.gains is None else self.gains[j]), p
+
+    def known(self, d, j, sky, tods):
+        """S + F + sum_k a_k B_k of d (a new array) from the B_k `tods` (from
+        tods), of which the fixed ones are removed; returns it and, per template
+        with amplitudes per period present in `tods`, (amplitudes, period of each
+        sample)."""
+        known = np.zeros(len(d.tod)) if sky is None else np.array(sky, dtype=float)
+        with numba_threads(self.nthreads):
+            for k in [k for k in tods if self.templates[k].fixed]:
+                _axpy(known, 1.0, tods.pop(k))
+            for k, t in tods.items():
+                if self.templates[k].period_s is None:
+                    a = self.shared(k, d)
+                    if a is not None:
+                        _axpy(known, float(a), t)
+        local = {}
+        for k, amps in self.local.items():
+            if k not in tods:
+                continue
+            p = _periods(len(d.tod), d.sampling_rate_hz, self.templates[k].period_s)
+            amp = np.zeros(p[-1] + 1) if amps is None else amps[j]
+            if amp.size:
+                known += amp[p] * tods[k]
+            local[k] = amp, p
+        return known, local
+
+    def calibrated(self, d, known, gain):
+        """d / g - D - known (d - known without calibration: `gain` None, else from gain)."""
+        if gain is None:
+            return d.tod - known
+        out = np.empty(len(d.tod))
+        with numba_threads(self.nthreads):
+            _calibrated(d.tod, gain[0], gain[1], d.dipole, known, out)
+        return out
 
     def check(self, n):
         """n DetectorData were used: as many as in make_maps."""
-        if self.count is not None and n != self.count:
+        count = self.count
+        if count is not None and n != count:
             raise ValueError(f"estimate_noise: {n} DetectorData, but the MapResult has gains or amplitudes per period "
-                             f"for {self.count}: pass the data of make_maps, in the same order")
-
-    def _amplitude(self, k, d, j):
-        """a_k of DetectorData d (a number or one per sample), or None."""
-        t = self.templates[k]
-        if t.fixed:
-            return 1.0
-        a = self.result.templates[k]
-        if t.period_s is not None:
-            amp = a[j]
-            return amp[_periods(len(d.tod), d.sampling_rate_hz, t.period_s)] if amp.size else None
-        return a if t.common else a.get(d.name)
+                             f"for {count}: pass the data of make_maps, in the same order")
 
     def residual(self, d, j):
-        """d / g - D - F - sum_k a_k B_k - P m for DetectorData d (a new array)."""
+        """d / g - D - F - sum_k a_k B_k - P m for DetectorData d (a new array;
+        from_result only)."""
         r, nthreads = self.result, self.nthreads
-        if self.count is not None and j >= self.count:
+        count = self.count
+        if count is not None and j >= count:
             self.check(j + 1)
-        if r.calibration is not None and d.dipole is None:
+        if self.calibration is not None and d.dipole is None:
             raise ValueError("estimate_noise: the MapResult has gains: the DetectorData need DetectorData.dipole, "
                              "as in make_maps")
         if (self.alm or r.gradient is not None) and d.pointing.pix is not None:
@@ -1823,25 +1881,15 @@ class _TODModel:
                              "(theta, phi), as in make_maps, not pixels")
         pix, angle, loc = _pixels_and_angles(d, r.nside, r.coordinates, nthreads,
                                              loc=self.alm or r.gradient is not None)
-        res = np.array(d.tod, dtype=float)
-        if r.calibration is not None:
-            period = _periods(len(res), d.sampling_rate_hz, r.calibration.gain_period_s)
-            with numba_threads(nthreads):
-                _calibrated(res, r.gains[j], period, np.asarray(d.dipole, dtype=float), np.zeros(len(res)), res)
+        tods = self.tods(d, self.sample(d, pix, angle, loc)[1])
         for k, t in self.templates.items():
-            a = self._amplitude(k, d, j)
-            if k in self.skies:
-                b = _sample(self.skies[k], d, pix, angle, loc, nthreads)
-            elif d.templates is not None and k in d.templates:
-                b = np.asarray(d.templates[k], dtype=float)
-            else:
-                # a DetectorData may lack a TOD template; not one with amplitudes of its own
-                if a is not None and (t.period_s is not None or (not t.fixed and not t.common and d.templates is None)):
+            # a DetectorData may lack a TOD template; not one with amplitudes of its own
+            if k not in tods and not t.fixed and (t.period_s is not None or (not t.common and d.templates is None)):
+                a = self.local[k][j] if t.period_s is not None else self.shared(k, d)
+                if a is not None and np.size(a):
                     raise ValueError(f"estimate_noise: DetectorData {d.name!r} has no template {k!r}, fitted by "
                                      "make_maps: pass the DetectorData.templates given to make_maps")
-                continue
-            if a is not None:
-                res -= a * b
+        res = self.calibrated(d, self.known(d, j, None, tods)[0], self.gain(d, j))
         res -= _project_maps(self.maps, pix, angle, d.pol_efficiency, nthreads)
         if r.gradient is not None:
             res -= _subpixel_tod(self.sub, pix, *_pixel_offsets(pix, loc, r.nside, float, nthreads))
@@ -1995,7 +2043,7 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
     the scan), so iterating make_maps / estimate_noise once is usually enough.
     """
     nthreads = resolve_nthreads(nthreads)
-    model = _TODModel(result, nthreads)
+    model = _TODModel.from_result(result, nthreads)
     acc = {}  # name -> [fs, sum of P per bin, count per bin, sum of log f per bin]
     gacc = {}  # names of a group -> [fs, sum of the cross-spectra per bin, count, sum of log f]
     j = 0  # DetectorData so far, groups expanded: the index of their gains and amplitudes per period
