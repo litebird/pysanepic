@@ -105,3 +105,33 @@ def test_estimate_noise_uses_fitted_model(calibration, template):
     if template:
         with pytest.raises(ValueError, match="no template 'thermal'"):
             estimate_noise([dataclasses.replace(d, templates=None) for d in data], result, **kw)
+
+
+def test_tod_model_of_fit_and_result(monkeypatch):
+    """The TOD model with the estimates of the last pass of make_maps (from_fit)
+    and with those of its MapResult (from_result) is the same, but the sky
+    model S (in the maps of the MapResult): make_maps and estimate_noise model
+    the TOD the same way. All kinds of templates: per detector, common, per
+    period, fixed and sky."""
+    from pysanepic import mapmaker
+
+    models = []
+    from_fit = mapmaker._TODModel.from_fit
+    monkeypatch.setattr(mapmaker._TODModel, "from_fit", classmethod(lambda cls, *a: models.append(from_fit(*a)) or models[-1]))
+    rng = np.random.default_rng(5)
+    data = [dataclasses.replace(d, templates={**d.templates, "per": rng.normal(size=len(d.tod)) * 1e-2,
+                                              "fix": np.full(len(d.tod), 1e-4), "com": np.sin(np.arange(len(d.tod)) / 300)})
+            for d in _data(True, "detector")]
+    sky = rng.normal(0, 1e-4, (3, 12 * NSIDE**2))
+    tmpl = {"thermal": Template(), "per": Template(period_s=PERIOD / FS), "fix": Template(fixed=True),
+            "com": Template(common=True), "bp": Template(sky=rng.normal(0, 1e-3, 12 * NSIDE**2), sum_zero=True)}
+    result = make_maps(data, NSIDE, coordinates="E", params=GLSParameters(chunk_s=CHUNK / FS, tol=1e-10),
+                       calibration=CalibrationParameters(gain_period_s=CHUNK / FS, n_iter=2), templates=tmpl, sky_model=sky)
+    fit, res = models[-1], mapmaker._TODModel.from_result(result, 1)
+    for j, d in enumerate(data):
+        pix, angle, loc = mapmaker._pixels_and_angles(d, NSIDE, "E", 1)
+        s, b = fit.sample(d, pix, angle, loc)
+        k_fit = fit.known(d, j, s, fit.tods(d, b))[0]
+        k_res = res.known(d, j, None, res.tods(d, res.sample(d, pix, angle, loc)[1]))[0]
+        np.testing.assert_allclose(k_fit - s, k_res, rtol=0, atol=1e-15)
+        np.testing.assert_array_equal(fit.gain(d, j)[0], res.gain(d, j)[0])
