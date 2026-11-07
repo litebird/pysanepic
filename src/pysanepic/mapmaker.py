@@ -13,7 +13,7 @@ import functools
 import time
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 
 import ducc0
@@ -620,11 +620,11 @@ class Prior:
     mean: float | dict | None = None
 
     def __post_init__(self):
-        for field, x in (("sigma", self.sigma), ("mean", self.mean)):
+        for attr, x in (("sigma", self.sigma), ("mean", self.mean)):
             values = np.array(list(x.values()) if isinstance(x, dict) else [] if x is None else [x], dtype=float)
-            if field == "sigma" and not np.all(values > 0):
+            if attr == "sigma" and not np.all(values > 0):
                 raise ValueError("Prior.sigma must be > 0 (inf: no prior)")
-            if field == "mean" and not np.all(np.isfinite(values)):
+            if attr == "mean" and not np.all(np.isfinite(values)):
                 raise ValueError("Prior.mean must be finite")
 
     def _terms(self, det, nominal, name):
@@ -1386,17 +1386,285 @@ def _conditional_tod(tod, gls, npix, common_modes, fill, rng, nthreads):
     return iterations
 
 
+@dataclass
+class _DetectorTOD:
+    """The TOD of one DetectorData for the GLS, from _ChunkBuilder._detector_tod."""
+
+    tod: np.ndarray  # calibrated, minus the known part of the model
+    flags: np.ndarray | None  # with the samples out of every fit
+    sky: np.ndarray | None  # TOD of the sky model (put back in the maps)
+    gain: np.ndarray | None = None  # template of the gains (T dg)
+    gain_labels: np.ndarray | None = None
+    templates: dict = field(default_factory=dict)  # name -> TOD of the fitted templates
+    labels: dict = field(default_factory=dict)  # name -> labels of the templates with amplitudes per period
+
+
+class _ChunkBuilder:
+    """The chunks of the GLS of _make_maps, built one DetectorData at a time
+    (add): their TOD, templates and sky model TOD at every pass, and their
+    pixels, angles, noise weights and sub-pixel offsets the first time only
+    (in the calibration iterations after the first, `reuse`, the GLS keeps
+    them). The DetectorData are indexed by their position `j` among those
+    given to make_maps (groups expanded), which picks their gains, amplitudes
+    per period, cached sky model TODs and batched samples."""
+
+    def __init__(self, nside, coordinates, params, comm, nthreads, fit):
+        self.nside, self.coordinates, self.params, self.nthreads, self.fit = nside, coordinates, params, nthreads, fit
+        self.reuse = fit is not None and fit.fit and fit.gls is not None
+        self.method = _flag_treatment(params.flag_method)
+        self.fill = self.method if isinstance(self.method, GapFill) else None
+        self.conditional = self.fill is not None and self.fill.mode != "local_white"
+        self.npix = 12 * nside * nside
+        self.rank, self.size = (0, 1) if comm is None else (comm.rank, comm.size)
+        self.flag_rng = np.random.default_rng(np.random.SeedSequence([0 if self.fill is None else self.fill.seed, self.rank]))
+        self.dtype = params.angle_dtype
+        self.npol = 3 if params.pol else 1
+        self.model = None if fit is None else _TODModel.from_fit(fit, nthreads)  # with the current estimates
+        self.cal = None if fit is None else fit.calibration
+        # every pass, one entry per chunk (TOD, sky model TOD) or per template
+        self.tod, self.model_tod = [], []
+        self.templates, self.shared = [], []  # local and shared templates (chunk, values, labels)
+        self.gain_ids = set()  # ids of the gain templates in `templates`
+        self.gains, self.offsets = [], []  # gains of each DetectorData and their first label
+        self.local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
+        self.nlab = 0  # local amplitudes so far
+        # (precision, mean) of the local amplitudes, in the order of their labels, with a prior on some of them
+        self.priors = None
+        if fit is not None and fit.fit and ((self.cal is not None and self.cal.prior is not None)
+                                            or any(fit.templates[k].prior is not None for k in fit.local)):
+            self.priors = []
+        self.common_modes = []
+        # first pass only, one entry per chunk
+        self.pix, self.a2, self.gamma, self.w, self.nfft, self.fs = [], [], [], [], [], []
+        self.gx, self.gy = [], []  # offsets from the pixel centers (subpixel_order >= 1)
+        self.weights = {}  # chunks with the same length and noise share one array
+        self.n_virtual = 0  # padding margins on this rank; labels are unique across ranks
+        self.presampled = {}  # j -> (pix, angle, {None: sky model TOD, key: sky template TOD}, loc)
+
+    def items(self, data):
+        """(j, item) of `data` (a DetectorData or a DetectorGroup, j of its
+        first DetectorData); sample_batch DetectorData at a time when the alm
+        models are sampled in this pass (their TODs then in `presampled`)."""
+        fit, params = self.fit, self.params
+        batching = fit is not None and fit.alm and params.sample_batch > 1 and not (fit.cache is not None and fit.cache)
+        it, j = iter(data), 0
+        while True:
+            items, dets = [], []
+            for d in it:
+                items.append(d)
+                dets += d.detectors if isinstance(d, DetectorGroup) else [d]
+                if not batching or len(dets) >= params.sample_batch:
+                    break
+            if not items:
+                return
+            if batching:
+                fields = {None: fit.sky, **fit.skies}
+                for i, r in enumerate(_sample_batch(fields, dets, self.nside, self.coordinates, self.nthreads)):
+                    self.presampled[j + i] = r
+            for d in items:
+                yield j, d
+                j += len(d.detectors) if isinstance(d, DetectorGroup) else 1
+
+    def add_item(self, j, d):
+        """The chunks of a DetectorData or a DetectorGroup with its first DetectorData at j."""
+        if not isinstance(d, DetectorGroup):
+            self.add(d, j)
+            return
+        # a group: chunks at the same times, not split at gaps (that would break
+        # the alignment); one common_modes entry per chunk of time
+        idx = [self.add(x, j + i, split=False) for i, x in enumerate(d.detectors)]
+        if self.reuse and not self.conditional:
+            return
+        fs = d.detectors[0].sampling_rate_hz
+        U = np.array([mode.coupling for mode in d.modes], dtype=float).T  # (ndet, r)
+        for chunks in zip(*idx):
+            nfft = self.fit.gls._nfft[chunks[0]] if self.reuse else self.nfft[chunks[0]]
+            lam = np.array([1 / np.maximum(w, w.max() * 1e-12) for w in (mode.noise.weights(nfft, fs) for mode in d.modes)])
+            self.common_modes.append((list(chunks), U, lam))
+
+    def add(self, d, j, split=True):
+        """The chunks of DetectorData d, at position j; returns their indices."""
+        fit, params = self.fit, self.params
+        sample = fit is not None and (fit.cache is None or j not in fit.cache)
+        batch = self.presampled.pop(j, None)  # from _sample_batch (GLSParameters.sample_batch > 1)
+        if batch is not None:
+            pix, angle, sampled, loc = batch
+        else:
+            # the (theta, phi) only for alm models or offsets, not to keep them otherwise
+            sampled = None
+            pix, angle, loc = _pixels_and_angles(d, self.nside, self.coordinates, self.nthreads,
+                                                 loc=(sample and fit.alm) or params.subpixel_order > 0)
+        offsets = None
+        if params.subpixel_order:
+            if loc is None:
+                raise ValueError("GLSParameters.subpixel_order needs a Pointing with angles (theta, phi), not pixels")
+            offsets = _pixel_offsets(pix, loc, self.nside, self.dtype, self.nthreads)
+        det = (_DetectorTOD(d.tod, d.flags, None) if fit is None
+               else self._detector_tod(d, j, pix, angle, loc, offsets, sample, sampled))
+        gap = params.split_gap_s * d.sampling_rate_hz if split else np.inf
+        chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * d.sampling_rate_hz))))
+        pieces = [piece for c in chunks for piece in _split_at_gaps(*c, det.flags, gap)]
+        first = len(self.tod)
+        self._add_tod(d, det, pieces)
+        if not self.reuse:  # the GLS has pixels, angles and weights already
+            self._add_layout(d, det.flags, pix, angle, offsets, pieces)
+        return list(range(first, len(self.tod)))
+
+    def _detector_tod(self, d, j, pix, angle, loc, offsets, sample, sampled):
+        """d = g (P m + D + S + F + sum_k a_k B_k) + n (F: the fixed templates), linearized around the
+        current g, a: d / g - D - S - F - sum a B = P m_res + T dg + sum B da + n,
+        T = D + S + F + sum a B + P m_res_prev."""
+        fit, model, cal, nthreads = self.fit, self.model, self.cal, self.nthreads
+        if not sample:
+            sky_tod, cached = fit.cache[j]
+            ttod = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
+        else:
+            if sampled is not None:
+                sky_tod = sampled.pop(None)
+                ttod = sampled
+            else:
+                sky_tod, ttod = model.sample(d, pix, angle, loc)
+            if fit.cache is not None:
+                fit.cache[j] = sky_tod, {k: t.copy() for k, t in ttod.items()}
+        ttod = model.tods(d, ttod)
+        known, amps_d = model.known(d, j, sky_tod, ttod)
+        gain = model.gain(d, j)
+        det = _DetectorTOD(None, d.flags, sky_tod, templates=ttod)
+        if cal is not None:
+            self.offsets.append(self.nlab)
+            self.nlab += gain[0].size
+            self.gains.append(gain[0])
+            det.gain_labels = self.offsets[-1] + gain[1]
+            if self.priors is not None:
+                prec, g0 = (0.0, 1.0) if cal.prior is None else cal.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
+                # g (1 + dg) ~ N(g0, 1 / prec): dg ~ N((g0 - g) / g, 1 / (prec g^2))
+                self.priors.append((prec * gain[0]**2, (g0 - gain[0]) / gain[0]))
+        for k, amps in self.local.items():
+            if k not in amps_d:
+                amps.append((np.zeros(0), self.nlab))
+                continue
+            amp, p = amps_d[k]
+            amps.append((amp, self.nlab))
+            if self.priors is not None:
+                tp = fit.templates[k].prior
+                prec, a0 = (0.0, 0.0) if tp is None else tp._terms(d.name, 0.0, f"templates[{k!r}].prior")
+                self.priors.append((np.full(amp.size, prec), a0 - amp))  # on a + da
+            det.labels[k] = self.nlab + p
+            self.nlab += amp.size
+        if cal is not None and fit.fit:
+            det.gain = d.dipole + known
+            if fit.residual is not None:
+                with numba_threads(nthreads):
+                    _axpy(det.gain, 1.0, _project_maps(fit.residual[:self.npol], pix, angle, d.pol_efficiency, nthreads))
+                    if offsets is not None:
+                        _axpy(det.gain, 1.0, _subpixel_tod(fit.residual[self.npol:], pix, *offsets))
+        det.tod = model.calibrated(d, known, gain)
+        # masks: samples out of every active fit are flagged; out of some, their templates are 0
+        active = [(det.gain, fit.mask_gain)] if det.gain is not None else []
+        active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
+        if any(mk is not None for _, mk in active):
+            out = {}  # samples out of each distinct mask
+            for _, mk in active:
+                if mk is not None and id(mk) not in out:
+                    out[id(mk)] = mk[pix] == 0
+            drop = None if any(mk is None for _, mk in active) else np.logical_and.reduce(list(out.values()))
+            for t, mk in active:
+                if mk is not None and (drop is None or len(out) > 1):
+                    t[out[id(mk)] if drop is None else out[id(mk)] & ~drop] = 0.0
+            if drop is not None:
+                det.flags = drop if det.flags is None else det.flags | drop
+        return det
+
+    def _add_tod(self, d, det, pieces):
+        """The TOD, templates and sky model TOD of the chunks `pieces` of d (every pass)."""
+        fit, params = self.fit, self.params
+        m = int(round(params.pad_s * d.sampling_rate_hz))
+        dt = params.template_dtype
+        for a, b in pieces:
+            k = len(self.tod)
+            tod = det.tod[a:b]  # a view: the TOD is not copied
+            if fit is not None:
+                # values as template_dtype and int32 labels (0 in the margins, where
+                # the values are 0), one int for an amplitude in the whole chunk
+                if det.gain is not None:
+                    self.templates.append((k, _padded(det.gain, a, b, m, dt), _padded(det.gain_labels, a, b, m, np.int32)))
+                    self.gain_ids.add(id(self.templates[-1]))
+                if fit.fit:
+                    cols = []  # the templates with one amplitude in the chunk: one 2D array, one pass in the PCG
+                    for name, t in det.templates.items():
+                        if name in det.labels:
+                            self.templates.append((k, _padded(t, a, b, m, dt), _padded(det.labels[name], a, b, m, np.int32)))
+                        else:
+                            cols.append((t, fit.index[name, None if fit.templates[name].common else d.name]))
+                    if len(cols) == 1:
+                        self.shared.append((k, _padded(cols[0][0], a, b, m, dt), cols[0][1]))
+                    elif cols:
+                        values = np.zeros((b - a + 2 * m, len(cols)), dt)
+                        with numba_threads(self.nthreads):
+                            _fill_columns(values, tuple(np.asarray(t, dtype=float) for t, _ in cols), a, m)
+                        self.shared.append((k, values, np.array([i for _, i in cols])))
+                if fit.sky is not None:  # the templates are not put back
+                    self.model_tod.append(_padded(det.sky, a, b, m, np.float64))
+            flagged = None if det.flags is None else det.flags[a:b]
+            if flagged is not None and flagged.any():
+                if self.fill is not None and not self.conditional:
+                    filled = _fill_flagged(tod, flagged, self.flag_rng)
+                    tod = filled if m else _GapFilledTOD(tod, flagged, filled[flagged])
+                    del filled
+                elif m:  # the padding must not use flagged TOD
+                    tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
+            self.tod.append(tod if m == 0 else _pad(tod, m, params.pad_fill))
+
+    def _add_layout(self, d, flags, pix, angle, offsets, pieces):
+        """The pixels, angles, noise weights and offsets of the chunks `pieces` of d (first pass)."""
+        params, dtype = self.params, self.dtype
+        fs = d.sampling_rate_hz
+        m = int(round(params.pad_s * fs))
+        for a, b in pieces:
+            n = b - a + 2 * m
+            nfft = fast_fft_length(n)  # e.g. chunks split at gaps have any length
+            key = (nfft, fs, d.noise)  # the dict keeps the noise objects alive: no reused ids
+            if key not in self.weights:
+                self.weights[key] = d.noise.weights(nfft, fs)
+            self.w.append(self.weights[key])
+            self.nfft.append(nfft)
+            self.fs.append(fs)
+            # 2a computed in float64, then stored as `dtype`; the margins of a
+            # padded chunk carry no polarization (gamma = 0: intensity-only
+            # virtual pixels), so only padded chunks need gamma per sample
+            if params.pol:
+                a2 = np.zeros(n, dtype)
+                a2[m : n - m] = two_angle(angle[a:b])
+                self.a2.append(a2)
+                if m == 0:
+                    self.gamma.append(d.pol_efficiency)
+                else:
+                    g = np.zeros(n, dtype)
+                    g[m : n - m] = d.pol_efficiency
+                    self.gamma.append(g)
+            if offsets is not None:
+                self.gx.append(_padded(offsets[0], a, b, m, dtype))
+                self.gy.append(_padded(offsets[1], a, b, m, dtype))
+            p = pix[a:b].astype(np.int32)
+            flagged = None if flags is None else flags[a:b]
+            if flagged is not None and flagged.any():
+                p[flagged] = -1 if isinstance(self.method, (ACTCuts, GapFill)) else _flag_labels(flagged, self.method)
+            if m == 0:
+                self.pix.append(p)
+            else:
+                left = self.npix + 2 * (self.n_virtual * self.size + self.rank)
+                self.n_virtual += 1
+                self.pix.append(np.concatenate([np.full(m, left, np.int32), p, np.full(m, left + 1, np.int32)]))
+
+
 def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=None):
     """make_maps with the current estimates in `fit` (a _Fit, or None), which
     are updated; returns (MapResult, GLS). In the calibration iterations after
     the first, the GLS of the first one is reused (same pixels, flags and
     chunks): only the TOD and the templates are built."""
-    reuse = fit is not None and fit.fit and fit.gls is not None
     params = GLSParameters() if params is None else params
     method = _flag_treatment(params.flag_method)
-    fill = method if isinstance(method, GapFill) else None
-    conditional = fill is not None and fill.mode != "local_white"
-    if conditional and (fit is None or fit.sky is None):
+    if isinstance(method, GapFill) and method.mode != "local_white" and (fit is None or fit.sky is None):
         raise ValueError("a conditional GapFill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
     if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
         raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
@@ -1405,226 +1673,14 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
-    rank, size = (0, 1) if comm is None else (comm.rank, comm.size)
-    flag_rng = np.random.default_rng(np.random.SeedSequence([0 if fill is None else fill.seed, rank]))
-    n_virtual = 0  # padding margins on this rank; labels are unique across ranks
-    pix_c, a2_c, gamma_c, tod_c, w_c, nfft_c, fs_c = [], [], [], [], [], [], []
-    gx_c, gy_c = [], []  # offsets from the pixel centers (subpixel_order >= 1)
-    weights = {}  # chunks with the same length and noise share one array
-    dtype = params.angle_dtype
     npol = 3 if params.pol else 1
-    common_modes = []
-    templates, shared, model_c = [], [], []  # local and shared templates (chunk, values, labels), sky model TOD
-    gains, offsets = [], []  # gains of each DetectorData and their first label
-    local = {} if fit is None else {k: [] for k in fit.local}  # (current amplitudes, first label) per DetectorData
-    cal = None if fit is None else fit.calibration
-    # (precision, mean) of the local amplitudes, in the order of their labels, with a prior on some of them
-    priors = None
-    if fit is not None and fit.fit and ((cal is not None and cal.prior is not None)
-                                        or any(fit.templates[k].prior is not None for k in fit.local)):
-        priors = []
-    nchunk = ndata = nlab = 0  # chunks, DetectorData and local amplitudes so far
-    gain_ids = set()  # ids of the gain templates in `templates`
     t0 = time.perf_counter()  # the time of each step, with verbose
-    model = None if fit is None else _TODModel.from_fit(fit, nthreads)  # the TOD model with the current estimates
-
-    def add(d, split=True):
-        """Chunks of one DetectorData; returns their indices."""
-        nonlocal n_virtual, nchunk, ndata, nlab
-        first = nchunk
-        ndata += 1
-        sample = fit is not None and (fit.cache is None or ndata not in fit.cache)
-        batch = presampled.pop(ndata, None)  # from _sample_batch (GLSParameters.sample_batch > 1)
-        if batch is not None:
-            pix, angle, tods, loc = batch
-        else:
-            # the (theta, phi) only for alm models or offsets, not to keep them otherwise
-            pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads,
-                                                 loc=(sample and fit.alm) or params.subpixel_order > 0)
-        if params.subpixel_order:
-            if loc is None:
-                raise ValueError("GLSParameters.subpixel_order needs a Pointing with angles (theta, phi), not pixels")
-            gx, gy = _pixel_offsets(pix, loc, nside, dtype, nthreads)
-        fs = d.sampling_rate_hz
-        m = int(round(params.pad_s * fs))
-        flags, tod_all, tmpl, ttod, tlab = d.flags, d.tod, None, {}, {}
-        if fit is not None:
-            # d = g (P m + D + S + F + sum_k a_k B_k) + n (F: the fixed templates), linearized around the
-            # current g, a: d / g - D - S - F - sum a B = P m_res + T dg + sum B da + n,
-            # T = D + S + F + sum a B + P m_res_prev
-            if not sample:
-                sky_tod, cached = fit.cache[ndata]
-                ttod = {k: t.copy() for k, t in cached.items()}  # zeroed below in the masks
-            else:
-                if batch is not None:
-                    sky_tod = tods.pop(None)
-                    ttod = tods
-                else:
-                    sky_tod, ttod = model.sample(d, pix, angle, loc)
-                if fit.cache is not None:
-                    fit.cache[ndata] = sky_tod, {k: t.copy() for k, t in ttod.items()}
-            ttod = model.tods(d, ttod)
-            known, amps_d = model.known(d, ndata - 1, sky_tod, ttod)
-            gain = model.gain(d, ndata - 1)
-            if cal is not None:
-                offsets.append(nlab)
-                nlab += gain[0].size
-                gains.append(gain[0])
-                labels = offsets[-1] + gain[1]
-                if priors is not None:
-                    prec, g0 = (0.0, 1.0) if cal.prior is None else cal.prior._terms(d.name, 1.0, "CalibrationParameters.prior")
-                    # g (1 + dg) ~ N(g0, 1 / prec): dg ~ N((g0 - g) / g, 1 / (prec g^2))
-                    priors.append((prec * gain[0]**2, (g0 - gain[0]) / gain[0]))
-            for k, amps in local.items():
-                if k not in amps_d:
-                    amps.append((np.zeros(0), nlab))
-                    continue
-                amp, p = amps_d[k]
-                amps.append((amp, nlab))
-                if priors is not None:
-                    tp = fit.templates[k].prior
-                    prec, a0 = (0.0, 0.0) if tp is None else tp._terms(d.name, 0.0, f"templates[{k!r}].prior")
-                    priors.append((np.full(amp.size, prec), a0 - amp))  # on a + da
-                tlab[k] = nlab + p
-                nlab += amp.size
-            if cal is not None and fit.fit:
-                tmpl = d.dipole + known
-                if fit.residual is not None:
-                    with numba_threads(nthreads):
-                        _axpy(tmpl, 1.0, _project_maps(fit.residual[:npol], pix, angle, d.pol_efficiency, nthreads))
-                        if params.subpixel_order:
-                            _axpy(tmpl, 1.0, _subpixel_tod(fit.residual[npol:], pix, gx, gy))
-            tod_all = model.calibrated(d, known, gain)
-            # masks: samples out of every active fit are flagged; out of some, their templates are 0
-            active = [(tmpl, fit.mask_gain)] if tmpl is not None else []
-            active += [(t, fit.masks[k]) for k, t in ttod.items()] if fit.fit else []
-            if any(mk is not None for _, mk in active):
-                out = {}  # samples out of each distinct mask
-                for _, mk in active:
-                    if mk is not None and id(mk) not in out:
-                        out[id(mk)] = mk[pix] == 0
-                drop = None if any(mk is None for _, mk in active) else np.logical_and.reduce(list(out.values()))
-                for t, mk in active:
-                    if mk is not None and (drop is None or len(out) > 1):
-                        t[out[id(mk)] if drop is None else out[id(mk)] & ~drop] = 0.0
-                if drop is not None:
-                    flags = drop if flags is None else flags | drop
-        chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * fs))))
-        gap = params.split_gap_s * fs if split else np.inf
-        for a, b in (piece for c in chunks for piece in _split_at_gaps(*c, flags, gap)):
-            k = nchunk
-            nchunk += 1
-            tod = tod_all[a:b]  # a view: the TOD is not copied
-            if fit is not None:
-                # values as template_dtype and int32 labels (0 in the margins, where
-                # the values are 0), one int for an amplitude in the whole chunk
-                dt = params.template_dtype
-                if tmpl is not None:
-                    templates.append((k, _padded(tmpl, a, b, m, dt), _padded(labels, a, b, m, np.int32)))
-                    gain_ids.add(id(templates[-1]))
-                if fit.fit:
-                    cols = []  # the templates with one amplitude in the chunk: one 2D array, one pass in the PCG
-                    for name, t in ttod.items():
-                        if name in tlab:
-                            templates.append((k, _padded(t, a, b, m, dt), _padded(tlab[name], a, b, m, np.int32)))
-                        else:
-                            cols.append((t, fit.index[name, None if fit.templates[name].common else d.name]))
-                    if len(cols) == 1:
-                        shared.append((k, _padded(cols[0][0], a, b, m, dt), cols[0][1]))
-                    elif cols:
-                        values = np.zeros((b - a + 2 * m, len(cols)), dt)
-                        with numba_threads(nthreads):
-                            _fill_columns(values, tuple(np.asarray(t, dtype=float) for t, _ in cols), a, m)
-                        shared.append((k, values, np.array([i for _, i in cols])))
-                if fit.sky is not None:  # the templates are not put back
-                    model_c.append(_padded(sky_tod, a, b, m, np.float64))
-            flagged = None if flags is None else flags[a:b]
-            if flagged is not None and flagged.any():
-                if fill is not None and not conditional:
-                    filled = _fill_flagged(tod, flagged, flag_rng)
-                    tod = filled if m else _GapFilledTOD(tod, flagged, filled[flagged])
-                    del filled
-                elif m:  # the padding must not use flagged TOD
-                    tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
-            tod_c.append(tod if m == 0 else _pad(tod, m, params.pad_fill))
-            if reuse:  # the GLS has pixels, angles and weights already
-                continue
-            n = b - a + 2 * m
-            nfft = fast_fft_length(n)  # e.g. chunks split at gaps have any length
-            key = (nfft, fs, d.noise)  # the dict keeps the noise objects alive: no reused ids
-            if key not in weights:
-                weights[key] = d.noise.weights(nfft, fs)
-            w_c.append(weights[key])
-            nfft_c.append(nfft)
-            fs_c.append(fs)
-            # 2a computed in float64, then stored as `dtype`; the margins of a
-            # padded chunk carry no polarization (gamma = 0: intensity-only
-            # virtual pixels), so only padded chunks need gamma per sample
-            if params.pol:
-                a2 = np.zeros(n, dtype)
-                a2[m : n - m] = two_angle(angle[a:b])
-                a2_c.append(a2)
-                if m == 0:
-                    gamma_c.append(d.pol_efficiency)
-                else:
-                    g = np.zeros(n, dtype)
-                    g[m : n - m] = d.pol_efficiency
-                    gamma_c.append(g)
-            if params.subpixel_order:
-                gx_c.append(_padded(gx, a, b, m, dtype))
-                gy_c.append(_padded(gy, a, b, m, dtype))
-            p = pix[a:b].astype(np.int32)
-            if flagged is not None and flagged.any():
-                p[flagged] = -1 if isinstance(method, (ACTCuts, GapFill)) else _flag_labels(flagged, method)
-            if m == 0:
-                pix_c.append(p)
-            else:
-                left = npix + 2 * (n_virtual * size + rank)
-                n_virtual += 1
-                pix_c.append(np.concatenate([np.full(m, left, np.int32), p, np.full(m, left + 1, np.int32)]))
-        del pix, angle
-        return list(range(first, nchunk))
-
-    presampled = {}  # DetectorData index -> (pix, angle, {None: sky model TOD, key: sky template TOD})
-    batching = fit is not None and fit.alm and params.sample_batch > 1
-
-    def batches():
-        """The items of `data`, sample_batch DetectorData at a time when the
-        alm models are sampled in this pass (their TODs then in `presampled`)."""
-        if not batching or (fit.cache is not None and fit.cache):  # sampled already (cache_model)
-            yield from data
-            return
-        it, first = iter(data), ndata + 1
-        while True:
-            items, dets = [], []
-            for d in it:
-                items.append(d)
-                dets += d.detectors if isinstance(d, DetectorGroup) else [d]
-                if len(dets) >= params.sample_batch:
-                    break
-            if not items:
-                return
-            fields = {None: fit.sky, **fit.skies}
-            for j, r in enumerate(_sample_batch(fields, dets, nside, coordinates, nthreads)):
-                presampled[first + j] = r
-            first += len(dets)
-            yield from items
-
-    for d in batches():  # one detector (or group) at a time: only its pointings are in memory (but a batch)
-        if not isinstance(d, DetectorGroup):
-            add(d)
-            continue
-        # a group: chunks at the same times, not split at gaps (that would break
-        # the alignment); one common_modes entry per chunk of time
-        idx = [add(x, split=False) for x in d.detectors]
-        if reuse and not conditional:
-            continue
-        fs = d.detectors[0].sampling_rate_hz
-        U = np.array([mode.coupling for mode in d.modes], dtype=float).T  # (ndet, r)
-        for chunks in zip(*idx):
-            nfft = fit.gls._nfft[chunks[0]] if reuse else nfft_c[chunks[0]]
-            lam = np.array([1 / np.maximum(w, w.max() * 1e-12) for w in (mode.noise.weights(nfft, fs) for mode in d.modes)])
-            common_modes.append((list(chunks), U, lam))
+    chunks = _ChunkBuilder(nside, coordinates, params, comm, nthreads, fit)
+    for j, d in chunks.items(data):  # one detector (or group) at a time: only its pointings are in memory (but a batch)
+        chunks.add_item(j, d)
+    reuse, conditional, cal = chunks.reuse, chunks.conditional, chunks.cal
+    priors, templates, shared, gain_ids = chunks.priors, chunks.templates, chunks.shared, chunks.gain_ids
+    tod_c, model_c, common_modes, gains, local = chunks.tod, chunks.model_tod, chunks.common_modes, chunks.gains, chunks.local
 
     t1 = time.perf_counter()
     prior = None if not priors else tuple(np.concatenate(x) for x in zip(*priors))
@@ -1636,14 +1692,15 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls = fit.gls
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
-        gls = _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior,
-                       params, nside, comm, nthreads, fit, fs_c, (gx_c, gy_c) if params.subpixel_order else None)
+        gls = _new_gls(chunks.pix, chunks.w, chunks.a2, chunks.gamma, chunks.nfft, common_modes, templates, shared,
+                       prior, shared_prior, params, nside, comm, nthreads, fit, chunks.fs,
+                       (chunks.gx, chunks.gy) if params.subpixel_order else None)
         if fit is not None and fit.fit:
             fit.gls = gls
-    del pix_c, a2_c, gamma_c, gx_c, gy_c
+    chunks.pix = chunks.a2 = chunks.gamma = chunks.gx = chunks.gy = None
     gap_iterations = None
     if conditional:
-        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, fill, flag_rng, nthreads)
+        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, chunks.fill, chunks.flag_rng, nthreads)
         if comm is not None:
             gap_iterations = max(comm.allgather(gap_iterations))
     # warm start from the previous calibration iteration (if the pixels are the same)
@@ -1656,7 +1713,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         if fit.fit:
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
             if cal is not None:
-                dg = [info["amplitudes"][o : o + g.size] for g, o in zip(gains, offsets)]
+                dg = [info["amplitudes"][o : o + g.size] for g, o in zip(gains, chunks.offsets)]
                 fit.dg_max = max((float(np.abs(x).max()) for x in dg if x.size), default=0.0)
                 gains = [g * (1 + x) for g, x in zip(gains, dg)]
             for k, amps in local.items():
@@ -1676,7 +1733,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * np.array([2.0, 1.0, 2.0])[:, None]) if params.subpixel_order > 1 else None
     if gradient is not None:
         maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
-    if verbose and rank == 0:
+    if verbose and chunks.rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
               f"({info['iterations']} iterations), maps {time.perf_counter() - t3:.1f} s", flush=True)
