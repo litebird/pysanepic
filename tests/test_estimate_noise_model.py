@@ -2,9 +2,9 @@
 
 make_maps fits d = g (P m + D + sum_k a_k B_k) + n. A residual consistent with
 it is d / g - D - sum a B - P m (the noise in calibrated units). These tests
-compare estimate_noise on the raw DetectorData with estimate_noise on the
-DetectorData cleaned by hand with the fitted gains and amplitudes (the
-reference: what estimate_noise should compute), with the same MapResult.
+compare estimate_noise on the DetectorData of make_maps with estimate_noise
+on the DetectorData cleaned by hand with the fitted gains and amplitudes and
+the maps alone (the reference: what estimate_noise should compute).
 """
 
 import dataclasses
@@ -24,6 +24,7 @@ from pysanepic import (
 
 NSIDE, FS, CHUNK, NCHUNK = 16, 10.0, 4000, 40
 SIGMA = 50.0 * np.sqrt(FS) * 1e-6  # NET 50 uK sqrt(s)
+PERIOD = 2 * CHUNK  # samples per amplitude of the template per period (2 per DetectorData)
 
 
 def _shape(f):
@@ -58,30 +59,32 @@ def _data(calibration, template):
 
 
 def _cleaned(data, result):
-    """The DetectorData with the fitted gains, dipole and templates removed by hand."""
+    """The DetectorData with the fitted gains, dipole and templates removed by
+    hand, and the MapResult with the maps alone."""
     out = []
     for i, d in enumerate(data):
         tod = np.array(d.tod, dtype=float)
+        t = np.arange(len(tod))
         if result.gains is not None:
-            g = result.gains[i]
-            tod = tod / g[np.arange(len(tod)) // CHUNK] - d.dipole
+            tod = tod / result.gains[i][t // CHUNK] - d.dipole
         for name, a in (result.templates or {}).items():
-            tod = tod - a[d.name] * d.templates[name]
+            a = a[i][t // PERIOD] if isinstance(a, list) else a[d.name]
+            tod = tod - a * d.templates[name]
         out.append(dataclasses.replace(d, tod=tod, dipole=None, templates=None))
-    return out
+    maps_only = dataclasses.replace(result, gains=None, templates=None, calibration=None, template_definitions=None)
+    return out, maps_only
 
 
-@pytest.mark.xfail(strict=True, reason="T1: estimate_noise models d - P m only, not d / g - D - sum a B - P m")
-@pytest.mark.parametrize("calibration, template", [(True, False), (False, True), (True, True)],
-                         ids=["gains+dipole", "template", "both"])
+@pytest.mark.parametrize("calibration, template", [(True, None), (False, "detector"), (True, "detector"), (True, "period")],
+                         ids=["gains+dipole", "template", "both", "both-period"])
 def test_estimate_noise_uses_fitted_model(calibration, template):
     data = _data(calibration, template)
     params = GLSParameters(chunk_s=CHUNK / FS, tol=1e-12)
     cal = CalibrationParameters(gain_period_s=CHUNK / FS, n_iter=3) if calibration else None
-    tmpl = {"thermal": Template()} if template else None
+    tmpl = {"thermal": Template(period_s=None if template == "detector" else PERIOD / FS)} if template else None
     result = make_maps(data, NSIDE, coordinates="E", params=params, calibration=cal, templates=tmpl)
     kw = {"chunk_s": CHUNK / FS, "nbins": 30}
-    ref = estimate_noise(_cleaned(data, result), result, **kw)
+    ref = estimate_noise(*_cleaned(data, result), **kw)
     # the reference is the noise (in calibrated units): the PSD of the simulation above
     # the knee (below, few modes per bin and the errors of the fitted amplitudes)
     for e in ref.values():
@@ -90,6 +93,8 @@ def test_estimate_noise_uses_fitted_model(calibration, template):
         assert np.max(np.abs(ratio - 1)) < 0.1
     raw = estimate_noise(data, result, **kw)
     for name, e in raw.items():
-        worst = np.max(np.abs(e.psd / ref[name].psd - 1))
-        print(f"{name}: max |PSD(raw) / PSD(cleaned) - 1| = {worst:.3g}")
-        assert worst < 1e-3
+        assert np.max(np.abs(e.psd / ref[name].psd - 1)) < 1e-8
+    # the gains and amplitudes per period are those of the DetectorData of make_maps
+    if calibration or template == "period":
+        with pytest.raises(ValueError, match="same order"):
+            estimate_noise(data[:-1], result, **kw)

@@ -365,6 +365,12 @@ class MapResult:
         derivatives of I (Ixx, Ixy, Iyy), in K per pixel side^2, along the
         axes of `gradient`; hp.UNSEEN where they are not solved (see GLS
         `subpixel_order`) or I is not. None otherwise.
+    calibration : the CalibrationParameters of make_maps (gain_period_s
+        gives the period of each gain), or None.
+    template_definitions : the {name: Template} of make_maps (fixed ones
+        included), or None. With `gains` and `templates` they give the TOD
+        model fitted by make_maps, d = g (P m + D + F + sum_k a_k B_k) + n,
+        whose residual :func:`estimate_noise` uses.
     """
 
     maps: np.ndarray
@@ -381,6 +387,8 @@ class MapResult:
     gap_fill_iterations: int | None = None
     gradient: np.ndarray | None = None
     hessian: np.ndarray | None = None
+    calibration: "CalibrationParameters | None" = None
+    template_definitions: dict | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1203,6 +1211,8 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
     res.templates = out or None
     res.template_covariance = cov
     res.calibration_iterations = None if calibration is None else n_cal
+    res.calibration = calibration
+    res.template_definitions = tmpls or None
     return res
 
 
@@ -1749,17 +1759,83 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
     )
 
 
-def _model_tod(d, maps, nside, coordinates, nthreads, gradient=None, hessian=None):
-    """P m for one DetectorData: the TOD of the maps (UNSEEN Q/U taken as 0),
-    with the sub-pixel `gradient` and `hessian` of I (MapResult), if any."""
-    pix, angle, loc = _pixels_and_angles(d, nside, coordinates, nthreads, loc=gradient is not None)
-    if gradient is not None:
-        maps = maps.copy()
-        maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
-    tod = _project_maps(maps, pix, angle, d.pol_efficiency, nthreads)
-    if gradient is not None:
-        tod += _subpixel_tod(_subpixel_maps(gradient, hessian), pix, *_pixel_offsets(pix, loc, nside, float, nthreads))
-    return tod
+def _periods(n, fs, seconds):
+    """The period of each of n samples, for periods of `seconds` (inf: one)
+    counted from the first sample, as the gains and the amplitudes per period."""
+    per = int(round(seconds * fs)) if np.isfinite(seconds) else n
+    return np.arange(n) // max(1, per)
+
+
+class _TODModel:
+    """The TOD model fitted by make_maps, from its MapResult:
+    d = g (P m + D + F + sum_k a_k B_k) + n, with the maps m (and their
+    sub-pixel gradient and Hessian), the gains g, the dipole D, the fixed
+    templates F and the fitted templates B_k with amplitudes a_k. The sky
+    model is in m (put back as its binned map).
+
+    The DetectorData are those given to make_maps, in the same order (groups
+    expanded): `j` is the position of a DetectorData among them, which picks
+    its gains and its amplitudes per period."""
+
+    def __init__(self, result, nthreads):
+        self.result, self.nthreads = result, nthreads
+        self.templates = dict(result.template_definitions or {})
+        self.skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky")
+                      for k, t in self.templates.items() if t.sky is not None}
+        self.alm = any(np.iscomplexobj(x) for x in self.skies.values())
+        self.maps = result.maps
+        if result.gradient is not None:  # the maps at the pixel centers, once
+            self.maps = result.maps.copy()
+            self.maps[0] -= _pixel_mean_shift(result.nside, result.gradient, result.hessian, nthreads)
+            self.sub = _subpixel_maps(result.gradient, result.hessian)
+        self.count = None if result.calibration is None else len(result.gains)
+        if self.count is None:
+            local = [v for k, v in (result.templates or {}).items() if self.templates[k].period_s is not None]
+            self.count = len(local[0]) if local else None
+
+    def check(self, n):
+        """n DetectorData were used: as many as in make_maps."""
+        if self.count is not None and n != self.count:
+            raise ValueError(f"estimate_noise: {n} DetectorData, but the MapResult has gains or amplitudes per period "
+                             f"for {self.count}: pass the data of make_maps, in the same order")
+
+    def _amplitude(self, k, d, j):
+        """a_k of DetectorData d (a number or one per sample), or None."""
+        t = self.templates[k]
+        if t.fixed:
+            return 1.0
+        a = self.result.templates[k]
+        if t.period_s is not None:
+            amp = a[j]
+            return amp[_periods(len(d.tod), d.sampling_rate_hz, t.period_s)] if amp.size else None
+        return a if t.common else a.get(d.name)
+
+    def residual(self, d, j):
+        """d / g - D - F - sum_k a_k B_k - P m for DetectorData d (a new array)."""
+        r, nthreads = self.result, self.nthreads
+        if self.count is not None and j >= self.count:
+            self.check(j + 1)
+        pix, angle, loc = _pixels_and_angles(d, r.nside, r.coordinates, nthreads,
+                                             loc=self.alm or r.gradient is not None)
+        res = np.array(d.tod, dtype=float)
+        if r.calibration is not None:
+            period = _periods(len(res), d.sampling_rate_hz, r.calibration.gain_period_s)
+            with numba_threads(nthreads):
+                _calibrated(res, r.gains[j], period, np.asarray(d.dipole, dtype=float), np.zeros(len(res)), res)
+        for k in self.templates:
+            if k in self.skies:
+                b = _sample(self.skies[k], d, pix, angle, loc, nthreads)
+            elif d.templates is not None and k in d.templates:
+                b = np.asarray(d.templates[k], dtype=float)
+            else:
+                continue
+            a = self._amplitude(k, d, j)
+            if a is not None:
+                res -= a * b
+        res -= _project_maps(self.maps, pix, angle, d.pol_efficiency, nthreads)
+        if r.gradient is not None:
+            res -= _subpixel_tod(self.sub, pix, *_pixel_offsets(pix, loc, r.nside, float, nthreads))
+        return res
 
 
 def _project_maps(maps, pix, angle, pol_efficiency, nthreads=1):
@@ -1808,15 +1884,15 @@ def _fit_one_over_f(f, psd, fs, model):
                          alpha=float(q[2]), fmin_hz=float(np.exp(q[3])), model=model)
 
 
-def _group_cross_spectra(g, result, chunk_s, nbins, nthreads, acc):
-    """Add the binned cross-periodograms of the residuals of the detectors of
+def _group_cross_spectra(g, model, j, chunk_s, nbins, nthreads, acc):
+    """Add the binned cross-periodograms of the residuals (_TODModel `model`;
+    the first detector is DetectorData j of make_maps) of the detectors of
     DetectorGroup `g` to acc[names] = [fs, R (nbins, n, n), modes, sum of log f]."""
     dets = g.detectors
     if any(d.name is None for d in dets):
         raise ValueError("estimate_noise: the detectors of a DetectorGroup need a name")
     key, n, fs = tuple(d.name for d in dets), len(dets), dets[0].sampling_rate_hz
-    res = np.array([np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads, result.gradient,
-                                                                  result.hessian) for d in dets])
+    res = np.array([model.residual(d, j + i) for i, d in enumerate(dets)])
     good = np.ones(res.shape, bool)
     for i, d in enumerate(dets):
         if d.flags is not None:
@@ -1879,8 +1955,12 @@ def _fit_common_modes(R, w, r, maxiter=2000, tol=1e-10):
 def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None, nthreads=None, n_modes=1):
     """Noise spectrum of each detector from the residual of a map.
 
-    The residual d - P m of each DetectorData, with m the maps of `result`
-    (a MapResult, e.g. a first make_maps), is cut in chunks of `chunk_s`
+    The residual of each DetectorData with respect to the TOD model of
+    `result` (a MapResult, e.g. a first make_maps), d - P m with m its maps,
+    or with calibration and templates d / g - D - F - sum_k a_k B_k - P m with
+    the fitted gains and amplitudes (the noise in the units of the calibrated
+    TOD; `data` must then be the data of make_maps, in the same order), is
+    cut in chunks of `chunk_s`
     seconds; the periodogram of each chunk (Hann window, flagged samples set
     to 0, normalized by the window energy left) is averaged over all the chunks of the
     DetectorData with the same `name` (on all MPI processes), in `nbins`
@@ -1905,16 +1985,19 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
     the scan), so iterating make_maps / estimate_noise once is usually enough.
     """
     nthreads = resolve_nthreads(nthreads)
+    model = _TODModel(result, nthreads)
     acc = {}  # name -> [fs, sum of P per bin, count per bin, sum of log f per bin]
     gacc = {}  # names of a group -> [fs, sum of the cross-spectra per bin, count, sum of log f]
+    j = 0  # DetectorData so far, groups expanded: the index of their gains and amplitudes per period
     for i, d in enumerate(data):
         if isinstance(d, DetectorGroup):
-            _group_cross_spectra(d, result, chunk_s, nbins, nthreads, gacc)
+            _group_cross_spectra(d, model, j, chunk_s, nbins, nthreads, gacc)
+            j += len(d.detectors)
             continue
         key = i if d.name is None else d.name
         fs = d.sampling_rate_hz
-        res = np.asarray(d.tod, dtype=float) - _model_tod(d, result.maps, result.nside, result.coordinates, nthreads,
-                                                          result.gradient, result.hessian)
+        res = model.residual(d, j)
+        j += 1
         if d.flags is not None:
             res[d.flags] = 0.0
         edges = np.geomspace(1.0 / chunk_s, fs / 2, nbins + 1)
@@ -1935,6 +2018,7 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
             np.add.at(a_[1], k[ok], p[1:-1][ok])
             np.add.at(a_[2], k[ok], 1)
             np.add.at(a_[3], k[ok], np.log(f[1:-1][ok]))
+    model.check(j)
     if comm is not None:  # the DetectorData of a detector (or the groups of a wafer) may be on several processes
         merged, gmerged = {}, {}
         for part, gpart in comm.allgather((acc, gacc)):
