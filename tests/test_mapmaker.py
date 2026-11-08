@@ -877,6 +877,19 @@ def test_subpixel_hessian():
         GLSParameters(subpixel_order=3)
 
 
+def test_parameters_checked_when_built():
+    """GLSParameters with an invalid sample_batch or coarse_nside raise when built,
+    before make_maps; a coarse_nside above the nside of the maps raises in make_maps."""
+    for bad in (0, 1.5):
+        with pytest.raises(ValueError, match="sample_batch must be an int >= 1"):
+            GLSParameters(sample_batch=bad)
+    for bad in (-1, 3):
+        with pytest.raises(ValueError, match="coarse_nside"):
+            GLSParameters(coarse_nside=bad)
+    with pytest.raises(ValueError, match="coarse_nside"):
+        make_maps([], 4, params=GLSParameters(coarse_nside=8))
+
+
 def _bandpass_data(nside, n, fs, per, amp):
     """_calibration_data plus a foreground seen as (1 + amp[i]) F by detector i."""
     data, true, sky = _calibration_data(nside, n, fs, per)
