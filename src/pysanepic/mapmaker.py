@@ -392,8 +392,53 @@ class MapResult:
     template_definitions: dict | None = None
 
 
+class _FlagTreatment:
+    """What make_maps does with the flagged samples of a GLSParameters.flag_method
+    (from _flag_treatment): their pixel labels for GLS (`_labels`: negative,
+    a repeated label is one unknown; -1 for the treatments of GLS itself), the
+    TOD fill (`_local_fill`: once, before the GLS setup; `_conditional`: after
+    it, conditional on the valid noise; `_seed` of the random fills) and the
+    flag arguments of GLS (`_gls_args`)."""
+
+    _local_fill = False
+    _conditional = False
+    _seed = 0
+
+    def _labels(self, flagged):
+        """The labels of the flagged samples `flagged` (a mask) of a chunk."""
+        return -1
+
+    def _gls_args(self, fs):
+        """The flag arguments of GLS for the sampling rates `fs` of the chunks."""
+        raise NotImplementedError
+
+    def _check(self, fit):
+        """Raise ValueError if the treatment cannot be used with `fit` (a _Fit or None)."""
+
+
+@dataclass(frozen=True)
+class _Marginalize(_FlagTreatment):
+    """flag_method "marginalize": one unknown per flagged sample."""
+
+    def _labels(self, flagged):
+        return -1 - np.arange(int(flagged.sum()), dtype=np.int32)
+
+    def _gls_args(self, fs):
+        return {"flag_method": "marginalize"}
+
+
+@dataclass(frozen=True)
+class _Offset(_Marginalize):
+    """flag_method "offset": one unknown per run of flagged samples (repeated
+    labels, for the "marginalize" method of GLS)."""
+
+    def _labels(self, flagged):
+        starts, stops = _flag_runs(flagged)
+        return np.repeat(-1 - np.arange(starts.size, dtype=np.int32), stops - starts)
+
+
 @dataclass(frozen=True, kw_only=True)
-class ACTCuts:
+class ACTCuts(_FlagTreatment):
     """GLSParameters.flag_method: each run of flagged samples is fitted by its
     own polynomial coefficients (the compressed cut model of Naess et al. 2025,
     Sect. 3.3.3), and its TOD is set to 0 (no random filling). Exact GLS with
@@ -416,9 +461,12 @@ class ACTCuts:
     def __post_init__(self):
         _validate_act_ncoeff(self.ncoeff)
 
+    def _gls_args(self, fs):
+        return {"flag_method": "act", "flag_sampling_rate_hz": fs, "act_ncoeff": self.ncoeff}
+
 
 @dataclass(frozen=True, kw_only=True)
-class GapFill:
+class GapFill(_FlagTreatment):
     """GLSParameters.flag_method: flagged samples have no unknowns; their TOD
     is filled once, held fixed during the map solve, and their pointing and
     template rows are excluded (Patanchon et al. 2008, Sect. 3.6). Approximate:
@@ -469,15 +517,36 @@ class GapFill:
         if self.mode == "conditional_mean" and self.seed != default["seed"]:
             warnings.warn("GapFill.seed has no effect with mode='conditional_mean': no random numbers", stacklevel=3)
 
+    @property
+    def _local_fill(self):
+        return self.mode == "local_white"
 
-def _flag_treatment(method):
-    """GLSParameters.flag_method as "marginalize", "offset", ACTCuts or GapFill."""
-    if isinstance(method, str) and method == "act":
-        return ACTCuts()
-    if isinstance(method, (ACTCuts, GapFill)) or (isinstance(method, str) and method in ("marginalize", "offset")):
-        return method
-    hint = " (now GapFill(...))" if method == "sanepic" else ""
-    raise ValueError(f"Unknown flag_method {method!r}{hint}: use 'marginalize', 'offset', 'act', ACTCuts(...) or GapFill(...)")
+    @property
+    def _conditional(self):
+        return self.mode != "local_white"
+
+    @property
+    def _seed(self):
+        return self.seed
+
+    def _gls_args(self, fs):
+        return {"flag_method": "fill"}
+
+    def _check(self, fit):
+        if self._conditional and (fit is None or fit.sky is None):
+            raise ValueError("a conditional GapFill requires sky_model to condition noise residuals "
+                             "(pass a zero model for noise-only TOD)")
+
+
+def _flag_treatment(method, fit):
+    """GLSParameters.flag_method as a _FlagTreatment, checked for `fit` (a _Fit or None)."""
+    if isinstance(method, str) and method in ("marginalize", "offset", "act"):
+        method = {"marginalize": _Marginalize, "offset": _Offset, "act": ACTCuts}[method]()
+    if not isinstance(method, (ACTCuts, GapFill, _Marginalize)):
+        hint = " (now GapFill(...))" if method == "sanepic" else ""
+        raise ValueError(f"Unknown flag_method {method!r}{hint}: use 'marginalize', 'offset', 'act', ACTCuts(...) or GapFill(...)")  # noqa: TRY004
+    method._check(fit)
+    return method
 
 
 @dataclass(kw_only=True)
@@ -858,9 +927,23 @@ def _pixel_offsets(pix, loc, nside, dtype, nthreads):
     return gx.astype(dtype, copy=False), gy.astype(dtype, copy=False)
 
 
+# The sub-pixel terms of I (GLSParameters.subpixel_order) in two forms, for the
+# offsets (x, y) of the samples from the pixel center in pixel sides (_offsets):
+# - GLS: the solution of GLS, I/Q/U then the components s multiplying
+#   (x, y[, x^2 - 1/12, x y, y^2 - 1/12]) in the TOD (gls._project, and
+#   _subpixel_tod here): I + s0 x + s1 y [+ s2 (x^2 - 1/12) + s3 x y + s4 (y^2 - 1/12)];
+# - MapResult: maps with I the mean of this model over the pixel (geometric
+#   moments of the HEALPix pixels), gradient = (s0, s1), hessian = (Ixx, Ixy, Iyy) = (2 s2, s3, 2 s4).
+# _subpixel_result converts the first into the second (make_maps), _subpixel_gls back
+# (the TOD model of a MapResult, estimate_noise). Inside the fit (e.g. the gain template)
+# everything stays in the GLS form.
+_HESSIAN = np.array([2.0, 1.0, 2.0])  # MapResult.hessian / GLS components
+
+
 def _subpixel_tod(sub, pix, gx, gy):
-    """The sub-pixel terms of the maps `sub` (2 or 5, npix), the GLS
-    components after I/Q/U (see GLS `offsets`, `subpixel_order`), UNSEEN as 0."""
+    """The sub-pixel terms of the TOD from the GLS components `sub` (2 or 5,
+    npix) and the offsets (gx, gy) of the samples, UNSEEN as 0: the same
+    model as the projection of GLS."""
     g = sub[:, pix]
     g[g == hp.UNSEEN] = 0.0
     tod = g[0] * gx + g[1] * gy
@@ -909,12 +992,28 @@ def _pixel_mean_shift(nside, gradient, hessian, nthreads):
     return shift
 
 
-def _subpixel_maps(gradient, hessian):
-    """The GLS sub-pixel components of MapResult.gradient and .hessian."""
+def _subpixel_result(maps, npol, order, nside, nthreads):
+    """GLS form -> MapResult form: (maps (npol, npix) with I the pixel mean,
+    gradient or None, hessian or None) of the GLS maps `maps` (npol + 0, 2 or
+    5 components, UNSEEN where not solved) for subpixel_order `order`."""
+    sub, maps = maps[npol:], maps[:npol]
+    if not order:
+        return maps, None, None
+    gradient = sub[:2]
+    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * _HESSIAN[:, None]) if order > 1 else None
+    maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    return maps, gradient, hessian
+
+
+def _subpixel_gls(maps, gradient, hessian, nside, nthreads):
+    """MapResult form -> GLS form: (maps with I as in the TOD model of GLS
+    (a copy), the GLS sub-pixel components) of MapResult.maps, .gradient (not
+    None) and .hessian; the inverse of _subpixel_result."""
+    maps = maps.copy()
+    maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
     if hessian is None:
-        return gradient
-    h = np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian * np.array([0.5, 1.0, 0.5])[:, None])
-    return np.concatenate([gradient, h])
+        return maps, gradient
+    return maps, np.concatenate([gradient, np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian / _HESSIAN[:, None])])
 
 
 def _pixels_and_angles(d, nside, coordinates, nthreads, loc=False):
@@ -976,15 +1075,6 @@ def _split_at_gaps(a, b, flags, min_len):
     long = stops - starts >= max(min_len, 1)
     cuts = [a] + [x for s0, s1 in zip(starts[long], stops[long]) for x in (a + s0, a + s1)] + [b]
     return [(lo, hi) for lo, hi in zip(cuts[0::2], cuts[1::2]) if hi > lo]
-
-
-def _flag_labels(f, method):
-    """Negative labels of the flagged samples of a chunk for GLS: one unknown
-    per sample ("marginalize") or per run ("offset")."""
-    if method == "marginalize":
-        return -1 - np.arange(int(f.sum()), dtype=np.int32)
-    starts, stops = _flag_runs(f)
-    return np.repeat(-1 - np.arange(starts.size, dtype=np.int32), stops - starts)
 
 
 @numba.njit(nogil=True, cache=True)
@@ -1570,12 +1660,10 @@ class _ChunkBuilder:
     def __init__(self, nside, coordinates, params, comm, nthreads, fit):
         self.nside, self.coordinates, self.params, self.nthreads, self.fit = nside, coordinates, params, nthreads, fit
         self.reuse = fit is not None and fit.fit and fit.gls is not None
-        self.method = _flag_treatment(params.flag_method)
-        self.fill = self.method if isinstance(self.method, GapFill) else None
-        self.conditional = self.fill is not None and self.fill.mode != "local_white"
+        self.method = _flag_treatment(params.flag_method, fit)
         self.npix = 12 * nside * nside
         self.rank, self.size = (0, 1) if comm is None else (comm.rank, comm.size)
-        self.flag_rng = np.random.default_rng(np.random.SeedSequence([0 if self.fill is None else self.fill.seed, self.rank]))
+        self.flag_rng = np.random.default_rng(np.random.SeedSequence([self.method._seed, self.rank]))
         self.dtype = params.angle_dtype
         self.npol = 3 if params.pol else 1
         self.model = None if fit is None else _TODModel.from_fit(fit, nthreads)  # with the current estimates
@@ -1626,7 +1714,7 @@ class _ChunkBuilder:
         # a group: chunks at the same times, not split at gaps (that would break
         # the alignment); one common_modes entry per chunk of time
         idx = [self.add(x, j + i, split=False) for i, x in enumerate(d.detectors)]
-        if self.reuse and not self.conditional:
+        if self.reuse and not self.method._conditional:
             return
         fs = d.detectors[0].sampling_rate_hz
         U = np.array([mode.coupling for mode in d.modes], dtype=float).T  # (ndet, r)
@@ -1689,7 +1777,7 @@ class _ChunkBuilder:
             if fit.residual is not None:
                 with numba_threads(nthreads):
                     _axpy(det.gain, 1.0, _project_maps(fit.residual[:self.npol], pix, angle, d.pol_efficiency, nthreads))
-                    if offsets is not None:
+                    if offsets is not None:  # fit.residual is in the GLS form, as _subpixel_tod
                         _axpy(det.gain, 1.0, _subpixel_tod(fit.residual[self.npol:], pix, *offsets))
         det.tod = model.calibrated(d, known, gain)
         # masks: samples out of every active fit are flagged; out of some, their templates are 0
@@ -1740,7 +1828,7 @@ class _ChunkBuilder:
                     self.model_tod.append(_padded(det.sky, a, b, m, np.float64))
             flagged = None if det.flags is None else det.flags[a:b]
             if flagged is not None and flagged.any():
-                if self.fill is not None and not self.conditional:
+                if self.method._local_fill:
                     filled = _fill_flagged(tod, flagged, self.flag_rng)
                     tod = filled if m else _GapFilledTOD(tod, flagged, filled[flagged])
                     del filled
@@ -1781,7 +1869,7 @@ class _ChunkBuilder:
             p = pix[a:b].astype(np.int32)
             flagged = None if flags is None else flags[a:b]
             if flagged is not None and flagged.any():
-                p[flagged] = -1 if isinstance(self.method, (ACTCuts, GapFill)) else _flag_labels(flagged, self.method)
+                p[flagged] = self.method._labels(flagged)
             if m == 0:
                 self.pix.append(p)
             else:
@@ -1796,9 +1884,6 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     the first, the GLS of the first one is reused (same pixels, flags and
     chunks): only the TOD and the templates are built."""
     params = GLSParameters() if params is None else params
-    method = _flag_treatment(params.flag_method)
-    if isinstance(method, GapFill) and method.mode != "local_white" and (fit is None or fit.sky is None):
-        raise ValueError("a conditional GapFill requires sky_model to condition noise residuals (pass a zero model for noise-only TOD)")
     if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
         raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
     nc = params.coarse_nside
@@ -1811,7 +1896,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     chunks = _ChunkBuilder(nside, coordinates, params, comm, nthreads, fit)
     for j, d in chunks.items(data):  # one detector (or group) at a time: only its pointings are in memory (but a batch)
         chunks.add_item(j, d)
-    reuse, conditional, cal = chunks.reuse, chunks.conditional, chunks.cal
+    reuse, conditional, cal = chunks.reuse, chunks.method._conditional, chunks.cal
     templates, shared, gain_ids = chunks.templates, chunks.shared, chunks.gain_ids
     tod_c, model_c, common_modes = chunks.tod, chunks.model_tod, chunks.common_modes
 
@@ -1825,14 +1910,14 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
         gls = _new_gls(chunks.pix, chunks.w, chunks.a2, chunks.gamma, chunks.nfft, common_modes, templates, shared,
-                       prior, shared_prior, params, nside, comm, nthreads, fit, chunks.fs,
-                       (chunks.gx, chunks.gy) if params.subpixel_order else None)
+                       prior, shared_prior, params, nside, comm, nthreads, fit, chunks.method,
+                       chunks.fs, (chunks.gx, chunks.gy) if params.subpixel_order else None)
         if fit is not None and fit.fit:
             fit.gls = gls
     chunks.pix = chunks.a2 = chunks.gamma = chunks.gx = chunks.gy = None
     gap_iterations = None
     if conditional:
-        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, chunks.fill, chunks.flag_rng, nthreads)
+        gap_iterations = _conditional_tod(tod_c, gls, npix, common_modes, chunks.method, chunks.flag_rng, nthreads)
         if comm is not None:
             gap_iterations = max(comm.allgather(gap_iterations))
     # warm start from the previous calibration iteration (if the pixels are the same)
@@ -1851,12 +1936,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)
     hit_map[:n] = gls.full(gls.hits)[:n]
-    maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
-    sub, maps = maps[npol:], maps[:npol]
-    gradient = sub[:2] if params.subpixel_order else None
-    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * np.array([2.0, 1.0, 2.0])[:, None]) if params.subpixel_order > 1 else None
-    if gradient is not None:
-        maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    maps, gradient, hessian = _subpixel_result(gls.to_healpix(m, nside, fill=hp.UNSEEN), npol, params.subpixel_order,
+                                               nside, nthreads)
     if verbose and chunks.rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
@@ -1886,8 +1967,7 @@ def _padded(x, a, b, m, dtype):
 
 
 def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior, params, nside, comm,
-             nthreads, fit, fs_c, offsets=None):
-    method = _flag_treatment(params.flag_method)
+             nthreads, fit, method, fs_c, offsets=None):
     nc = params.coarse_nside
     return GLS(
         pix_c,
@@ -1910,9 +1990,7 @@ def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared,
         shared_prior=shared_prior,
         shared_groups=fit.amplitudes.groups if fit is not None and fit.fit else None,
         template_dtype=params.template_dtype,
-        flag_method="act" if isinstance(method, ACTCuts) else "fill" if isinstance(method, GapFill) else "marginalize",
-        flag_sampling_rate_hz=fs_c if isinstance(method, ACTCuts) else None,
-        act_ncoeff=method.ncoeff if isinstance(method, ACTCuts) else None,
+        **method._gls_args(fs_c),
         offsets=offsets,
         subpixel_order=params.subpixel_order,
     )
@@ -1955,10 +2033,8 @@ class _TODModel:
         skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky") for k, t in templates.items() if t.sky is not None}
         model = cls(templates, skies, None, _Amplitudes.from_result(result), nthreads)
         model.result, model.maps = result, result.maps
-        if result.gradient is not None:  # the maps at the pixel centers, once
-            model.maps = result.maps.copy()
-            model.maps[0] -= _pixel_mean_shift(result.nside, result.gradient, result.hessian, nthreads)
-            model.sub = _subpixel_maps(result.gradient, result.hessian)
+        if result.gradient is not None:  # back to the GLS form of the sub-pixel terms, once
+            model.maps, model.sub = _subpixel_gls(result.maps, result.gradient, result.hessian, result.nside, nthreads)
         return model
 
     @property
