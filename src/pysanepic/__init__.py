@@ -1,4 +1,4 @@
-__version__ = "0.6.4"
+__version__ = "0.6.5"
 
 from .gls import GLS, fast_fft_length, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 from .gapfill import conditional_gap_fill
