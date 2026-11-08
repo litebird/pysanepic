@@ -691,25 +691,26 @@ def _weights(i, c2, s2, pol, gx, gy, grad, w):
 
 
 @numba.njit(nogil=True, cache=True)
-def _coverage(ip, c2, s2, pol, gx, gy, grad, out):
+def _coverage(ip, c2, s2, pol, gx, gy, grad, out, scale=1.0):
     """Per pixel: hits, polarized hits (gamma > 0.5, as SANEPIC) and the sums of
     w_a w_b, a <= b, (a, b) != (0, 0), row by row, with w the pointing
     weights (see _weights): with pol only, c2, s2, c2^2, c2 s2, s2^2 (the
-    angle-coverage matrix). Serial: the chunks are summed in parallel into
-    private arrays (GLS._chunk_coverage)."""
+    angle-coverage matrix), each sample counted `scale` times (the weight of
+    the chunk in a weighted binned map). Serial: the chunks are summed in
+    parallel into private arrays (GLS._chunk_coverage)."""
     w = np.empty(8)
     for i in range(ip.size):
         p = ip[i]
         if p < 0 or p >= out.shape[0]:  # flagged sample
             continue
-        out[p, 0] += 1.0
+        out[p, 0] += scale
         n = _weights(i, c2, s2, pol, gx, gy, grad, w)
         if pol and w[1] * w[1] + w[2] * w[2] > 0.25:
-            out[p, 1] += 1.0
+            out[p, 1] += scale
         col = 2
         for a in range(n):
             for b in range(max(a, 1), n):
-                out[p, col] += w[a] * w[b]
+                out[p, col] += scale * w[a] * w[b]
                 col += 1
 
 
@@ -1380,11 +1381,12 @@ class GLS:
                 diag[a] += x
         return diag
 
-    def _chunk_coverage(self):
-        """The coverage (nobs, _ncov) of this rank's chunks (see _coverage): the
-        chunks in parallel, worker j on chunks j, j + nw, ... into its own
-        array, summed in place in a fixed order. At most 8 workers, limited
-        by _COVERAGE_BYTES (8 _ncov bytes per pixel each, at least one array)."""
+    def _chunk_coverage(self, scale=None):
+        """The coverage (nobs, _ncov) of this rank's chunks (see _coverage), each
+        chunk k counted scale[k] times (None: once): the chunks in parallel,
+        worker j on chunks j, j + nw, ... into its own array, summed in place
+        in a fixed order. At most 8 workers, limited by _COVERAGE_BYTES (8
+        _ncov bytes per pixel each, at least one array)."""
         max_workers = max(1, _COVERAGE_BYTES // max(8 * self._ncov * self.nobs, 1))
         nw = min(self.nthreads, len(self.ip), 8, max_workers)
         # Separate allocations: returning covs[0] must not retain the others.
@@ -1399,7 +1401,7 @@ class GLS:
                 if self.pol:
                     _cos_sin_1(self.angle2[k], self.gamma[k], c2[:n], s2[:n], _TRIG_COS, _TRIG_SIN)
                 _coverage(self.ip[k], c2[:n] if self.pol else c2, s2[:n] if self.pol else s2, self.pol,
-                          *self._grad_arrays(k), covs[j])
+                          *self._grad_arrays(k), covs[j], 1.0 if scale is None else float(scale[k]))
 
         list(map(work, range(nw)) if nw <= 1 else self._workers(nw).map(work, range(nw)))
         for cov in covs[1:]:
@@ -1931,19 +1933,44 @@ class GLS:
                 print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
         return x, it, history
 
-    def binned(self, tod):
-        """Binned map (P^T P)^-1 P^T tod (white noise), (ncomp, nobs) on every
-        rank, for timelines laid out like `pix`; I only where Q/U are not
-        solved (no gradient where it is not), 0 where not observed; flagged
-        samples are not used. Collective with MPI."""
+    def white_weights(self):
+        """The white-noise weight of each chunk of this rank, 1 / sigma^2 for
+        white noise of rms sigma per sample: the median of its inverse PSD
+        (`weights`) over the upper half of the frequencies, where 1/f noise
+        is negligible (relative error ~ (fknee / (fs / 4))^alpha). The
+        common modes are not included."""
+        return np.array([float(np.median(np.asarray(w, dtype=float)[len(w) // 2 :])) for w in self.weights])
+
+    def binned(self, tod, weights="equal"):
+        """Binned map (P^T W P)^-1 P^T W tod, (ncomp, nobs) on every rank, for
+        timelines laid out like `pix`, with W one weight per chunk: "equal"
+        (default: W = 1, all the samples alike), "noise" (the white-noise
+        weights of the chunks, 1 / sigma^2, see white_weights: the optimal
+        binned map with white noise of different levels) or an array of one
+        weight > 0 per chunk of this rank (e.g. the same weight for the
+        detectors of a pair). I only where Q/U are not solved (no gradient
+        where it is not), 0 where not observed; flagged samples are not
+        used. Collective with MPI."""
         tod = _chunks(tod)
-        cov = self._cov  # the coverage of the setup: the same samples
+        if isinstance(weights, str):
+            if weights not in ("equal", "noise"):
+                raise ValueError(f"binned: weights must be 'equal', 'noise' or one weight per chunk, not {weights!r}")
+            scale = None if weights == "equal" else self.white_weights()
+        else:
+            scale = np.asarray(weights, dtype=float)
+            if scale.shape != (len(self.ip),) or not np.all(np.isfinite(scale) & (scale > 0)):
+                raise ValueError(f"binned: weights must be one finite weight > 0 per chunk ({len(self.ip)} on this rank)")
+        # the same samples as the setup: its coverage if not weighted
+        cov = self._cov if scale is None else self._scatter_sum(self._chunk_coverage(scale), by_column=True)
         rhs = np.zeros((self.nobs, self.ncomp))
         flag = np.zeros(self.nflag)  # not used
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
                 pol, c2, s2 = self._pol_arrays(k)
-                _backproject(ip, np.asarray(tod[k], dtype=float), c2, s2, pol, *self._grad_arrays(k), self._edges, rhs, flag)
+                t = np.asarray(tod[k], dtype=float)
+                if scale is not None:
+                    t = t * scale[k]
+                _backproject(ip, t, c2, s2, pol, *self._grad_arrays(k), self._edges, rhs, flag)
         rhs = self._scatter_sum(rhs)
         out = np.zeros((self.ncomp, self.nloc))
         i_only = self.mask[0] & ~self.mask[1:].any(axis=0)

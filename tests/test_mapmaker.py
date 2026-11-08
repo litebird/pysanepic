@@ -1979,6 +1979,77 @@ def test_relative_detector_weights():
     assert np.abs(flat - ref).max() > 0.1 * np.abs(ref).max()
 
 
+def test_binned_weights():
+    """GLS.binned: "equal" is (P^T P)^-1 P^T d, "noise" and per-chunk weights
+    (P^T W P)^-1 P^T W d with W the weight of each chunk; white_weights is
+    1 / sigma^2 (exactly for white noise, to ~(fknee / (fs / 4))^alpha with 1/f)."""
+    from pysanepic import GLS
+
+    rng = np.random.default_rng(21)
+    npix, ns, fs = 6, 400, 10.0
+    sigmas = np.array([1.0, 3.0, 0.5, 2.0])
+    pix = rng.integers(0, npix, (sigmas.size, ns))
+    psi = rng.uniform(0, np.pi, (sigmas.size, ns))
+    tod = rng.normal(size=(sigmas.size, ns))
+    weights = np.array([one_over_f_weights(ns, fs, s, 0.0, 1.0) for s in sigmas])
+    g = GLS(pix, psi, weights, min_pol_rcond=0.0, angle_dtype=np.float64)
+    assert np.allclose(g.white_weights(), 1 / sigmas**2, rtol=1e-14)
+
+    def ref(wt):
+        M, v = np.zeros((npix, 3, 3)), np.zeros((npix, 3))
+        for p, a, t, w in zip(pix, psi, tod, wt):
+            u = np.stack([np.ones(ns), np.cos(2 * a), np.sin(2 * a)], axis=1)
+            np.add.at(M, p, w * u[:, :, None] * u[:, None, :])
+            np.add.at(v, p, w * u * t[:, None])
+        return np.linalg.solve(M, v[..., None])[..., 0].T
+
+    for wt, arg in [(np.ones(4), "equal"), (1 / sigmas**2, "noise"), (np.array([2.0, 2.0, 0.3, 0.3]), [2.0, 2.0, 0.3, 0.3])]:
+        r = ref(wt)
+        assert np.abs(g.binned(tod, weights=arg) - r).max() < 1e-12 * np.abs(r).max()
+    assert np.array_equal(g.binned(tod), g.binned(tod, weights="equal"))
+    assert np.abs(g.binned(tod, weights="noise") - ref(np.ones(4))).max() > 1e-2  # sensitive to the weights
+    # white noise: the GLS map is the binned map weighted by 1 / sigma^2
+    x, _ = g.solve(tod, tol=1e-26)
+    assert np.abs(x - g.binned(tod, weights="noise")).max() < 1e-10 * np.abs(x).max()
+    for bad in ("white", [1.0, 1.0, 1.0], [1.0, 0.0, 1.0, 1.0], [1.0, np.nan, 1.0, 1.0]):
+        with pytest.raises(ValueError):
+            g.binned(tod, weights=bad)
+    # 1/f noise: the white level from the upper half of the band
+    w1f = one_over_f_weights(2**14, fs, 2.0, 0.05, 1.5, 1e-4)
+    g1f = GLS(rng.integers(0, npix, (1, 2**14)), None, w1f[None], pol_angles=None)
+    assert abs(g1f.white_weights()[0] * 4.0 - 1) < 5e-3
+
+
+def test_binned_weights_sky_model():
+    """With white noise of different levels and a sky model as alm, the maps
+    of a noiseless TOD with structure below the pixel size equal the GLS maps
+    without the model (the 1 / sigma^2 binned map) only if the model is put
+    back with binned_weights="noise" (default) or the same weights by name."""
+    nside, n, fs = 16, 60_000, 10.0
+    data, alm = _subpixel_data(nside, n, fs)
+    nets = {"d0": 30.0, "d1": 30.0, "d2": 120.0, "d3": 60.0}
+    data = [dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=nets[d.name])) for d in data]
+    params = GLSParameters(chunk_s=1200.0, tol=1e-22, angle_dtype=np.float64)
+    plain = make_maps(data, nside, coordinates="E", params=params)
+    seen = plain.maps[1] != hp.UNSEEN
+
+    def diff(p):
+        r = make_maps(data, nside, coordinates="E", params=dataclasses.replace(params, binned_weights=p), sky_model=alm)
+        return np.abs((r.maps - plain.maps)[:, seen]).max() / np.abs(plain.maps[:, seen]).max()
+
+    assert diff("noise") < 1e-10
+    assert diff({k: 1 / (v * np.sqrt(fs) * 1e-6) ** 2 for k, v in nets.items()}) < 1e-10
+    assert diff({k: 3.7 / v**2 for k, v in nets.items()}) < 1e-10  # only relative weights matter
+    assert diff("equal") > 1e-4
+    assert diff({"d0": 1.0, "d1": 1.0, "d2": 0.2, "d3": 0.2}) > 1e-4  # one weight per pair: another binned map
+    with pytest.raises(ValueError, match="d3"):
+        make_maps(data, nside, coordinates="E", params=dataclasses.replace(params, binned_weights={"d0": 1.0, "d1": 1.0, "d2": 1.0}),
+                  sky_model=alm)
+    for bad in ("white", {"d0": 0.0}, {"d0": np.inf}):
+        with pytest.raises(ValueError):
+            GLSParameters(binned_weights=bad)
+
+
 def test_noise_variance_monte_carlo():
     """1/f noise drawn from the toast PSD written here: the scatter of the GLS
     maps over realizations matches diag((P^T N^-1 P)^-1), with N from the same

@@ -12,6 +12,16 @@
   gains or amplitudes per period). The maps at the pixel centers of the
   sub-pixel model are computed once, not per `DetectorData`.
 
+- Weighted binned maps: `GLS.binned(tod, weights=...)` takes `"equal"`
+  (default, as before), `"noise"` (each chunk weighted by its white-noise
+  level 1/σ², `GLS.white_weights()`) or one weight per chunk.
+  `GLSParameters.binned_weights` sets the weights of the binned sky model
+  put back by `make_maps(sky_model=...)`: `"noise"` (new default, consistent
+  with the GLS weighting of detectors with different NETs), `"equal"` (the
+  behavior of 0.6.4) or `{detector name: weight}`, e.g. one weight per pair
+  of detectors in a horn. The maps change only with a sky model and
+  detectors of different white-noise levels.
+
 ## 0.6.4 (2026-11-05)
 
 - Sub-pixel terms of I, `GLSParameters(subpixel_order=1 or 2)` (GLS

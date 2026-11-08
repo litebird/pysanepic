@@ -640,6 +640,15 @@ class GLSParameters:
         in angle_dtype) and ~1.3-1.5x the PCG time with 1, ~1.15-1.3x more
         with 2 (no memory per sample); the white noise of I grows by <~1%.
         Polarization has no sub-pixel terms.
+    binned_weights : weights of the binned map of the sky model put back in
+        the maps (make_maps' `sky_model`; unused without it): "noise"
+        (default) weights each detector by its white-noise level 1 /
+        sigma^2 (the high-frequency inverse PSD of DetectorData.noise, see
+        GLS.white_weights), as the GLS weights its samples; "equal": every
+        sample alike (pysanepic <= 0.6.4); or {detector name: weight > 0}
+        for every DetectorData.name, e.g. one weight per pair of detectors
+        in a horn, 2 / (sigma_a^2 + sigma_b^2) for both, so that their
+        difference cancels the intensity in Q/U as in the pair.
     """
 
     chunk_s: float = 3600.0
@@ -659,6 +668,7 @@ class GLSParameters:
     template_dtype: type = np.float32
     sample_batch: int = 1
     subpixel_order: int = 0
+    binned_weights: str | dict = "noise"
 
     def __post_init__(self):
         if self.subpixel_order not in (0, 1, 2):
@@ -668,6 +678,12 @@ class GLSParameters:
         nc = self.coarse_nside
         if nc is not None and (nc < 0 or nc & (nc - 1)):
             raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
+        bw = self.binned_weights
+        if isinstance(bw, dict):
+            if not all(isinstance(v, (int, float, np.integer, np.floating)) and np.isfinite(v) and v > 0 for v in bw.values()):
+                raise ValueError("GLSParameters.binned_weights: the weights must be finite and > 0")
+        elif bw not in ("noise", "equal"):
+            raise ValueError(f"GLSParameters.binned_weights must be 'noise', 'equal' or {{detector name: weight}}, not {bw!r}")
 
     def _gls_settings(self, nside):
         """The solver settings among the arguments of GLS, for the maps at `nside`."""
@@ -1248,6 +1264,13 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                          "(theta, phi), not pixels (or pass them as maps)")
     if calibration is not None and any(d.dipole is None for d in dets):
         raise ValueError("calibration needs DetectorData.dipole")
+    bw = None if params is None else params.binned_weights
+    if sky is not None and isinstance(bw, dict):  # checked on every rank before the collective GLS
+        missing = sorted({str(d.name) for d in dets if d.name not in bw})
+        if comm is not None:
+            missing = sorted(set().union(*comm.allgather(missing)))
+        if missing:
+            raise ValueError(f"GLSParameters.binned_weights has no weight for the detectors {missing} (DetectorData.name)")
     amplitudes = _Amplitudes.build(tmpls, calibration, dets, comm)
     fitted = {k: t for k, t in tmpls.items() if not t.fixed}
     mask_gain = _mask(None if calibration is None else calibration.mask, nside, "CalibrationParameters.mask")
@@ -1688,8 +1711,8 @@ class _ChunkBuilder:
         self.npol = 3 if params.pol else 1
         self.model = None if fit is None else _TODModel.from_fit(fit, nthreads)  # with the current estimates
         self.cal = None if fit is None else fit.calibration
-        # every pass, one entry per chunk (TOD, sky model TOD) or per template
-        self.tod, self.model_tod = [], []
+        # every pass, one entry per chunk (TOD, sky model TOD, detector name) or per template
+        self.tod, self.model_tod, self.names = [], [], []
         self.templates, self.shared = [], []  # local and shared templates (chunk, values, labels)
         self.gain_ids = set()  # ids of the gain templates in `templates`
         if fit is not None:  # labels of the local amplitudes from 0
@@ -1855,6 +1878,7 @@ class _ChunkBuilder:
                 elif m:  # the padding must not use flagged TOD
                     tod = np.where(flagged, tod[~flagged].mean() if not flagged.all() else 0.0, tod)
             self.tod.append(tod if m == 0 else _pad(tod, m, params.pad_fill))
+            self.names.append(d.name)  # for binned_weights by name
 
     def _add_layout(self, d, flags, pix, angle, offsets, pieces):
         """The pixels, angles, noise weights and offsets of the chunks `pieces` of d (first pass)."""
@@ -1963,7 +1987,10 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
             fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
         fit.amplitudes.update(info if fit.fit else None)  # g (1 + dg), a + da, A + dA
         if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky
-            m = m + gls.binned(model_c)
+            bw = params.binned_weights
+            if isinstance(bw, dict):  # every name checked in make_maps
+                bw = np.array([bw[n] for n in chunks.names], dtype=float)
+            m = m + gls.binned(model_c, weights=bw)
 
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)
