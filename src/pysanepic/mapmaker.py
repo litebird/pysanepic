@@ -858,9 +858,23 @@ def _pixel_offsets(pix, loc, nside, dtype, nthreads):
     return gx.astype(dtype, copy=False), gy.astype(dtype, copy=False)
 
 
+# The sub-pixel terms of I (GLSParameters.subpixel_order) in two forms, for the
+# offsets (x, y) of the samples from the pixel center in pixel sides (_offsets):
+# - GLS: the solution of GLS, I/Q/U then the components s multiplying
+#   (x, y[, x^2 - 1/12, x y, y^2 - 1/12]) in the TOD (gls._project, and
+#   _subpixel_tod here): I + s0 x + s1 y [+ s2 (x^2 - 1/12) + s3 x y + s4 (y^2 - 1/12)];
+# - MapResult: maps with I the mean of this model over the pixel (geometric
+#   moments of the HEALPix pixels), gradient = (s0, s1), hessian = (Ixx, Ixy, Iyy) = (2 s2, s3, 2 s4).
+# _subpixel_result converts the first into the second (make_maps), _subpixel_gls back
+# (the TOD model of a MapResult, estimate_noise). Inside the fit (e.g. the gain template)
+# everything stays in the GLS form.
+_HESSIAN = np.array([2.0, 1.0, 2.0])  # MapResult.hessian / GLS components
+
+
 def _subpixel_tod(sub, pix, gx, gy):
-    """The sub-pixel terms of the maps `sub` (2 or 5, npix), the GLS
-    components after I/Q/U (see GLS `offsets`, `subpixel_order`), UNSEEN as 0."""
+    """The sub-pixel terms of the TOD from the GLS components `sub` (2 or 5,
+    npix) and the offsets (gx, gy) of the samples, UNSEEN as 0: the same
+    model as the projection of GLS."""
     g = sub[:, pix]
     g[g == hp.UNSEEN] = 0.0
     tod = g[0] * gx + g[1] * gy
@@ -909,12 +923,28 @@ def _pixel_mean_shift(nside, gradient, hessian, nthreads):
     return shift
 
 
-def _subpixel_maps(gradient, hessian):
-    """The GLS sub-pixel components of MapResult.gradient and .hessian."""
+def _subpixel_result(maps, npol, order, nside, nthreads):
+    """GLS form -> MapResult form: (maps (npol, npix) with I the pixel mean,
+    gradient or None, hessian or None) of the GLS maps `maps` (npol + 0, 2 or
+    5 components, UNSEEN where not solved) for subpixel_order `order`."""
+    sub, maps = maps[npol:], maps[:npol]
+    if not order:
+        return maps, None, None
+    gradient = sub[:2]
+    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * _HESSIAN[:, None]) if order > 1 else None
+    maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    return maps, gradient, hessian
+
+
+def _subpixel_gls(maps, gradient, hessian, nside, nthreads):
+    """MapResult form -> GLS form: (maps with I as in the TOD model of GLS
+    (a copy), the GLS sub-pixel components) of MapResult.maps, .gradient (not
+    None) and .hessian; the inverse of _subpixel_result."""
+    maps = maps.copy()
+    maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
     if hessian is None:
-        return gradient
-    h = np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian * np.array([0.5, 1.0, 0.5])[:, None])
-    return np.concatenate([gradient, h])
+        return maps, gradient
+    return maps, np.concatenate([gradient, np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian / _HESSIAN[:, None])])
 
 
 def _pixels_and_angles(d, nside, coordinates, nthreads, loc=False):
@@ -1689,7 +1719,7 @@ class _ChunkBuilder:
             if fit.residual is not None:
                 with numba_threads(nthreads):
                     _axpy(det.gain, 1.0, _project_maps(fit.residual[:self.npol], pix, angle, d.pol_efficiency, nthreads))
-                    if offsets is not None:
+                    if offsets is not None:  # fit.residual is in the GLS form, as _subpixel_tod
                         _axpy(det.gain, 1.0, _subpixel_tod(fit.residual[self.npol:], pix, *offsets))
         det.tod = model.calibrated(d, known, gain)
         # masks: samples out of every active fit are flagged; out of some, their templates are 0
@@ -1851,12 +1881,8 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     hit_map = np.zeros(npix, dtype=np.int64)
     n = min(npix, gls.nobs)
     hit_map[:n] = gls.full(gls.hits)[:n]
-    maps = gls.to_healpix(m, nside, fill=hp.UNSEEN)
-    sub, maps = maps[npol:], maps[:npol]
-    gradient = sub[:2] if params.subpixel_order else None
-    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * np.array([2.0, 1.0, 2.0])[:, None]) if params.subpixel_order > 1 else None
-    if gradient is not None:
-        maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    maps, gradient, hessian = _subpixel_result(gls.to_healpix(m, nside, fill=hp.UNSEEN), npol, params.subpixel_order,
+                                               nside, nthreads)
     if verbose and chunks.rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
@@ -1955,10 +1981,8 @@ class _TODModel:
         skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky") for k, t in templates.items() if t.sky is not None}
         model = cls(templates, skies, None, _Amplitudes.from_result(result), nthreads)
         model.result, model.maps = result, result.maps
-        if result.gradient is not None:  # the maps at the pixel centers, once
-            model.maps = result.maps.copy()
-            model.maps[0] -= _pixel_mean_shift(result.nside, result.gradient, result.hessian, nthreads)
-            model.sub = _subpixel_maps(result.gradient, result.hessian)
+        if result.gradient is not None:  # back to the GLS form of the sub-pixel terms, once
+            model.maps, model.sub = _subpixel_gls(result.maps, result.gradient, result.hessian, result.nside, nthreads)
         return model
 
     @property
