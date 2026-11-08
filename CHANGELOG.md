@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `estimate_noise` takes the residual of the whole TOD model fitted by
+  `make_maps`, d / g - D - F - sum_k a_k B_k - P m, not d - P m: with
+  calibration the dipole and the gain drifts, and the fitted and fixed
+  templates, were left in the noise spectrum (~10^3 times the noise at
+  2.5 mHz in a test with 1% gains and the solar dipole). `MapResult` keeps
+  the `calibration` and the `template_definitions` given to `make_maps`;
+  `data` must be the data of `make_maps`, in the same order (checked with
+  gains or amplitudes per period). The maps at the pixel centers of the
+  sub-pixel model are computed once, not per `DetectorData`.
+
 - Weighted binned maps: `GLS.binned(tod, weights=...)` takes `"equal"`
   (default, as before), `"noise"` (each chunk weighted by its white-noise
   level 1/σ², `GLS.white_weights()`) or one weight per chunk.

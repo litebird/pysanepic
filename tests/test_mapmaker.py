@@ -14,33 +14,20 @@ import ducc0
 import healpy as hp
 import numpy as np
 import pytest
+from builders import bandpass_data, calibration_data, four_detectors, group_data, iqu_tod, noise_data, random_sky, scan
 
 from pysanepic import ACTCuts, Coordinates, DetectorData, GapFill, GLSParameters, OneOverFNoise, Pointing, Prior, TabulatedNoise, Template, make_maps, one_over_f_weights, pol_angle_template
-
-
-def _scan(n, rng):
-    """Spinning scan: (theta, phi, psi) in Ecliptic, covering most of the sky."""
-    t = np.arange(n)
-    lam = 2 * np.pi * t / n + rng.uniform(0, 2 * np.pi)
-    spin = 2 * np.pi * t / 3000.0
-    a = np.array([np.cos(lam), np.sin(lam), np.zeros(n)])
-    z = np.array([np.zeros(n), np.zeros(n), np.ones(n)])
-    e2 = np.cross(a.T, z.T).T
-    b = np.cos(1.3) * a + np.sin(1.3) * (np.cos(spin) * z + np.sin(spin) * e2)
-    theta = np.arccos(np.clip(b[2], -1, 1))
-    phi = np.arctan2(b[1], b[0]) % (2 * np.pi)
-    return theta, phi, (spin + lam) % (2 * np.pi) - np.pi
 
 
 def test_noiseless_recovers_sky():
     nside, n, fs = 16, 120_000, 10.0
     rng = np.random.default_rng(0)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     rot = hp.Rotator(coord=["E", "G"])
 
     data = []
     for pol_angle, gamma in [(0.0, 1.0), (np.pi / 4, 0.9)]:
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         hwp = 2 * np.pi * 0.7 * np.arange(n) / fs
         # Signal in Galactic coordinates, rotated with healpy (independent of pysanepic)
         th_g, ph_g = rot(theta, phi)
@@ -68,28 +55,11 @@ def test_noiseless_recovers_sky():
             assert np.abs(res.maps[i][seen] - sky[i][seen]).max() < rel * np.abs(sky).max(), (dtype, i)
 
 
-def _four_detectors(n, fs, rng, sky, nside, noise=False):
-    """Four detectors at different polarization angles, 1/f noise model, no HWP."""
-    data = []
-    for pol_angle in [0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]:
-        theta, phi, psi = _scan(n, rng)
-        p = hp.ang2pix(nside, theta, phi)
-        a = psi + pol_angle
-        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a)
-        data.append(
-            DetectorData(
-                tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,
-                noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4), pol_angle_rad=pol_angle,
-            )
-        )
-    return data
-
-
 def test_padding_noiseless():
     nside, n, fs = 16, 120_000, 10.0
     rng = np.random.default_rng(0)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _four_detectors(n, fs, rng, sky, nside)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
     # compare only pixels where Q/U are well conditioned (the default criterion)
     good = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, maxiter=1)).maps[1] != hp.UNSEEN
     common = dict(chunk_s=1200.0, pad_s=300.0, tol=1e-24, min_pol_rcond=0.0)
@@ -114,8 +84,8 @@ def test_pixel_input_and_generator():
 
     nside, n, fs = 16, 40_000, 10.0
     rng = np.random.default_rng(2)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _four_detectors(n, fs, rng, sky, nside)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
     common = dict(coordinates="E", params=GLSParameters(chunk_s=1000.0, maxiter=20))
     ref = make_maps(data, nside, **common)
 
@@ -229,8 +199,8 @@ def test_fft_float32():
     is checked in float64) and the maps match the float64 ones."""
     nside, n, fs = 16, 120_000, 10.0
     rng = np.random.default_rng(13)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _four_detectors(n, fs, rng, sky, nside)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
     for d in data:
         d.tod[:] += rng.normal(0, 1e-5, n)  # some noise, so that the solution is not trivial
     params = GLSParameters(chunk_s=1200.0, tol=1e-12)
@@ -461,33 +431,13 @@ def test_prior_tight_mean_converges(shared):
     assert info["shared_amplitudes" if shared else "amplitudes"] == pytest.approx([1.0], abs=1e-12)
 
 
-def _calibration_data(nside, n, fs, per):
-    """_four_detectors with solar + orbital dipole (the orbital velocity turns
-    once over the data, as in the year of _scan) and gains drifting every `per`
-    samples: (data, true gains, sky)."""
-    rng = np.random.default_rng(5)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    solar = 3.36e-3 * np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
-    t = np.arange(n)
-    orbital = 2.7e-4 * np.array([-np.sin(2 * np.pi * t / n), np.cos(2 * np.pi * t / n), 0 * t])
-    data, true = [], []
-    for d in _four_detectors(n, fs, rng, sky, nside):
-        th, ph = d.pointing.theta, d.pointing.phi
-        nvec = np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
-        dipole = solar @ nvec + np.sum(orbital * nvec, axis=0)
-        g = 1 + 0.01 * rng.normal(size=n // per)
-        true.append(g)
-        data.append(dataclasses.replace(d, tod=g[t // per] * (d.tod + dipole), dipole=dipole))
-    return data, true, sky
-
-
 def test_calibration_noiseless():
     """Gains drifting every 1200 s, solar + orbital dipole: the gains and the
     maps are recovered, also with a mask and with an external sky template."""
     from pysanepic import CalibrationParameters
 
     nside, n, fs, per = 16, 120_000, 10.0, 12_000
-    data, true, sky = _calibration_data(nside, n, fs, per)
+    data, true, sky = calibration_data(nside, n, fs, per)
     # every pixel solved in Q/U: elsewhere the unmodelled polarization leaks
     # through the 1/f weights, in the maps and in the gains
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
@@ -524,7 +474,7 @@ def test_calibration_act_flags(ncoeff):
     from pysanepic import CalibrationParameters
 
     nside, n, fs, per = 16, 120_000, 10.0, 12_000
-    data, true, sky = _calibration_data(nside, n, fs, per)
+    data, true, sky = calibration_data(nside, n, fs, per)
     rng = np.random.default_rng(8)
     flagged = []
     for d in data:
@@ -552,9 +502,9 @@ def test_flag_methods_noiseless_response():
     SANEPIC fill is biased (a white sky is its worst case: ~20% rms here)."""
     nside, n, fs = 8, 60_000, 10.0
     rng = np.random.default_rng(3)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     data = []
-    for d in _four_detectors(n, fs, rng, sky, nside):
+    for d in four_detectors(n, fs, rng, sky, nside):
         flags = rng.random(n) < 0.01
         for start, length in zip(rng.integers(0, n - 400, 8), (3, 8, 20, 40, 80, 150, 300, 300)):
             flags[start:start + length] = True
@@ -585,7 +535,7 @@ def test_calibration_unsolved_pol():
     from pysanepic import CalibrationParameters
 
     nside = 16
-    data, true, _ = _calibration_data(nside, 60_000, 10.0, 12_000)
+    data, true, _ = calibration_data(nside, 60_000, 10.0, 12_000)
     data = data[:3]
     r = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
                   calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=4))
@@ -640,7 +590,7 @@ def test_sky_model_sampling():
 
 
 def _subpixel_data(nside, n, fs, hi=64, seed=33):
-    """_four_detectors on a sky with structure below the pixel size: the TOD
+    """four_detectors on a sky with structure below the pixel size: the TOD
     interpolated from alm at lmax 2 hi; returns (data, alm)."""
     rng = np.random.default_rng(seed)
     lmax = 2 * hi
@@ -648,7 +598,7 @@ def _subpixel_data(nside, n, fs, hi=64, seed=33):
     alm = np.array([hp.synalm(cl, lmax=lmax) for _ in range(3)])
     data = []
     for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         loc = np.stack([theta, phi % (2 * np.pi)], axis=1)
         t = ducc0.sht.synthesis_general(alm=alm[:1], spin=0, lmax=lmax, loc=loc, epsilon=1e-12)[0]
         q, u = ducc0.sht.synthesis_general(alm=alm[1:], spin=2, lmax=lmax, loc=loc, epsilon=1e-12)
@@ -736,7 +686,7 @@ def test_subpixel_gradient():
     alm[1:] *= 0.03
     data = []
     for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         tod = _observe(alm, theta, phi, psi + pol_angle)
         data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                                  sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
@@ -825,7 +775,7 @@ def test_subpixel_hessian():
     alm[1:] *= 0.03
     data = []
     for i, pol_angle in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         tod = _observe(alm, theta, phi, psi + pol_angle)
         data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                                  sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
@@ -877,18 +827,17 @@ def test_subpixel_hessian():
         GLSParameters(subpixel_order=3)
 
 
-def _bandpass_data(nside, n, fs, per, amp):
-    """_calibration_data plus a foreground seen as (1 + amp[i]) F by detector i."""
-    data, true, sky = _calibration_data(nside, n, fs, per)
-    rng = np.random.default_rng(37)
-    fg = hp.smoothing(rng.normal(0, 3e-4, (3, 12 * nside**2)), fwhm=np.radians(10))
-    t = np.arange(n)
-    out = []
-    for i, (d, g) in enumerate(zip(data, true)):
-        pix, angle = hp.ang2pix(nside, d.pointing.theta, d.pointing.phi), d.pointing.psi + d.pol_angle_rad
-        f = fg[0, pix] + fg[1, pix] * np.cos(2 * angle) + fg[2, pix] * np.sin(2 * angle)
-        out.append(dataclasses.replace(d, tod=d.tod + g[t // per] * (1 + amp[i]) * f, name=f"d{i}"))
-    return out, true, sky, fg
+def test_parameters_checked_when_built():
+    """GLSParameters with an invalid sample_batch or coarse_nside raise when built,
+    before make_maps; a coarse_nside above the nside of the maps raises in make_maps."""
+    for bad in (0, 1.5):
+        with pytest.raises(ValueError, match="sample_batch must be an int >= 1"):
+            GLSParameters(sample_batch=bad)
+    for bad in (-1, 3):
+        with pytest.raises(ValueError, match="coarse_nside"):
+            GLSParameters(coarse_nside=bad)
+    with pytest.raises(ValueError, match="coarse_nside"):
+        make_maps([], 4, params=GLSParameters(coarse_nside=8))
 
 
 def test_bandpass_templates():
@@ -900,7 +849,7 @@ def test_bandpass_templates():
 
     nside, n, fs, per = 16, 120_000, 10.0, 12_000
     amp = np.array([0.05, -0.02, 0.03, 0.01])
-    data, true, sky, fg = _bandpass_data(nside, n, fs, per, amp)
+    data, true, sky, fg = bandpass_data(nside, n, fs, per, amp)
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
     expect = {f"d{i}": a - amp.mean() for i, a in enumerate(amp)}
     fg_tmpl = {"fg": Template(sky=fg, sum_zero=True)}
@@ -989,7 +938,7 @@ def test_tod_templates():
     from pysanepic import CalibrationParameters
 
     nside, n, fs, per, per_drift = 16, 120_000, 10.0, 12_000, 30_000
-    data, true, _ = _calibration_data(nside, n, fs, per)
+    data, true, _ = calibration_data(nside, n, fs, per)
     rng = np.random.default_rng(41)
     t = np.arange(n)
     a_th = {"d0": 2e-3, "d1": -1e-3, "d2": 5e-4}
@@ -1037,7 +986,7 @@ def test_priors():
     from pysanepic import CalibrationParameters
 
     nside, n, fs = 16, 120_000, 10.0
-    data, true, _ = _calibration_data(nside, n, fs, n)  # one gain per detector
+    data, true, _ = calibration_data(nside, n, fs, n)  # one gain per detector
     rng = np.random.default_rng(43)
     t = np.arange(n)
     a_th = {"d0": 2e-3, "d1": -1e-3, "d2": 5e-4, "d3": 1e-3}
@@ -1107,7 +1056,7 @@ def test_pol_angle_template():
     from pysanepic import CalibrationParameters
 
     nside, n, fs, per = 16, 120_000, 10.0, 12_000
-    data, true, sky = _calibration_data(nside, n, fs, per)
+    data, true, sky = calibration_data(nside, n, fs, per)
     # the template as maps and as alm
     lmax = 2 * nside
     alm = np.array(hp.map2alm(sky, lmax=lmax))
@@ -1213,7 +1162,7 @@ def test_beam_templates():
     model = np.array([hp.almxfl(a, bl) for a in sky])
     gh, gw = np.polynomial.hermite.hermgauss(5)
     pols = np.radians([0, 90, 45, 135])
-    scans = [_scan(n, rng) for _ in pols]
+    scans = [scan(n, rng) for _ in pols]
     chi = 2 * np.pi * np.arange(n) / 600.0
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, angle_dtype=np.float64)
     draw = rng.normal(size=(len(pols), 5))
@@ -1293,7 +1242,7 @@ def test_beam_tods_derivatives():
     lmax, eps = 40, 2e-4
     ell = np.arange(lmax + 1)
     base = np.array([hp.synalm(1 / (1 + ell) ** 2, lmax=lmax) for _ in range(3)])
-    theta, phi, psi = _scan(20000, rng)
+    theta, phi, psi = scan(20000, rng)
     chi = rng.uniform(0, 2 * np.pi, len(psi))
     for k in range(3):
         alm = base * (np.arange(3) == k)[:, None]
@@ -1388,7 +1337,7 @@ def test_blm_tods():
     lmax, mmax, fwhm, pol = 128, 4, np.radians(3.0), 0.3
     ell = np.arange(lmax + 1)
     sky = np.array([hp.synalm(1 / (ell + 5.0) ** 2, lmax=lmax) for _ in range(3)])
-    theta, phi, psi = _scan(20000, rng)
+    theta, phi, psi = scan(20000, rng)
     d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                      sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=pol)
     circ = blm_tods(d, sky, _gauss_blm(lmax, mmax, fwhm, pol_angle=pol), "E")
@@ -1420,7 +1369,7 @@ def test_blm_fixed_template():
     solar = 3.36e-3 * np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
     full, sym, blms, gains = [], [], {}, []
     for i, pol in enumerate([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8]):
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         nvec = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)])
         d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                          sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
@@ -1476,7 +1425,7 @@ def test_blm_mmax(monkeypatch):
     monkeypatch.setattr(ducc0.totalconvolve, "Interpolator", counted)
     data = []
     for name in ("d0", "d0", "d1"):
-        theta, phi, psi = _scan(5000, rng)
+        theta, phi, psi = scan(5000, rng)
         data.append(DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                                  sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=0.3,
                                  name=name))
@@ -1504,7 +1453,7 @@ def test_blm_tods_model_bl():
     lmax, mmax, fwhm, pol = 128, 4, np.radians(3.0), 0.3
     ell = np.arange(lmax + 1)
     sky = np.array([hp.synalm(1 / (ell + 5.0) ** 2, lmax=lmax) for _ in range(3)])
-    theta, phi, psi = _scan(20000, rng)
+    theta, phi, psi = scan(20000, rng)
     d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                      sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), pol_angle_rad=pol)
     bl = hp.gauss_beam(fwhm, lmax=lmax, pol=True)
@@ -1538,7 +1487,7 @@ def test_blm_fixed_template_model_bl():
     data, blms, gains = [], {}, []
     t = np.arange(n) * 5 // n
     for i, (pol, e) in enumerate(zip([0.0, np.pi / 4, np.pi / 8, 3 * np.pi / 8], [1.0, 1.1, 1.2, 1.3])):
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         nvec = np.array([np.sin(theta) * np.cos(phi), np.sin(theta) * np.sin(phi), np.cos(theta)])
         d = DetectorData(tod=0 * psi, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                          sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4),
@@ -1572,7 +1521,7 @@ def test_template_helpers_errors():
 
     rng = np.random.default_rng(0)
     alm = np.array([hp.synalm(np.ones(9), lmax=8) for _ in range(3)])
-    theta, phi, psi = _scan(100, rng)
+    theta, phi, psi = scan(100, rng)
     d = DetectorData(tod=np.zeros(100), pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"),
                      sampling_rate_hz=1.0, noise=OneOverFNoise(net_ukrts=1.0), name="d0")
     assert set(beam_tods(d, alm, "E", ellipticity=False)) == {"offset_x", "offset_y"}
@@ -1623,10 +1572,10 @@ def test_coarse_preconditioner():
 
     nside, fs, chunk = 16, 10.0, 6000
     rng = np.random.default_rng(21)
-    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(6))
+    sky = hp.smoothing(random_sky(rng, nside), fwhm=np.radians(6))
     own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4)
     coupling = np.full(4, np.sqrt(0.5))
-    dets = _group_data(rng, nside, sky, fs, chunk, 6, own, own, coupling)
+    dets = group_data(rng, nside, sky, fs, chunk, 6, own, own, coupling)
     flags = np.zeros(len(dets[0].tod), bool)
     flags[1000:1010] = True
     dets[1] = dataclasses.replace(dets[1], flags=flags)
@@ -1651,7 +1600,7 @@ def test_coarse_monopole():
     from pysanepic import CalibrationParameters
 
     nside, n, fs, per = 16, 120_000, 10.0, 12_000
-    data, _, _ = _calibration_data(nside, n, fs, per)
+    data, _, _ = calibration_data(nside, n, fs, per)
     rng = np.random.default_rng(41)
     noisy = [dataclasses.replace(d, tod=d.tod + 2e-5 * np.cumsum(rng.normal(size=n)) / np.sqrt(n) * 30
                                  + 1e-5 * rng.normal(size=n)) for d in data]
@@ -1679,13 +1628,13 @@ def test_estimate_common_modes():
 
     nside, fs, chunk = 16, 10.0, 36000
     rng = np.random.default_rng(22)
-    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(6))
+    sky = hp.smoothing(random_sky(rng, nside), fwhm=np.radians(6))
     own = OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-4)
     mode = OneOverFNoise(net_ukrts=30.0, fknee_hz=0.2, alpha=1.5, fmin_hz=1e-4)
     coupling = rng.uniform(0.6, 0.9, 6)
     groups = []
     for _ in range(2):  # e.g. two days of a wafer
-        dets = _group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
+        dets = group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
         groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)]))
     flags = np.zeros(len(dets[0].tod), bool)
     flags[5000:9000] = True
@@ -1725,26 +1674,6 @@ def test_estimate_common_modes():
         estimate_noise([groups[0], dets[0]], first, nbins=10)
 
 
-def _group_data(rng, nside, sky, fs, chunk, nchunk, own, mode, coupling):
-    """Detectors observed at the same times (different pointings), each with
-    its own noise plus coupling[i] times a common mode."""
-    def draw(noise):
-        w = noise.weights(chunk, fs)
-        return np.concatenate([np.fft.irfft(np.fft.rfft(rng.normal(size=chunk)) / np.sqrt(w), n=chunk) for _ in range(nchunk)])
-
-    n = chunk * nchunk
-    c = draw(mode)
-    dets = []
-    for i, pa in enumerate(np.linspace(0, np.pi, len(coupling), endpoint=False)):
-        th, ph, psi = _scan(n, rng)
-        a = psi + pa
-        p = hp.ang2pix(nside, th, ph)
-        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a) + draw(own) + coupling[i] * c
-        dets.append(DetectorData(tod=tod, pointing=Pointing(theta=th, phi=ph, psi=psi, coordinates="E"),
-                                 sampling_rate_hz=fs, noise=own, pol_angle_rad=pa, name=f"d{i}"))
-    return dets
-
-
 def test_detector_group():
     """make_maps with a DetectorGroup: noiseless data give back the sky; with a
     red common mode the maps are much better than with the mode on the
@@ -1753,11 +1682,11 @@ def test_detector_group():
 
     nside, fs, chunk = 16, 10.0, 6000
     rng = np.random.default_rng(18)
-    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(6))
+    sky = hp.smoothing(random_sky(rng, nside), fwhm=np.radians(6))
     own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.02, alpha=1.0, fmin_hz=1e-4)
     mode = OneOverFNoise(net_ukrts=20.0, fknee_hz=1.0, alpha=2.0, fmin_hz=1e-3)
     coupling = np.array([1.0, 0.9, 1.1, 1.05])
-    dets = _group_data(rng, nside, sky, fs, chunk, 6, own, mode, coupling)
+    dets = group_data(rng, nside, sky, fs, chunk, 6, own, mode, coupling)
     group = DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)])
     params = GLSParameters(chunk_s=chunk / fs, tol=1e-10)
 
@@ -1793,7 +1722,7 @@ def _signal(d, sky, nside):
     """Noiseless TOD of a DetectorData (no HWP, Ecliptic pointing in the sky frame)."""
     p = hp.ang2pix(nside, d.pointing.theta, d.pointing.phi)
     a = d.pointing.psi + d.pol_angle_rad
-    return sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a)
+    return iqu_tod(sky, p, a)
 
 
 def test_pixel_order():
@@ -1849,7 +1778,7 @@ def test_noise_classes_in_make_maps():
     one of them; a white tabulated PSD gives the same map as the NET model."""
     nside, n, fs, net = 8, 40_000, 10.0, 50.0
     rng = np.random.default_rng(5)
-    theta, phi, psi = _scan(n, rng)
+    theta, phi, psi = scan(n, rng)
     ptg = Pointing(theta=theta, phi=phi, psi=psi, coordinates="G")
     tod = rng.normal(0, net * np.sqrt(fs) * 1e-6, n)
     with pytest.raises(ValueError, match="model"):
@@ -1918,8 +1847,8 @@ def test_flags_in_make_maps():
     flagged TOD (NaN or huge), flagged samples are not hits; flags are checked."""
     nside, n, fs = 16, 120_000, 10.0
     rng = np.random.default_rng(3)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _four_detectors(n, fs, rng, sky, nside)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
     params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64)
     ref = make_maps(data, nside, coordinates="E", params=params)
     out = {}
@@ -1972,9 +1901,9 @@ def test_intensity_only():
 
     nside, n, fs = 16, 120_000, 10.0
     rng = np.random.default_rng(8)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     sky[1:] = 0
-    data = _four_detectors(n, fs, rng, sky, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
     r = make_maps(data, nside, coordinates="E", params=GLSParameters(chunk_s=1200.0, pol=False, tol=1e-24))
     seen = r.maps[0] != hp.UNSEEN
     assert r.maps.shape == (1, 12 * nside**2)
@@ -2021,7 +1950,7 @@ def test_relative_detector_weights():
     rng = np.random.default_rng(10)
     data, rows = [], []
     for net, pol_angle in [(30.0, 0.0), (300.0, np.pi / 4), (60.0, np.pi / 8), (150.0, 3 * np.pi / 8)]:
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         sigma = net * np.sqrt(fs) * 1e-6
         tod = rng.normal(0, sigma, n)
         data.append(DetectorData(tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="G"),
@@ -2150,27 +2079,6 @@ def test_noise_variance_monte_carlo():
     assert np.all(np.abs(ratio - 1) < 0.35) and abs(ratio.mean() - 1) < 0.06
 
 
-def _noise_data(rng, nside, sky, fs, chunk, nchunk, shape, sigma, names=True):
-    """Detectors with circulant noise of PSD 2 sigma^2 / fs * shape(f) per chunk,
-    each split in stretches of 4 chunks sharing a name."""
-    data = []
-    for j, pa in enumerate((0.0, np.pi / 4, np.pi / 8)):
-        n = nchunk * chunk
-        th, ph, psi = _scan(n, rng)
-        a = psi + pa
-        p = hp.ang2pix(nside, th, ph)
-        f = np.fft.rfftfreq(chunk, 1 / fs)
-        noise = np.concatenate([np.fft.irfft(np.fft.rfft(rng.normal(size=chunk)) * sigma * np.sqrt(shape(np.maximum(f, 1e-9))), n=chunk)
-                                for _ in range(nchunk)])
-        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a) + noise
-        for s0 in range(0, n, 4 * chunk):
-            sl = slice(s0, s0 + 4 * chunk)
-            data.append(DetectorData(tod=tod[sl], pointing=Pointing(theta=th[sl], phi=ph[sl], psi=psi[sl], coordinates="E"),
-                                     sampling_rate_hz=fs, noise=OneOverFNoise(net_ukrts=50.0), pol_angle_rad=pa,
-                                     name=f"det{j}" if names else None))
-    return data
-
-
 def test_estimate_noise():
     """With the true sky as map the residual is the noise: the binned periodogram
     matches the PSD; the fit recovers NET, fknee and alpha; flagged (NaN)
@@ -2180,9 +2088,9 @@ def test_estimate_noise():
 
     nside, fs, chunk, sigma = 16, 10.0, 4000, 50.0 * np.sqrt(10.0) * 1e-6
     rng = np.random.default_rng(14)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     shape = lambda f: (f**1.5 + 0.1**1.5) / (f**1.5 + 1e-3**1.5)  # noqa: E731
-    data = _noise_data(rng, nside, sky, fs, chunk, 40, shape, sigma)
+    data = noise_data(rng, nside, sky, fs, chunk, 40, shape, sigma)
     truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True, residuals=None)
     flags = np.zeros(len(data[0].tod), bool)
     flags[1000:1500] = True
@@ -2197,7 +2105,7 @@ def test_estimate_noise():
         assert fit.model == model and abs(fit.net_ukrts / 50 - 1) < 0.03
         if model == "toast":
             assert abs(fit.fknee_hz / 0.1 - 1) < 0.25 and abs(fit.alpha / 1.5 - 1) < 0.15
-    anonymous = estimate_noise(_noise_data(rng, nside, sky, fs, chunk, 4, shape, sigma, names=False), truth, chunk_s=chunk / fs)
+    anonymous = estimate_noise(noise_data(rng, nside, sky, fs, chunk, 4, shape, sigma, names=False), truth, chunk_s=chunk / fs)
     assert sorted(anonymous) == [0, 1, 2]
 
 
@@ -2208,10 +2116,10 @@ def test_estimate_noise_iteration():
 
     nside, fs, chunk, sigma = 16, 10.0, 4000, 50.0 * np.sqrt(10.0) * 1e-6
     rng = np.random.default_rng(15)
-    sky = hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(8))  # smooth: no sub-pixel signal
+    sky = hp.smoothing(random_sky(rng, nside), fwhm=np.radians(8))  # smooth: no sub-pixel signal
     shape = lambda f: (f**1.5 + 0.1**1.5) / (f**1.5 + 1e-3**1.5)  # noqa: E731
     true = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.1, alpha=1.5, fmin_hz=1e-3)
-    data = [dataclasses.replace(d, noise=true) for d in _noise_data(rng, nside, sky, fs, chunk, 20, shape, sigma)]
+    data = [dataclasses.replace(d, noise=true) for d in noise_data(rng, nside, sky, fs, chunk, 20, shape, sigma)]
     params = GLSParameters(chunk_s=chunk / fs, tol=1e-10)
     ref = make_maps(data, nside, coordinates="E", params=params)
     white = make_maps([dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=50.0)) for d in data], nside, coordinates="E", params=params)
@@ -2465,7 +2373,7 @@ def test_covariance_fixed_gains():
     t = np.arange(n)
     data = []
     for i, pol in enumerate(np.radians([0, 90, 45, 135])):
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         pix, ang = hp.ang2pix(nside, theta, phi), psi + pol
         proj = lambda m: m[0, pix] + m[1, pix] * np.cos(2 * ang) + m[2, pix] * np.sin(2 * ang)  # noqa: E731
         vec = np.array(hp.ang2vec(theta, phi)).T
@@ -2525,14 +2433,14 @@ def test_sample_batch(monkeypatch, calibrate):
     monkeypatch.setattr(mapmaker, "_synthesis", lambda *a: calls.append(len(a[1])) or synthesis(*a))
     nside, n, fs, per = 16, 60_000, 10.0, 6000
     if calibrate:
-        data, _, _ = _calibration_data(nside, n, fs, per)
+        data, _, _ = calibration_data(nside, n, fs, per)
     else:
         data, _ = _subpixel_data(nside, n, fs)
     data = [dataclasses.replace(d, name=f"d{i}") for i, d in enumerate(data)]
     lmax = 3 * nside - 1
     rng = np.random.default_rng(31)
-    sky = hp.map2alm(hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(5)), lmax=lmax)
-    fg = 0.1 * hp.map2alm(hp.smoothing(rng.normal(0, 1e-4, (3, 12 * nside**2)), fwhm=np.radians(5)), lmax=lmax)
+    sky = hp.map2alm(hp.smoothing(random_sky(rng, nside), fwhm=np.radians(5)), lmax=lmax)
+    fg = 0.1 * hp.map2alm(hp.smoothing(random_sky(rng, nside), fwhm=np.radians(5)), lmax=lmax)
     cal = CalibrationParameters(gain_period_s=per / fs, n_iter=2, cache_model=True) if calibrate else None
     out = []
     ncalls = []
@@ -2580,9 +2488,9 @@ def test_coarse_null_monopole():
         assert info["converged"] and np.isfinite(m).all()
         assert np.allclose(g.apply_A(m), g.rhs(tod), rtol=0, atol=1e-10 * np.abs(g.rhs(tod)).max())
     nside, n, fs = 8, 24_000, 10.0
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     data = [dataclasses.replace(d, noise=OneOverFNoise(net_ukrts=40.0, fknee_hz=0.05, alpha=1.0))
-            for d in _four_detectors(n, fs, rng, sky, nside)]
+            for d in four_detectors(n, fs, rng, sky, nside)]
     r = make_maps(data, nside, "E", GLSParameters(chunk_s=1200.0, tol=1e-20))
     assert r.converged
 
@@ -2596,8 +2504,8 @@ def test_estimate_noise_contiguous_flags():
 
     nside, fs, chunk, sigma = 16, 10.0, 4000, 50.0 * np.sqrt(10.0) * 1e-6
     rng = np.random.default_rng(43)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _noise_data(rng, nside, sky, fs, chunk, 40, np.ones_like, sigma)
+    sky = random_sky(rng, nside)
+    data = noise_data(rng, nside, sky, fs, chunk, 40, np.ones_like, sigma)
     truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True, residuals=None)
     flags = (np.arange(len(data[0].tod)) % chunk >= 3 * chunk // 8) & (np.arange(len(data[0].tod)) % chunk < 5 * chunk // 8)
     data = [dataclasses.replace(d, tod=np.where(flags, np.nan, d.tod), flags=flags) for d in data]

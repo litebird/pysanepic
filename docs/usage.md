@@ -253,6 +253,16 @@ fraction corrected) is averaged over all the `DetectorData` with the same
 `fit="toast"` or `fit="keshner"`, a `OneOverFNoise` fitted to it ($f_\text{min}$
 is not constrained below `1/chunk_s`).
 
+With calibration and templates the residual is that of the whole TOD model
+fitted by `make_maps`, $d/g - D - F - \sum_k a_k B_k - P\hat m$, with the
+fitted gains and amplitudes kept in the `MapResult` (`gains`, `templates`,
+and the `calibration` and `template_definitions` given to `make_maps`): the
+noise in the units of the calibrated TOD. `data` must then be the data of
+`make_maps`, in the same order, as the gains and the amplitudes per period
+are one array per `DetectorData`. Without them the dipole, the gain drifts
+and the templates would stay in the residual (in a test with 1% gains per
+chunk and the solar dipole, the spectrum at 2.5 mHz was ~10^3 times the noise).
+
 The residual differs from the noise in two ways: the map absorbs part of the
 noise, mostly at the harmonics of the scan (on a very repetitive test scan
 with 1.4% as many unknowns as samples, up to 30% of the power between the spin
