@@ -663,6 +663,26 @@ class GLSParameters:
     def __post_init__(self):
         if self.subpixel_order not in (0, 1, 2):
             raise ValueError(f"GLSParameters.subpixel_order must be 0, 1 or 2, not {self.subpixel_order!r}")
+        if not (isinstance(self.sample_batch, (int, np.integer)) and self.sample_batch >= 1):
+            raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {self.sample_batch!r}")
+        nc = self.coarse_nside
+        if nc is not None and (nc < 0 or nc & (nc - 1)):
+            raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
+
+    def _gls_settings(self, nside):
+        """The solver settings among the arguments of GLS, for the maps at `nside`."""
+        nc = self.coarse_nside
+        if nc is not None and nc > nside:
+            raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
+        return {
+            "preconditioner": self.preconditioner,
+            "min_pol_rcond": self.min_pol_rcond,
+            "angle_dtype": self.angle_dtype,
+            "fft_dtype": self.fft_dtype,
+            "template_dtype": self.template_dtype,
+            "coarse": None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
+            "subpixel_order": self.subpixel_order,
+        }
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1884,11 +1904,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     the first, the GLS of the first one is reused (same pixels, flags and
     chunks): only the TOD and the templates are built."""
     params = GLSParameters() if params is None else params
-    if not (isinstance(params.sample_batch, (int, np.integer)) and params.sample_batch >= 1):
-        raise ValueError(f"GLSParameters.sample_batch must be an int >= 1, not {params.sample_batch!r}")
-    nc = params.coarse_nside
-    if nc is not None and (nc < 0 or (nc and (nc & (nc - 1) or nc > nside))):
-        raise ValueError(f"coarse_nside must be None, 0 (the monopole) or a power of 2 <= nside, not {nc}")
+    settings = params._gls_settings(nside)
     nthreads = resolve_nthreads(nthreads)
     npix = 12 * nside * nside
     npol = 3 if params.pol else 1
@@ -1909,9 +1925,25 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         gls = fit.gls
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
-        gls = _new_gls(chunks.pix, chunks.w, chunks.a2, chunks.gamma, chunks.nfft, common_modes, templates, shared,
-                       prior, shared_prior, params, nside, comm, nthreads, fit, chunks.method,
-                       chunks.fs, (chunks.gx, chunks.gy) if params.subpixel_order else None)
+        gls = GLS(
+            chunks.pix,
+            None,
+            chunks.w,
+            pol_angles=(chunks.a2, chunks.gamma) if params.pol else None,
+            comm=comm,
+            nthreads=nthreads,
+            overwrite_pix=True,  # chunks.pix holds copies made here
+            fft_lengths=chunks.nfft,
+            common_modes=common_modes,
+            templates=templates,
+            shared_templates=shared,
+            prior=prior,
+            shared_prior=shared_prior,
+            shared_groups=fit.amplitudes.groups if fit is not None and fit.fit else None,
+            offsets=(chunks.gx, chunks.gy) if params.subpixel_order else None,
+            **settings,
+            **chunks.method._gls_args(chunks.fs),
+        )
         if fit is not None and fit.fit:
             fit.gls = gls
     chunks.pix = chunks.a2 = chunks.gamma = chunks.gx = chunks.gy = None
@@ -1964,36 +1996,6 @@ def _padded(x, a, b, m, dtype):
     out = np.zeros(b - a + 2 * m, dtype)
     out[m : m + b - a] = x[a:b]
     return out
-
-
-def _new_gls(pix_c, w_c, a2_c, gamma_c, nfft_c, common_modes, templates, shared, prior, shared_prior, params, nside, comm,
-             nthreads, fit, method, fs_c, offsets=None):
-    nc = params.coarse_nside
-    return GLS(
-        pix_c,
-        None,
-        w_c,
-        pol_angles=(a2_c, gamma_c) if params.pol else None,
-        preconditioner=params.preconditioner,
-        min_pol_rcond=params.min_pol_rcond,
-        comm=comm,
-        nthreads=nthreads,
-        angle_dtype=params.angle_dtype,
-        overwrite_pix=True,  # pix_c holds copies made here
-        fft_lengths=nfft_c,
-        fft_dtype=params.fft_dtype,
-        common_modes=common_modes,
-        coarse=None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
-        templates=templates,
-        shared_templates=shared,
-        prior=prior,
-        shared_prior=shared_prior,
-        shared_groups=fit.amplitudes.groups if fit is not None and fit.fit else None,
-        template_dtype=params.template_dtype,
-        **method._gls_args(fs_c),
-        offsets=offsets,
-        subpixel_order=params.subpixel_order,
-    )
 
 
 def _periods(n, fs, seconds):
