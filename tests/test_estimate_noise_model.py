@@ -11,51 +11,24 @@ import dataclasses
 
 import numpy as np
 import pytest
-from test_mapmaker import _noise_data
+from builders import (
+    CHUNK,
+    FS,
+    NSIDE,
+    PERIOD,
+    SIGMA,
+    estimate_noise_data,
+    noise_shape,
+    random_sky,
+)
 
 from pysanepic import (
     CalibrationParameters,
     GLSParameters,
-    OneOverFNoise,
     Template,
     estimate_noise,
     make_maps,
 )
-
-NSIDE, FS, CHUNK, NCHUNK = 16, 10.0, 4000, 40
-SIGMA = 50.0 * np.sqrt(FS) * 1e-6  # NET 50 uK sqrt(s)
-PERIOD = 2 * CHUNK  # samples per amplitude of the template per period (2 per DetectorData)
-
-
-def _shape(f):
-    return (f**1.5 + 0.1**1.5) / (f**1.5 + 1e-3**1.5)
-
-
-def _data(calibration, template):
-    """_noise_data (1/f noise, three detectors, ten DetectorData each) with a
-    solar dipole and gains per chunk and/or one TOD template per detector."""
-    rng = np.random.default_rng(71)
-    sky = rng.normal(0, 1e-4, (3, 12 * NSIDE**2))
-    noise = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.1, alpha=1.5, fmin_hz=1e-3)
-    solar = 3.36e-3 * np.array([0.3, -0.5, 0.8]) / np.linalg.norm([0.3, -0.5, 0.8])
-    amp = {"det0": 2e-3, "det1": -1e-3, "det2": 5e-4}
-    out = []
-    for d in _noise_data(rng, NSIDE, sky, FS, CHUNK, NCHUNK, _shape, SIGMA):
-        n = len(d.tod)
-        th, ph = d.pointing.theta, d.pointing.phi
-        signal = d.tod.copy()  # sky + noise
-        kw = {"noise": noise}
-        if template:
-            b = np.convolve(rng.normal(size=n), np.ones(50) / 50, mode="same")
-            signal += amp[d.name] * b
-            kw["templates"] = {"thermal": b}
-        if calibration:
-            dipole = solar @ np.array([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
-            g = 1 + 0.01 * rng.normal(size=n // CHUNK)
-            signal = g[np.arange(n) // CHUNK] * (signal + dipole)
-            kw["dipole"] = dipole
-        out.append(dataclasses.replace(d, tod=signal, **kw))
-    return out
 
 
 def _cleaned(data, result):
@@ -78,7 +51,7 @@ def _cleaned(data, result):
 @pytest.mark.parametrize("calibration, template", [(True, None), (False, "detector"), (True, "detector"), (True, "period")],
                          ids=["gains+dipole", "template", "both", "both-period"])
 def test_estimate_noise_uses_fitted_model(calibration, template):
-    data = _data(calibration, template)
+    data = estimate_noise_data(calibration, template)
     params = GLSParameters(chunk_s=CHUNK / FS, tol=1e-12)
     cal = CalibrationParameters(gain_period_s=CHUNK / FS, n_iter=3) if calibration else None
     tmpl = {"thermal": Template(period_s=None if template == "detector" else PERIOD / FS)} if template else None
@@ -89,7 +62,7 @@ def test_estimate_noise_uses_fitted_model(calibration, template):
     # the knee (below, few modes per bin and the errors of the fitted amplitudes)
     for e in ref.values():
         hi = e.freqs_hz > 0.4
-        ratio = e.psd[hi] / (2 * SIGMA**2 / FS * _shape(e.freqs_hz[hi]))
+        ratio = e.psd[hi] / (2 * SIGMA**2 / FS * noise_shape(e.freqs_hz[hi]))
         assert np.max(np.abs(ratio - 1)) < 0.1
     raw = estimate_noise(data, result, **kw)
     for name, e in raw.items():
@@ -121,8 +94,8 @@ def test_tod_model_of_fit_and_result(monkeypatch):
     rng = np.random.default_rng(5)
     data = [dataclasses.replace(d, templates={**d.templates, "per": rng.normal(size=len(d.tod)) * 1e-2,
                                               "fix": np.full(len(d.tod), 1e-4), "com": np.sin(np.arange(len(d.tod)) / 300)})
-            for d in _data(True, "detector")]
-    sky = rng.normal(0, 1e-4, (3, 12 * NSIDE**2))
+            for d in estimate_noise_data(True, "detector")]
+    sky = random_sky(rng, NSIDE)
     tmpl = {"thermal": Template(), "per": Template(period_s=PERIOD / FS), "fix": Template(fixed=True),
             "com": Template(common=True), "bp": Template(sky=rng.normal(0, 1e-3, 12 * NSIDE**2), sum_zero=True)}
     result = make_maps(data, NSIDE, coordinates="E", params=GLSParameters(chunk_s=CHUNK / FS, tol=1e-10),
