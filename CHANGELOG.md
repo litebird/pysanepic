@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.5 (2026-11-08)
 
 - `estimate_noise` takes the residual of the whole TOD model fitted by
   `make_maps`, d / g - D - F - sum_k a_k B_k - P m, not d - P m: with
@@ -10,7 +10,7 @@
   the `calibration` and the `template_definitions` given to `make_maps`;
   `data` must be the data of `make_maps`, in the same order (checked with
   gains or amplitudes per period). The maps at the pixel centers of the
-  sub-pixel model are computed once, not per `DetectorData`.
+  sub-pixel model are computed once, not per `DetectorData`. (#76)
 
 - Weighted binned maps: `GLS.binned(tod, weights=...)` takes `"equal"`
   (default, as before), `"noise"` (each chunk weighted by its white-noise
@@ -20,7 +20,19 @@
   with the GLS weighting of detectors with different NETs), `"equal"` (the
   behavior of 0.6.4) or `{detector name: weight}`, e.g. one weight per pair
   of detectors in a horn. The maps change only with a sky model and
-  detectors of different white-noise levels.
+  detectors of different white-noise levels. (#75)
+
+- `GLSParameters` checks `sample_batch` and `coarse_nside` (None, 0 or a
+  power of 2) when it is built, not in `make_maps`; `coarse_nside <= nside`
+  is still checked by `make_maps`. The error messages are unchanged. (#79)
+
+- Internal refactors of `make_maps`, with results identical bit for bit:
+  one TOD model for the fit and `estimate_noise`, a chunk builder and a
+  registry of the fitted amplitudes (#77); the two forms of the sub-pixel
+  terms converted in one place, and each flag treatment (`"marginalize"`,
+  `"offset"`, `ACTCuts`, `GapFill`) owning its labels, gap filling and GLS
+  arguments (#78); the GLS solver settings from `GLSParameters` (#79); the
+  synthetic test data shared in `tests/builders.py` (#80).
 
 ## 0.6.4 (2026-11-05)
 
