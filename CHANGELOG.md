@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- With MPI, the ranks of a node share one copy of the full maps, in MPI-3
+  shared-memory windows, instead of one copy per rank: the map read by P
+  (the PCG search direction), the map summing P^T, and at setup the
+  coverage and the blocks of the preconditioner (the largest: 37 columns
+  with `subpixel_order=2`). At nside 2048 with I/Q/U, 1.2 GB per map per
+  node instead of per rank. The pixels are split among the ranks node by
+  node (the same split as before when the ranks are placed on the nodes in
+  blocks) and only the node leaders exchange maps between nodes. The ranks
+  of a node add their chunks to the shared maps in rounds over slabs of
+  pixels, in a fixed order: the maps do not depend on the timing, and are
+  the same as before up to rounding. Needs only mpi4py, with or without
+  litebird_sim.
+
 ## 0.6.5 (2026-11-08)
 
 - `estimate_noise` takes the residual of the whole TOD model fitted by

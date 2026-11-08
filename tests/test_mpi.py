@@ -396,6 +396,47 @@ def test_estimate_noise_calibrated_mpi():
             assert np.allclose(est[k].psd, ref[k].psd, rtol=1e-6)
 
 
+def test_node_shared_map():
+    """Ranks on fake nodes: placed cyclically on two nodes (rank r on node
+    r % 2, nodes of different sizes with an odd number of ranks), or one node
+    per rank. Each node owns a contiguous pixel range, its ranks share one map
+    (the same memory), and with a different number of chunks per rank (some
+    with none: empty rounds) and flagged samples the solution is the serial one."""
+    from pysanepic import node as nodemod
+
+    world = MPI.COMM_WORLD
+    rng = np.random.default_rng(1)
+    ns, nchunk = 512, max(world.size * (world.size - 1) // 2, 1)
+    pix = rng.integers(0, 200, (nchunk, ns))
+    pix[::3, 100:110] = -1  # flagged samples: unknowns local to the rank
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.0, 1.0), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    first = world.rank * (world.rank - 1) // 2
+    mine = slice(first, first + max(world.rank, world.size == 1))  # rank r has r chunks: rank 0 none
+    ms = GLS(pix, psi, w, min_pol_rcond=0.0).solve(tod, tol=1e-20)[0] if world.rank == 0 else None
+    for fake in (lambda r: r % 2, lambda r: r):
+        comm = world.Dup()  # a new communicator: not the cached Node of COMM_WORLD
+        nodemod._TEST_NODE = fake
+        try:
+            g = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0)
+            m, _ = g.solve(tod[mine], tol=1e-20)
+            nd = g._node
+            # the node's ranks own consecutive slots of pixels
+            assert nd.node.allgather(nd.pixels.rank) == list(range(nd.first, nd.first + nd.node.size))
+            # one map per node: what its rank 0 writes, the others read
+            work = nd.work("test", 1)
+            nd.barrier()
+            if nd.node.rank == 0:
+                work[0] = 1000.0 + nd.first
+            nd.barrier()
+            assert work[0] == 1000.0 + nd.first
+            if world.rank == 0:
+                assert np.allclose(m, ms, rtol=1e-10, atol=0)
+        finally:
+            nodemod._TEST_NODE = None
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
@@ -411,5 +452,6 @@ if __name__ == "__main__":
     test_tod_templates_mpi()
     test_priors_mpi()
     test_estimate_noise_calibrated_mpi()
+    test_node_shared_map()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")
