@@ -4,10 +4,10 @@ import healpy as hp
 import numba
 import numpy as np
 import pytest
+from builders import iqu_tod, random_sky, scan
 
 from pysanepic import DetectorData, GLSParameters, OneOverFNoise, Pointing, TabulatedNoise, make_maps, resolve_nthreads
 from pysanepic.gls import numba_threads
-from test_mapmaker import _scan
 
 
 @pytest.mark.parametrize("private", [True, False])
@@ -79,13 +79,13 @@ def test_numba_threads_restores():
 def test_same_result_any_thread_count():
     nside, n, fs = 16, 60_000, 10.0
     rng = np.random.default_rng(0)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     data = []
     for pol_angle in [0.0, np.pi / 4, np.pi / 8]:
-        theta, phi, psi = _scan(n, rng)
+        theta, phi, psi = scan(n, rng)
         p = hp.ang2pix(nside, theta, phi)
         a = psi + pol_angle
-        tod = sky[0, p] + sky[1, p] * np.cos(2 * a) + sky[2, p] * np.sin(2 * a) + rng.normal(0, 1e-4, n)
+        tod = iqu_tod(sky, p, a) + rng.normal(0, 1e-4, n)
         data.append(
             DetectorData(
                 tod=tod, pointing=Pointing(theta=theta, phi=phi, psi=psi, coordinates="E"), sampling_rate_hz=fs,

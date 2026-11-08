@@ -7,6 +7,7 @@ import tempfile
 
 import numpy as np
 import pytest
+from builders import random_sky
 from mpi4py import MPI
 
 from pysanepic import GLS, one_over_f_weights
@@ -44,13 +45,13 @@ def test_make_maps_mpi_padding():
     import healpy as hp
 
     from pysanepic import GLSParameters, make_maps
-    from test_mapmaker import _four_detectors
+    from builders import four_detectors
 
     comm = MPI.COMM_WORLD
     nside, n, fs = 16, 60_000, 10.0
     rng = np.random.default_rng(0)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _four_detectors(n, fs, rng, sky, nside)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
     kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, pad_s=300.0, tol=1e-20))
     res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
     if comm.rank == 0:
@@ -67,10 +68,10 @@ def test_calibration_mpi():
     templates in pixels without Q/U, a collective step), and gain_tol stops
     every rank at the serial iteration (the rank without data too)."""
     from pysanepic import CalibrationParameters, GLSParameters, make_maps
-    from test_mapmaker import _calibration_data
+    from builders import calibration_data
 
     comm = MPI.COMM_WORLD
-    data, _, _ = _calibration_data(16, 60_000, 10.0, 12_000)
+    data, _, _ = calibration_data(16, 60_000, 10.0, 12_000)
     data = data[:3]  # with 4 ranks, one has no data (and no templates)
     kw = dict(coordinates="E", params=GLSParameters(chunk_s=1200.0, tol=1e-20),
               calibration=CalibrationParameters(gain_period_s=1200.0, n_iter=10, gain_tol=1e-3))
@@ -91,11 +92,11 @@ def test_bandpass_mpi():
     import dataclasses
 
     from pysanepic import GLSParameters, Template, make_maps
-    from test_mapmaker import _bandpass_data
+    from builders import bandpass_data
 
     comm = MPI.COMM_WORLD
     n, per = 60_000, 12_000
-    data, true, _, fg = _bandpass_data(16, n, 10.0, per, np.array([0.05, -0.02, 0.03, 0.01]))
+    data, true, _, fg = bandpass_data(16, n, 10.0, per, np.array([0.05, -0.02, 0.03, 0.01]))
     t = np.arange(n)
     halves = []
     for d, g in zip(data, true):
@@ -118,11 +119,11 @@ def test_tod_templates_mpi():
     import dataclasses
 
     from pysanepic import GLSParameters, Template, make_maps
-    from test_mapmaker import _calibration_data
+    from builders import calibration_data
 
     comm = MPI.COMM_WORLD
     n, per = 60_000, 12_000
-    data, true, _ = _calibration_data(16, n, 10.0, per)
+    data, true, _ = calibration_data(16, n, 10.0, per)
     rng = np.random.default_rng(47)
     t = np.arange(n)
     halves = []
@@ -159,11 +160,11 @@ def test_priors_mpi():
     import healpy as hp
 
     from pysanepic import CalibrationParameters, GLSParameters, Prior, Template, make_maps
-    from test_mapmaker import _calibration_data
+    from builders import calibration_data
 
     comm = MPI.COMM_WORLD
     n, per = 60_000, 12_000
-    data, true, _ = _calibration_data(16, n, 10.0, per)
+    data, true, _ = calibration_data(16, n, 10.0, per)
     rng = np.random.default_rng(53)
     t = np.arange(n)
     halves = []
@@ -305,13 +306,13 @@ def test_estimate_noise_mpi():
     is the same as in serial."""
     from pysanepic import estimate_noise
     from pysanepic.mapmaker import MapResult
-    from test_mapmaker import _noise_data
+    from builders import noise_data
 
     comm = MPI.COMM_WORLD
     nside, fs, chunk = 8, 10.0, 2000
     rng = np.random.default_rng(16)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
-    data = _noise_data(rng, nside, sky, fs, chunk, 8, lambda f: 1 + (0.1 / f) ** 1.5, 1e-4)
+    sky = random_sky(rng, nside)
+    data = noise_data(rng, nside, sky, fs, chunk, 8, lambda f: 1 + (0.1 / f) ** 1.5, 1e-4)
     truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True, residuals=None)
     mine = estimate_noise(data[comm.rank :: comm.size], truth, chunk_s=chunk / fs, comm=comm)
     if comm.rank == 0:
@@ -327,18 +328,18 @@ def test_detector_groups_mpi():
     import healpy as hp
 
     from pysanepic import CommonMode, DetectorGroup, GLSParameters, OneOverFNoise, make_maps
-    from test_mapmaker import _group_data
+    from builders import group_data
 
     comm = MPI.COMM_WORLD
     nside, fs, chunk = 8, 10.0, 2000
     rng = np.random.default_rng(19)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-3)
     mode = OneOverFNoise(net_ukrts=20.0, fknee_hz=0.5, alpha=2.0, fmin_hz=1e-3)
     groups = []
     for _ in range(3):
         coupling = rng.uniform(0.8, 1.2, 3)
-        dets = _group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
+        dets = group_data(rng, nside, sky, fs, chunk, 3, own, mode, coupling)
         groups.append(DetectorGroup(detectors=dets, modes=[CommonMode(coupling=coupling, noise=mode)]))
     for nc in (0, 2):  # also with the two-level preconditioner
         kw = dict(coordinates="E", params=GLSParameters(chunk_s=chunk / fs, tol=1e-20, coarse_nside=nc))
@@ -353,16 +354,16 @@ def test_detector_groups_mpi():
 def test_estimate_common_modes_mpi():
     """Groups of the same detectors on different ranks: same estimate as serial."""
     from pysanepic import CommonMode, DetectorGroup, GLSParameters, OneOverFNoise, estimate_noise, make_maps
-    from test_mapmaker import _group_data
+    from builders import group_data
 
     comm = MPI.COMM_WORLD
     nside, fs, chunk = 8, 10.0, 4000
     rng = np.random.default_rng(23)
-    sky = rng.normal(0, 1e-4, (3, 12 * nside**2))
+    sky = random_sky(rng, nside)
     own = OneOverFNoise(net_ukrts=50.0, fknee_hz=0.05, alpha=1.0, fmin_hz=1e-3)
     mode = OneOverFNoise(net_ukrts=30.0, fknee_hz=0.2, alpha=1.5, fmin_hz=1e-3)
     coupling = rng.uniform(0.6, 0.9, 4)
-    groups = [DetectorGroup(detectors=_group_data(rng, nside, sky, fs, chunk, 2, own, mode, coupling), modes=[CommonMode(coupling=coupling, noise=mode)])
+    groups = [DetectorGroup(detectors=group_data(rng, nside, sky, fs, chunk, 2, own, mode, coupling), modes=[CommonMode(coupling=coupling, noise=mode)])
               for _ in range(3)]
     kw = dict(chunk_s=chunk / fs, nbins=12)
     first = make_maps(groups, nside, coordinates="E", params=GLSParameters(chunk_s=chunk / fs, tol=1e-10))
@@ -379,10 +380,10 @@ def test_estimate_noise_calibrated_mpi():
     the DetectorData spread over the ranks (gains and amplitudes of this rank):
     the serial spectra."""
     from pysanepic import CalibrationParameters, GLSParameters, Template, estimate_noise, make_maps
-    from test_estimate_noise_model import CHUNK, FS, NSIDE, PERIOD, _data
+    from builders import CHUNK, FS, NSIDE, PERIOD, estimate_noise_data
 
     comm = MPI.COMM_WORLD
-    data = _data(True, "period")
+    data = estimate_noise_data(True, "period")
     kw = dict(coordinates="E", params=GLSParameters(chunk_s=CHUNK / FS, tol=1e-14),
               calibration=CalibrationParameters(gain_period_s=CHUNK / FS, n_iter=3),
               templates={"thermal": Template(period_s=PERIOD / FS)})
