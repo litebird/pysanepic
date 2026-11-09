@@ -3,6 +3,7 @@
 Run with: mpirun -n 4 python tests/test_mpi.py  (under pytest it runs on 1 rank)
 """
 
+import dataclasses
 import tempfile
 
 import numpy as np
@@ -76,19 +77,21 @@ def test_make_maps_mpi_subpixel_sky_model():
     rng = np.random.default_rng(2)
     sky = random_sky(rng, nside)
     data = four_detectors(n, fs, rng, sky, nside)
-    kw = dict(coordinates="E", sky_model=0.9 * sky,
-              params=GLSParameters(chunk_s=1200.0, tol=1e-20, angle_dtype=np.float64, subpixel_order=2))
-    res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
-    shared = comm.Split_type(MPI.COMM_TYPE_SHARED).size > 1
-    assert all(x.flags.writeable != shared for x in (res.maps, res.hit_map, res.gradient, res.hessian))
-    if comm.rank == 0:
-        ref = make_maps(data, nside, **kw)
-        assert np.array_equal(res.hit_map, ref.hit_map)
-        for a, b in ((res.maps, ref.maps), (res.gradient, ref.gradient), (res.hessian, ref.hessian)):
-            seen = b != hp.UNSEEN
-            assert np.array_equal(a != hp.UNSEEN, seen)
-            # ~850 iterations, ill-conditioned: MPI and serial differ by ~3e-6 (as on 0.6.5)
-            assert np.abs(a[seen] - b[seen]).max() < 1e-5 * np.abs(b[seen]).max()
+    params = GLSParameters(chunk_s=1200.0, tol=1e-20, angle_dtype=np.float64, subpixel_order=2)
+    ref = make_maps(data, nside, coordinates="E", sky_model=0.9 * sky, params=params) if comm.rank == 0 else None
+    several = comm.Split_type(MPI.COMM_TYPE_SHARED).size > 1
+    for full_maps in ("node", "rank"):  # "auto" is "rank" here (small maps)
+        kw = dict(coordinates="E", sky_model=0.9 * sky, params=dataclasses.replace(params, full_maps=full_maps))
+        res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
+        shared = several and full_maps == "node"
+        assert all(x.flags.writeable != shared for x in (res.maps, res.hit_map, res.gradient, res.hessian))
+        if comm.rank == 0:
+            assert np.array_equal(res.hit_map, ref.hit_map)
+            for a, b in ((res.maps, ref.maps), (res.gradient, ref.gradient), (res.hessian, ref.hessian)):
+                seen = b != hp.UNSEEN
+                assert np.array_equal(a != hp.UNSEEN, seen)
+                # ~850 iterations, ill-conditioned: MPI and serial differ by ~3e-6 (as on 0.6.5)
+                assert np.abs(a[seen] - b[seen]).max() < 1e-5 * np.abs(b[seen]).max()
 
 
 def test_calibration_mpi():
@@ -448,7 +451,7 @@ def test_node_shared_map():
         comm = world.Dup()  # a new communicator: not the cached Node of COMM_WORLD
         nodemod._TEST_NODE = fake
         try:
-            g = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0)
+            g = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0, full_maps="node")
             m, _ = g.solve(tod[mine], tol=1e-20)
             nd = g._node
             # the node's ranks own consecutive slots of pixels
@@ -463,18 +466,35 @@ def test_node_shared_map():
             if g._node_maps:
                 # the solution is one read-only map per node, freed by a later
                 # output once no rank of the node references it
-                wins = [w for w, ref in nd._outs if ref() is m]
+                wins = [win for win, ref in nd._outs if ref() is m]
                 assert len(wins) == 1 and not m.flags.writeable
                 if world.rank == 0:
                     assert np.allclose(m, ms, rtol=1e-10, atol=0)
                 del m
                 hits = g.full(g.hits)
-                assert wins[0] not in [w for w, _ in nd._outs]
+                assert wins[0] not in [win for win, _ in nd._outs]
                 assert np.array_equal(hits[g.lo : g.hi], g.hits) and not hits.flags.writeable
             elif world.rank == 0:
                 assert np.allclose(m, ms, rtol=1e-10, atol=0)
         finally:
             nodemod._TEST_NODE = None
+    # P^T in one set of rounds per group of chunks: one thread per rank (all the
+    # chunks of a rank in one group, or groups of 2: a different number of sets
+    # of rounds per rank), or the batches of the worker threads
+    from pysanepic import gls as glsmod
+
+    budget = glsmod._ROUND_BYTES
+    nodemod._TEST_NODE = lambda r: r % 2
+    try:
+        for nthreads, rb in ((1, budget), (1, 16 * ns * 2), (2, budget)):
+            glsmod._ROUND_BYTES = rb
+            g = GLS(pix[mine], psi[mine], w[mine], comm=world.Dup(), min_pol_rcond=0.0, nthreads=nthreads, full_maps="node")
+            m, _ = g.solve(tod[mine], tol=1e-20)
+            if world.rank == 0:
+                assert np.allclose(m, ms, rtol=1e-10, atol=0)
+    finally:
+        nodemod._TEST_NODE = None
+        glsmod._ROUND_BYTES = budget
 
 
 if __name__ == "__main__":

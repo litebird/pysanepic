@@ -2,9 +2,18 @@
 
 ## Unreleased
 
-- With MPI, the ranks of a node share one copy of the full maps, in MPI-3
-  shared-memory windows, instead of one copy per rank: the map read by P
-  (the PCG search direction), the map summing P^T, and at setup the
+- `GLSParameters.full_maps` (and GLS `full_maps`): `"rank"`, `"node"` or
+  `"auto"` (default), where the full maps are with MPI (below). The maps per
+  node cost time: in a 1-year e2e run at nside 512 with 8 ranks x 6 threads
+  per node (job 23410051, one set of rounds per chunk) the PCG was 55%
+  slower and saved only a few GB per node; "auto" shares them only when
+  the copies of the ranks of a node would take more than 10% of its memory.
+  The rounds of P^T are now one per group of chunks (the batch of the
+  worker threads, or 512 MB of chunks with one thread).
+- With MPI, the ranks of a node can share one copy of the full maps
+  (`full_maps="node"`), in MPI-3 shared-memory windows, instead of one copy
+  per rank: the map read by P (the PCG search direction), the map summing
+  P^T, and at setup the
   coverage and the blocks of the preconditioner (the largest: 37 columns
   with `subpixel_order=2`). At nside 2048 with I/Q/U, 1.2 GB per map per
   node instead of per rank. The pixels are split among the ranks node by
@@ -14,14 +23,28 @@
   pixels, in a fixed order: the maps do not depend on the timing, and are
   the same as before up to rounding. Needs only mpi4py, with or without
   litebird_sim.
-- The full maps handed out with MPI are shared by the ranks of a node too:
-  the solution of `GLS.solve`, `GLS.full`, `GLS.binned` and the maps,
+- With `full_maps="node"` the full maps handed out are shared by the ranks
+  of a node too: the solution of `GLS.solve`, `GLS.full`, `GLS.binned` and the maps,
   gradient, Hessian and hit map of `MapResult` (`GLS.to_healpix` still
   returns an array of the rank, and is not collective after `solve`). With
   several ranks on a node these arrays are read-only (copy them to change
   them); the memory is freed when no rank of the node references them, at
   the next allocation of such a map. Before, `make_maps` ended with ~4 full
   maps per rank (~5 GB per rank at nside 2048 with I/Q/U).
+- `make_maps(verbose=True)` prints the time of the phases of each GLS
+  solve (rank 0): of the TOD and templates (pointing, sky sampling, TOD
+  model, chunks) and of the GLS setup (coverage, mask, preconditioner
+  blocks, template diagonals, preconditioner, coarse level); also in
+  `GLS.timings`. In a 30-day e2e test the preconditioner blocks were about
+  half of the setup.
+- `CalibrationParameters.tol` (default `None`: unchanged): the tolerance of
+  the PCG in the first calibration iterations, a number or `"adaptive"`
+  (`max(GLSParameters.tol, tol_factor * dg^2)`, `tol_factor` 1e-3); the
+  calibration stops on `gain_tol` only after a solve at
+  `GLSParameters.tol`. It saved 25-45% of the PCG iterations in a
+  noiseless test, but not in a 30-day e2e test with noise and calibration
+  converged in 3 iterations (1279 s with 1e-6, 1094 s adaptive, 1034 s
+  without): the less accurate early gains cost more calibration iterations.
 
 ## 0.6.5 (2026-11-08)
 

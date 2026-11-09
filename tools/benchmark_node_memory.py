@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--ns", type=int, default=2**20)
     ap.add_argument("--iterations", type=int, default=10)
     ap.add_argument("--nthreads", type=int, default=1)
+    ap.add_argument("--full-maps", default=None, help="GLS full_maps (versions that have it; default: theirs)")
     ap.add_argument("--output-dir", required=True)
     args = ap.parse_args()
     sys.path.insert(0, args.src)
@@ -100,8 +101,9 @@ def main():
     peak = Peak()
     peak.phase("setup")
     t0 = time.perf_counter()
+    extra = {} if args.full_maps is None else {"full_maps": args.full_maps}
     g = GLS(pix, None, [w] * args.chunks, pol_angles=(angle, [1.0] * args.chunks), comm=comm,
-            nthreads=args.nthreads, overwrite_pix=True, min_pol_rcond=0.0)
+            nthreads=args.nthreads, overwrite_pix=True, min_pol_rcond=0.0, **extra)
     comm.Barrier()
     t1 = time.perf_counter()
     peak.phase("pcg")
@@ -123,6 +125,8 @@ def main():
     peak.stop.set()
     peak.thread.join()
 
+    # the phases of the setup and of the PCG (rank 0 below), where the version has them
+    timings = {k: dict(getattr(g, k, {})) for k in ("timings", "pcg_timings")}
     row = {"rank": comm.rank, "host": socket.gethostname(),
            **{f"{k}_{x}_gb": v[x] / 1e9 for k, v in peak.rows.items() for x in ("pss", "rss")}}
     rows = comm.gather(row)
@@ -133,9 +137,11 @@ def main():
         summary = dict(label=args.label, version=pysanepic.__version__, ranks=comm.size, nodes=len(hosts),
                        nside=args.nside, nobs=g.nobs, ncomp=g.ncomp, nthreads=args.nthreads,
                        samples_per_rank=args.chunks * args.ns, iterations=info["iterations"],
+                       full_maps=getattr(g, "full_maps_info", None),
                        setup_s=t1 - t0, pcg_s=t2 - t1, maps_s=t3 - t2, hits=int(hits.sum()),
                        seen=int((maps[0] != -1.6375e30).sum()), s_per_iteration=(t2 - t1) / max(info["iterations"], 1),
-                       per_node_peak_pss_gb=per_node, ranks_detail=rows)
+                       per_node_peak_pss_gb=per_node, setup_timings_rank0=timings["timings"],
+                       pcg_timings_rank0=timings["pcg_timings"], ranks_detail=rows)
         (out / f"{args.label}.json").write_text(json.dumps(summary, indent=1))
         np.save(out / f"{args.label}_maps.npy", m.astype(np.float32))
         print(json.dumps({k: v for k, v in summary.items() if k != "ranks_detail"}, indent=1), flush=True)
