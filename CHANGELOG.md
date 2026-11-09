@@ -9,7 +9,10 @@
   slower and saved only a few GB per node; "auto" shares them only when
   the copies of the ranks of a node would take more than 10% of its memory.
   The rounds of P^T are now one per group of chunks (the batch of the
-  worker threads, or 512 MB of chunks with one thread).
+  worker threads, or 512 MB of chunks with one thread), and the order of
+  the samples of each chunk by slab of pixels is computed once (4 bytes per
+  sample) instead of at every P^T: at nside 512 (job 23415660) "node" was
+  still 24% slower than "rank", of which 340 s of 7705 s in that order.
 - With MPI, the ranks of a node can share one copy of the full maps
   (`full_maps="node"`), in MPI-3 shared-memory windows, instead of one copy
   per rank: the map read by P (the PCG search direction), the map summing

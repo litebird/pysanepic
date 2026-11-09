@@ -1810,6 +1810,7 @@ def test_slab_order():
             order, starts = _slab_order(ip, nobs, nslab)
             slab = np.where(ip >= nobs, nslab, ip.astype(np.int64) * nslab // nobs)
             keep = np.flatnonzero(ip >= 0)
+            assert order.dtype == np.int32
             assert np.array_equal(order, keep[np.argsort(slab[keep], kind="stable")])
             assert np.array_equal(starts, np.r_[0, np.cumsum(np.bincount(slab[keep], minlength=nslab + 1))])
 
