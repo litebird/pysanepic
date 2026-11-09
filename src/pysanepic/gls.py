@@ -2479,6 +2479,7 @@ class GLS:
         true_residual = True  # r was computed as b - A x in float64
 
         it = 0
+        t = time.perf_counter()
         while it < maxiter and history[-1] > tol:
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
@@ -2503,7 +2504,9 @@ class GLS:
                 d = z.copy()
                 delta = self._dot(r, z)
             if verbose and (self.comm is None or self.comm.rank == 0):
-                print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
+                now = time.perf_counter()
+                print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}  ({now - t:.1f} s)", flush=True)
+                t = now
         return x, it, history
 
     def white_weights(self):

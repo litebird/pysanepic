@@ -31,6 +31,8 @@
   them); the memory is freed when no rank of the node references them, at
   the next allocation of such a map. Before, `make_maps` ended with ~4 full
   maps per rank (~5 GB per rank at nside 2048 with I/Q/U).
+- With `verbose`, each PCG iteration line ends with its wall time, in
+  seconds (rank 0).
 - `make_maps(verbose=True)` prints the time of the phases of each GLS
   solve (rank 0): of the TOD and templates (pointing, sky sampling, TOD
   model, chunks) and of the GLS setup (coverage, mask, preconditioner
