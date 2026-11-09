@@ -62,6 +62,35 @@ def test_make_maps_mpi_padding():
         assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
 
 
+def test_make_maps_mpi_subpixel_sky_model():
+    """make_maps with the Hessian (the pixel means written once per node) and a
+    sky model (its binned map added back): the serial result; with several
+    ranks on a node its maps are shared and read-only."""
+    import healpy as hp
+
+    from pysanepic import GLSParameters, make_maps
+    from builders import four_detectors
+
+    comm = MPI.COMM_WORLD
+    nside, n, fs = 16, 60_000, 10.0
+    rng = np.random.default_rng(2)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
+    kw = dict(coordinates="E", sky_model=0.9 * sky,
+              params=GLSParameters(chunk_s=1200.0, tol=1e-20, angle_dtype=np.float64, subpixel_order=2))
+    res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
+    shared = comm.Split_type(MPI.COMM_TYPE_SHARED).size > 1
+    assert all(x.flags.writeable != shared for x in (res.maps, res.hit_map, res.gradient, res.hessian))
+    if comm.rank == 0:
+        ref = make_maps(data, nside, **kw)
+        assert np.array_equal(res.hit_map, ref.hit_map)
+        for a, b in ((res.maps, ref.maps), (res.gradient, ref.gradient), (res.hessian, ref.hessian)):
+            seen = b != hp.UNSEEN
+            assert np.array_equal(a != hp.UNSEEN, seen)
+            # ~850 iterations, ill-conditioned: MPI and serial differ by ~3e-6 (as on 0.6.5)
+            assert np.abs(a[seen] - b[seen]).max() < 1e-5 * np.abs(b[seen]).max()
+
+
 def test_calibration_mpi():
     """Calibration with the detectors split across ranks gives the serial gains
     (amplitudes local to each rank; default min_pol_rcond, which drops the
@@ -431,7 +460,18 @@ def test_node_shared_map():
                 work[0] = 1000.0 + nd.first
             nd.barrier()
             assert work[0] == 1000.0 + nd.first
-            if world.rank == 0:
+            if g._node_maps:
+                # the solution is one read-only map per node, freed by a later
+                # output once no rank of the node references it
+                wins = [w for w, ref in nd._outs if ref() is m]
+                assert len(wins) == 1 and not m.flags.writeable
+                if world.rank == 0:
+                    assert np.allclose(m, ms, rtol=1e-10, atol=0)
+                del m
+                hits = g.full(g.hits)
+                assert wins[0] not in [w for w, _ in nd._outs]
+                assert np.array_equal(hits[g.lo : g.hi], g.hits) and not hits.flags.writeable
+            elif world.rank == 0:
                 assert np.allclose(m, ms, rtol=1e-10, atol=0)
         finally:
             nodemod._TEST_NODE = None
@@ -440,6 +480,7 @@ def test_node_shared_map():
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
+    test_make_maps_mpi_subpixel_sky_model()
     test_more_ranks_than_pixels()
     test_mpi_count_check()
     test_flags_mpi()

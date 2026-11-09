@@ -14,6 +14,14 @@
   pixels, in a fixed order: the maps do not depend on the timing, and are
   the same as before up to rounding. Needs only mpi4py, with or without
   litebird_sim.
+- The full maps handed out with MPI are shared by the ranks of a node too:
+  the solution of `GLS.solve`, `GLS.full`, `GLS.binned` and the maps,
+  gradient, Hessian and hit map of `MapResult` (`GLS.to_healpix` still
+  returns an array of the rank, and is not collective after `solve`). With
+  several ranks on a node these arrays are read-only (copy them to change
+  them); the memory is freed when no rank of the node references them, at
+  the next allocation of such a map. Before, `make_maps` ended with ~4 full
+  maps per rank (~5 GB per rank at nside 2048 with I/Q/U).
 
 ## 0.6.5 (2026-11-08)
 

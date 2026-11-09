@@ -1051,7 +1051,9 @@ class GLS:
         coverage and the blocks of the preconditioner) are full size, and
         they are in memory shared by the ranks of a node, one copy per node:
         the pixels are split node by node and only the node leaders exchange
-        maps between nodes (see node.py and _NodeSum).
+        maps between nodes (see node.py and _NodeSum). The full maps handed
+        out (solve, full, binned) are shared by the ranks of a node too,
+        read-only when the node has several ranks.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -1417,7 +1419,7 @@ class GLS:
         self._shv = np.zeros(self.nshared)  # the shared amplitudes for P, set by _apply
         if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)) + self.nshared:  # collective
             if self._solved is None:
-                self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
+                self._solved = self.full(self.mask[1].astype(np.uint8)).view(bool)
             for k, ip in enumerate(self.ip):
                 valid = (ip >= 0) & (ip < self.nobs)
                 bad = np.zeros(ip.size, bool)
@@ -1761,11 +1763,68 @@ class GLS:
 
     def full(self, x):
         """Gather a per-pixel array of this rank, (k, nloc) or (nloc,), into the
-        full (k, nobs) or (nobs,) array on every rank."""
+        full (k, nobs) or (nobs,) array on every rank. Collective with MPI. With
+        several ranks on a node, a read-only array shared by the ranks of the
+        node (one copy per node)."""
         x = np.asarray(x)
+        if self._node_maps:
+            one = x.ndim == 1
+            x = x[None] if one else x
+            out = self._node.output((x.shape[0], self.nobs), x.dtype)
+            out[:, self.lo : self.hi] = x
+            self._node.gather_rows(out, self._layout)
+            self._node.freeze(out)
+            return out[0] if one else out
         if x.ndim == 1:
             return self._gather(x[:, None])[:, 0]
         return np.ascontiguousarray(self._gather(x.T).T)
+
+    def _full_mask_of(self):
+        """The full mask (ncomp, nobs), gathered once (collective the first time)."""
+        if getattr(self, "_full_mask", None) is None:
+            self._full_mask = self.full(self.mask.astype(np.uint8)).view(bool)
+        return self._full_mask
+
+    def _freeze(self, out):
+        """Hand out an array of _healpix (or written like it): read-only and
+        visible to the ranks of the node if shared, as it is otherwise."""
+        return self._node.freeze(out) if self._node_maps else out
+
+    @property
+    def _writer(self):
+        """Whether this rank writes the maps shared by its node (all ranks without them)."""
+        return not self._node_maps or self._node.leader
+
+    def _healpix(self, m, nside, fill, masked=True):
+        """to_healpix into a new array, with several ranks on a node shared by
+        them (collective; each one fills a part): writable, to be finished by
+        the _writer ranks and handed out with _freeze. Without `masked`, the
+        unseen pixels are not filled."""
+        npix = 12 * nside * nside
+        if not self._node_maps:
+            out, (a, b) = np.empty((m.shape[0], npix), np.asarray(fill).dtype), (0, npix)
+        else:
+            out = self._node.output((m.shape[0], npix), np.asarray(fill).dtype)
+            a, b = self._node.part(npix)
+        seen = self._full_mask_of() if masked else None
+        out[:, a:b] = fill
+        c = min(b, self.nobs)  # labels beyond the map (virtual pixels) dropped
+        if a < c:
+            out[:, a:c] = m[:, a:c]
+            if masked:
+                out[:, a:c][~seen[:, a:c]] = fill
+        if self._node_maps:
+            self._node.barrier()
+        return out
+
+    def _sum(self, a, b):
+        """a + b for full maps (ncomp, nobs), shared by the ranks of a node as a and b."""
+        if not self._node_maps:
+            return a + b
+        out = self._node.output(a.shape, np.result_type(a, b))
+        lo, hi = self._node.part(a.shape[1])
+        np.add(a[:, lo:hi], b[:, lo:hi], out=out[:, lo:hi])
+        return self._node.freeze(out)
 
     def _dot(self, a, b):
         d = float(_block_dots(a, b, _DOT_BLOCKS).sum())
@@ -2079,8 +2138,9 @@ class GLS:
                 "shared_amplitudes": shared if self.comm is None else self.comm.bcast(shared)}
         self._free()
         # full mask now, while all ranks are here, so that to_healpix is not collective
-        self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
-        return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
+        self._full_mask = None
+        self._full_mask_of()
+        return self.full(x[: self._nsky].reshape(self.ncomp, self.nloc)), info
 
     def shared_covariance(self, tol=1e-10, maxiter=2000, recompute_every=10, verbose=False):
         """Covariance of the shared template amplitudes, marginalized over the
@@ -2214,12 +2274,11 @@ class GLS:
         return self.full(out)
 
     def to_healpix(self, m, nside, fill=np.nan):
-        """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2); labels
+        """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2) of this
+        rank (not shared by the node, unlike the maps of make_maps); labels
         beyond the map (virtual pixels) are dropped. Collective with MPI only if
         called before solve()."""
-        if getattr(self, "_full_mask", None) is None:
-            self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
-        unseen = ~self._full_mask
+        unseen = ~self._full_mask_of()
         full = np.full((m.shape[0], 12 * nside * nside), fill)
         n = min(full.shape[1], self.nobs)
         full[:, :n] = m[:, :n]

@@ -4,7 +4,8 @@ Each rank observes random pixels over the whole sky (as LiteBIRD: every rank
 sees nearly every pixel), so the full maps dominate the memory. Reports, per
 rank, the peak PSS (proportional set size: a page shared by the k ranks of a
 node counts 1/k for each, so the sum over the ranks of a node is the memory
-of the node) during the setup and during the PCG, and the time per iteration.
+of the node) during the setup, the PCG and the output maps (as make_maps:
+HEALPix maps and hit map), and the time per iteration.
 
     srun python tools/benchmark_node_memory.py --src <snapshot>/src --label branch \
         --nside 2048 --output-dir results
@@ -107,6 +108,17 @@ def main():
     m, info = g.solve(tod, tol=1e-30, maxiter=args.iterations)
     comm.Barrier()
     t2 = time.perf_counter()
+    peak.phase("maps")
+    # the outputs of make_maps: hit map and HEALPix maps (shared per node where available)
+    if hasattr(g, "_healpix"):
+        hits = g._freeze(g._healpix(g.full(g.hits)[None], args.nside, 0, masked=False))[0]
+        maps = g._freeze(g._healpix(m, args.nside, -1.6375e30))
+    else:
+        hits = np.zeros(npix, np.int64)
+        hits[:] = g.full(g.hits)[:npix]
+        maps = g.to_healpix(m, args.nside, fill=-1.6375e30)
+    comm.Barrier()
+    t3 = time.perf_counter()
     peak.phase("end")
     peak.stop.set()
     peak.thread.join()
@@ -121,7 +133,8 @@ def main():
         summary = dict(label=args.label, version=pysanepic.__version__, ranks=comm.size, nodes=len(hosts),
                        nside=args.nside, nobs=g.nobs, ncomp=g.ncomp, nthreads=args.nthreads,
                        samples_per_rank=args.chunks * args.ns, iterations=info["iterations"],
-                       setup_s=t1 - t0, pcg_s=t2 - t1, s_per_iteration=(t2 - t1) / max(info["iterations"], 1),
+                       setup_s=t1 - t0, pcg_s=t2 - t1, maps_s=t3 - t2, hits=int(hits.sum()),
+                       seen=int((maps[0] != -1.6375e30).sum()), s_per_iteration=(t2 - t1) / max(info["iterations"], 1),
                        per_node_peak_pss_gb=per_node, ranks_detail=rows)
         (out / f"{args.label}.json").write_text(json.dumps(summary, indent=1))
         np.save(out / f"{args.label}_maps.npy", m.astype(np.float32))

@@ -13,6 +13,7 @@ nodes: an allgather of the node ranges for P, a reduce-scatter for the sums.
 """
 
 import atexit
+import weakref
 
 import numpy as np
 
@@ -70,6 +71,7 @@ class Node:
         self.leader = self.node.rank == 0
         self.leaders = comm.Split(0 if self.leader else MPI.UNDEFINED, slot)
         self._wins = {}  # name -> (window, number of float64)
+        self._outs = []  # (window, weak reference to its array): the outputs, see `output`
 
     def matches(self, comm):
         """Still the communicator this Node was made for (handles are reused)."""
@@ -105,12 +107,73 @@ class Node:
         buf, _ = win.Shared_query(0)
         return np.ndarray(n, np.float64, buffer=buf)
 
+    def output(self, shape, dtype):
+        """A new array shared by the ranks of the node, for a result handed to
+        the caller (collective on the node). Not reused: its window is freed by
+        a later `output` once no rank of the node references the array (or a
+        view of it), so the ranks must not write it after it is handed out
+        (see `freeze`). First frees the windows of the outputs released."""
+        from mpi4py import MPI
+
+        self._collect()
+        dtype = np.dtype(dtype)
+        n = int(np.prod(shape, dtype=np.int64))
+        win = MPI.Win.Allocate_shared(max(n * dtype.itemsize, 1) if self.leader else 0, dtype.itemsize, comm=self.node)
+        win.Lock_all(MPI.MODE_NOCHECK)
+        buf, _ = win.Shared_query(0)
+        # views of `out` keep `out` as their base (numpy stops at an array
+        # whose base is not an array): the weak reference sees them all
+        out = np.ndarray(shape, dtype, buffer=buf)
+        self._outs.append((win, weakref.ref(out)))
+        return out
+
+    def _collect(self):
+        """Free the windows of the outputs no rank of the node references (collective on the node)."""
+        from mpi4py import MPI
+
+        if not self._outs:
+            return
+        alive = np.array([ref() is not None for _, ref in self._outs])
+        self.node.Allreduce(MPI.IN_PLACE, alive, op=MPI.LOR)
+        for (win, _), keep in zip(self._outs, alive):
+            if not keep:
+                win.Unlock_all()
+                win.Free()
+        self._outs = [o for o, keep in zip(self._outs, alive) if keep]
+
+    def freeze(self, out):
+        """Hand out an `output` written by the ranks of the node: wait for them
+        all, then make it read-only (it is the same memory on every rank)."""
+        self.barrier()
+        out.flags.writeable = False
+        return out
+
+    def part(self, n):
+        """This rank's share [a, b) of n items split among the ranks of the node."""
+        r, s = self.node.rank, self.node.size
+        return r * n // s, (r + 1) * n // s
+
+    def gather_rows(self, full, layout):
+        """Fill the columns of the other nodes in the shared `full` (k, nobs),
+        whose columns [lo, hi) of this node its ranks have written: an
+        allgather of each row on the leaders. Collective."""
+        from mpi4py import MPI
+
+        self.barrier()
+        if self.leader and self.leaders.size > 1:
+            counts = layout.counts.tolist()
+            displs = np.concatenate([[0], np.cumsum(layout.counts)[:-1]]).tolist()
+            for row in full.reshape(-1, full.shape[-1]):
+                self.leaders.Allgatherv(MPI.IN_PLACE, [row, (counts, displs)])  # datatype from the dtype
+        self.barrier()
+
     def barrier(self):
         """Wait for the ranks of the node, the stores of each one visible to all."""
-        for win, _ in self._wins.values():
+        wins = [w for w, _ in self._wins.values()] + [w for w, _ in self._outs]
+        for win in wins:
             win.Sync()
         self.node.Barrier()
-        for win, _ in self._wins.values():
+        for win in wins:
             win.Sync()
 
     def allgather(self, full, layout):
@@ -148,10 +211,10 @@ class Node:
 
     def free(self):
         """Free the shared windows (collective on the node)."""
-        for win, _ in self._wins.values():
+        for win, _ in list(self._wins.values()) + self._outs:
             win.Unlock_all()
             win.Free()
-        self._wins = {}
+        self._wins, self._outs = {}, []
 
 
 def _free_at_exit():

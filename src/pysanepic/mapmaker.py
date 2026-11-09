@@ -320,6 +320,10 @@ class DetectorGroup:
 class MapResult:
     """Output of :func:`make_maps`.
 
+    With MPI, maps, hit_map, gradient and hessian are on every rank, shared
+    by the ranks of a node (one copy per node, read-only when the node has
+    several ranks: copy them to change them).
+
     Attributes
     ----------
     maps : (3, npix) I/Q/U in K, or (1, npix) if pol=False; RING ordering,
@@ -1028,16 +1032,21 @@ def _pixel_mean_shift(nside, gradient, hessian, nthreads):
     return shift
 
 
-def _subpixel_result(maps, npol, order, nside, nthreads):
-    """GLS form -> MapResult form: (maps (npol, npix) with I the pixel mean,
-    gradient or None, hessian or None) of the GLS maps `maps` (npol + 0, 2 or
-    5 components, UNSEEN where not solved) for subpixel_order `order`."""
+def _subpixel_result(maps, npol, order, nside, nthreads, write=True):
+    """GLS form -> MapResult form, in place: (maps (npol, npix) with I the
+    pixel mean, gradient or None, hessian or None), views of the GLS maps
+    `maps` (npol + 0, 2 or 5 components, UNSEEN where not solved) for
+    subpixel_order `order`. Only the ranks with `write` change `maps` (one
+    per node when the ranks of a node share it)."""
     sub, maps = maps[npol:], maps[:npol]
     if not order:
         return maps, None, None
     gradient = sub[:2]
-    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * _HESSIAN[:, None]) if order > 1 else None
-    maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    hessian = sub[2:] if order > 1 else None
+    if write:
+        if hessian is not None:
+            np.multiply(hessian, _HESSIAN[:, None], out=hessian, where=hessian != hp.UNSEEN)
+        maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
     return maps, gradient, hessian
 
 
@@ -1984,19 +1993,20 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     if fit is not None:
         fit.x0 = m
         if fit.fit:
-            fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
+            fit.residual = gls._freeze(gls._healpix(m, nside, hp.UNSEEN))
         fit.amplitudes.update(info if fit.fit else None)  # g (1 + dg), a + da, A + dA
         if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky
             bw = params.binned_weights
             if isinstance(bw, dict):  # every name checked in make_maps
                 bw = np.array([bw[n] for n in chunks.names], dtype=float)
-            m = m + gls.binned(model_c, weights=bw)
+            m = gls._sum(m, gls.binned(model_c, weights=bw))
 
-    hit_map = np.zeros(npix, dtype=np.int64)
-    n = min(npix, gls.nobs)
-    hit_map[:n] = gls.full(gls.hits)[:n]
-    maps, gradient, hessian = _subpixel_result(gls.to_healpix(m, nside, fill=hp.UNSEEN), npol, params.subpixel_order,
-                                               nside, nthreads)
+    # with MPI, the ranks of a node share the full maps (read-only)
+    hit_map = gls._freeze(gls._healpix(gls.full(gls.hits)[None], nside, 0, masked=False))[0]
+    full = gls._healpix(m, nside, hp.UNSEEN)
+    _subpixel_result(full, npol, params.subpixel_order, nside, nthreads, gls._writer)
+    gls._freeze(full)  # before the views: they inherit read-only
+    maps, gradient, hessian = _subpixel_result(full, npol, params.subpixel_order, nside, nthreads, write=False)
     if verbose and chunks.rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
         print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
