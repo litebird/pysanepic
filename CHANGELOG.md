@@ -9,7 +9,9 @@
   slower and saved only a few GB per node; "auto" shares them only when
   the copies of the ranks of a node would take more than 10% of its memory.
   The rounds of P^T are now one per group of chunks (the batch of the
-  worker threads, or 512 MB of chunks with one thread).
+  worker threads, or 512 MB of chunks with one thread). Part of that
+  slowdown, with "rank" too (28% in the PCG), came from a P^T kernel 5x
+  slower than in 0.6.5, now fixed: those numbers are being measured again.
 - With MPI, the ranks of a node can share one copy of the full maps
   (`full_maps="node"`), in MPI-3 shared-memory windows, instead of one copy
   per rank: the map read by P (the PCG search direction), the map summing

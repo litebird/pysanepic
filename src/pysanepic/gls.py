@@ -399,32 +399,17 @@ def _project(ip, m, c2, s2, pol, gx, gy, grad, loc, out):
         out[i] = v
 
 
-@numba.njit(nogil=True, cache=True, inline="always")
-def _backproject_sample(i, p, t, c2, s2, pol, gx, gy, grad, buf):
-    """buf[p] += P^T of sample i (in pixel p) of t."""
-    buf[p, 0] += t[i]
-    if pol:
-        buf[p, 1] += t[i] * c2[i]
-        buf[p, 2] += t[i] * s2[i]
-    if grad:
-        g = 3 if pol else 1
-        x, y = gx[i], gy[i]
-        buf[p, g] += t[i] * x
-        buf[p, g + 1] += t[i] * y
-        if grad > 1:
-            buf[p, g + 2] += t[i] * (x * x - _Q2)
-            buf[p, g + 3] += t[i] * x * y
-            buf[p, g + 4] += t[i] * (y * y - _Q2)
-
-
 @numba.njit(parallel=True, cache=True)
 def _backproject(ip, t, c2, s2, pol, gx, gy, grad, edges, buf, locbuf):
     """buf += P^T t, buf (nobs, ncomp). Thread th owns the pixels
     [edges[th], edges[th + 1]): it reads all the pixel indices of the chunk but
     adds only the samples of its pixels, so the threads share one map without
     races and without private copies. Flagged samples (labels p >= nobs) go to
-    locbuf[p - nobs], written by thread 0."""
+    locbuf[p - nobs], written by thread 0. The body is written out (also in
+    _backproject_sel): a per-sample helper inlined by numba made the serial
+    copy (_backproject_1, the P^T of the chunk workers) 5x slower."""
     nobs = buf.shape[0]
+    g = 3 if pol else 1
     for th in numba.prange(edges.size - 1):
         lo, hi = edges[th], edges[th + 1]
         for i in range(ip.size):
@@ -433,7 +418,18 @@ def _backproject(ip, t, c2, s2, pol, gx, gy, grad, edges, buf, locbuf):
                 if th == 0:
                     locbuf[p - nobs] += t[i]
             elif lo <= p < hi:
-                _backproject_sample(i, p, t, c2, s2, pol, gx, gy, grad, buf)
+                buf[p, 0] += t[i]
+                if pol:
+                    buf[p, 1] += t[i] * c2[i]
+                    buf[p, 2] += t[i] * s2[i]
+                if grad:
+                    x, y = gx[i], gy[i]
+                    buf[p, g] += t[i] * x
+                    buf[p, g + 1] += t[i] * y
+                    if grad > 1:
+                        buf[p, g + 2] += t[i] * (x * x - _Q2)
+                        buf[p, g + 3] += t[i] * x * y
+                        buf[p, g + 4] += t[i] * (y * y - _Q2)
 
 
 @numba.njit(parallel=True, cache=True)
@@ -441,6 +437,7 @@ def _backproject_sel(ip, t, c2, s2, pol, gx, gy, grad, idx, edges, buf, locbuf):
     """_backproject on the samples idx only (see _slab_order); flagged samples
     go to locbuf only if it is not empty."""
     nobs = buf.shape[0]
+    g = 3 if pol else 1
     for th in numba.prange(edges.size - 1):
         lo, hi = edges[th], edges[th + 1]
         for i in idx:
@@ -449,7 +446,18 @@ def _backproject_sel(ip, t, c2, s2, pol, gx, gy, grad, idx, edges, buf, locbuf):
                 if th == 0 and locbuf.size:
                     locbuf[p - nobs] += t[i]
             elif lo <= p < hi:
-                _backproject_sample(i, p, t, c2, s2, pol, gx, gy, grad, buf)
+                buf[p, 0] += t[i]
+                if pol:
+                    buf[p, 1] += t[i] * c2[i]
+                    buf[p, 2] += t[i] * s2[i]
+                if grad:
+                    x, y = gx[i], gy[i]
+                    buf[p, g] += t[i] * x
+                    buf[p, g + 1] += t[i] * y
+                    if grad > 1:
+                        buf[p, g + 2] += t[i] * (x * x - _Q2)
+                        buf[p, g + 3] += t[i] * x * y
+                        buf[p, g + 4] += t[i] * (y * y - _Q2)
 
 
 def _slab_order(ip, nobs, nslab):
@@ -778,27 +786,23 @@ def _coverage(ip, c2, s2, pol, gx, gy, grad, out, scale=1.0):
     weights (see _weights): with pol only, c2, s2, c2^2, c2 s2, s2^2 (the
     angle-coverage matrix), each sample counted `scale` times (the weight of
     the chunk in a weighted binned map). Serial: the chunks are summed in
-    parallel into private arrays (GLS._chunk_coverage)."""
+    parallel into private arrays (GLS._chunk_coverage). The body is written
+    out (also in _coverage_sel): a per-sample helper inlined by numba made
+    it 1.7x slower."""
     w = np.empty(8)
     for i in range(ip.size):
         p = ip[i]
         if p < 0 or p >= out.shape[0]:  # flagged sample
             continue
-        _coverage_sample(i, p, c2, s2, pol, gx, gy, grad, out, scale, w)
-
-
-@numba.njit(nogil=True, cache=True, inline="always")
-def _coverage_sample(i, p, c2, s2, pol, gx, gy, grad, out, scale, w):
-    """out[p] += the coverage of sample i (see _coverage); w: (8,) work array."""
-    out[p, 0] += scale
-    n = _weights(i, c2, s2, pol, gx, gy, grad, w)
-    if pol and w[1] * w[1] + w[2] * w[2] > 0.25:
-        out[p, 1] += scale
-    col = 2
-    for a in range(n):
-        for b in range(max(a, 1), n):
-            out[p, col] += scale * w[a] * w[b]
-            col += 1
+        out[p, 0] += scale
+        n = _weights(i, c2, s2, pol, gx, gy, grad, w)
+        if pol and w[1] * w[1] + w[2] * w[2] > 0.25:
+            out[p, 1] += scale
+        col = 2
+        for a in range(n):
+            for b in range(max(a, 1), n):
+                out[p, col] += scale * w[a] * w[b]
+                col += 1
 
 
 @numba.njit(parallel=True, cache=True)
@@ -811,7 +815,15 @@ def _coverage_sel(ip, c2, s2, pol, gx, gy, grad, idx, edges, out, scale):
         for i in idx:
             p = ip[i]
             if lo <= p < hi:
-                _coverage_sample(i, p, c2, s2, pol, gx, gy, grad, out, scale, w)
+                out[p, 0] += scale
+                n = _weights(i, c2, s2, pol, gx, gy, grad, w)
+                if pol and w[1] * w[1] + w[2] * w[2] > 0.25:
+                    out[p, 1] += scale
+                col = 2
+                for a in range(n):
+                    for b in range(max(a, 1), n):
+                        out[p, col] += scale * w[a] * w[b]
+                        col += 1
 
 
 def _pixel_order(ip, npix):
