@@ -455,11 +455,11 @@ def test_node_shared_map():
             m, _ = g.solve(tod[mine], tol=1e-20)
             nd = g._node
             # the node's ranks own consecutive slots of pixels
-            assert nd.node.allgather(nd.pixels.rank) == list(range(nd.first, nd.first + nd.node.size))
+            assert nd.comm.allgather(nd.pixels.rank) == list(range(nd.first, nd.first + nd.comm.size))
             # one map per node: what its rank 0 writes, the others read
             work = nd.work("test", 1)
             nd.barrier()
-            if nd.node.rank == 0:
+            if nd.comm.rank == 0:
                 work[0] = 1000.0 + nd.first
             nd.barrier()
             assert work[0] == 1000.0 + nd.first
