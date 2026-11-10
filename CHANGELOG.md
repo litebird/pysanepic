@@ -17,10 +17,10 @@
   ranks: 4.7 instead of 12.5 s per iteration in a benchmark).
 - With MPI, the ranks of a node can share one copy of the full maps
   (`full_maps="node"`), in MPI-3 shared-memory windows, instead of one copy
-  per rank: the map read by P (the PCG search direction), the map summing
-  P^T, and at setup the
-  coverage and the blocks of the preconditioner (the largest: 37 columns
-  with `subpixel_order=2`). At nside 2048 with I/Q/U, 1.2 GB per map per
+  per rank: the map summing P^T, and at setup the coverage and the blocks
+  of the preconditioner (the largest: 37 columns with `subpixel_order=2`).
+  The map read by P (the PCG search direction) is shared by the ranks of a
+  node with any `full_maps`. At nside 2048 with I/Q/U, 1.2 GB per map per
   node instead of per rank. The pixels are split among the ranks node by
   node (the same split as before when the ranks are placed on the nodes in
   blocks) and only the node leaders exchange maps between nodes. The ranks
@@ -29,12 +29,12 @@
   the same as before up to rounding. Needs only mpi4py, with or without
   litebird_sim.
 - With `full_maps="node"` the full maps handed out are shared by the ranks
-  of a node too: the solution of `GLS.solve`, `GLS.full`, `GLS.binned` and the maps,
-  gradient, Hessian and hit map of `MapResult` (`GLS.to_healpix` still
-  returns an array of the rank, and is not collective after `solve`). With
-  several ranks on a node these arrays are read-only (copy them to change
-  them); the memory is freed when no rank of the node references them, at
-  the next allocation of such a map. Before, `make_maps` ended with ~4 full
+  of a node too: the solution of `GLS.solve`, `GLS.full`, `GLS.binned` and
+  the maps, gradient, Hessian and hit map of `MapResult` (`GLS.to_healpix`
+  still returns an array of the rank, and is not collective after
+  `solve`). These arrays are read-only (copy them to change them); the
+  memory is freed when no rank of the node references them, at the next
+  allocation of such a map. Before, `make_maps` ended with ~4 full
   maps per rank (~5 GB per rank at nside 2048 with I/Q/U).
 - With `verbose`, each PCG iteration line ends with its wall time, in
   seconds (rank 0).

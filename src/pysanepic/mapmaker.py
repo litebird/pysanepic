@@ -320,9 +320,9 @@ class DetectorGroup:
 class MapResult:
     """Output of :func:`make_maps`.
 
-    With MPI, maps, hit_map, gradient and hessian are on every rank, shared
-    by the ranks of a node (one copy per node, read-only when the node has
-    several ranks: copy them to change them).
+    With MPI, maps, hit_map, gradient and hessian are on every rank: a copy
+    per rank with full_maps "rank", or shared by the ranks of a node with
+    "node" (one copy per node, read-only: copy them to change them).
 
     Attributes
     ----------
@@ -2062,7 +2062,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
                 bw = np.array([bw[n] for n in chunks.names], dtype=float)
             m = gls._sum(m, gls.binned(model_c, weights=bw))
 
-    # with MPI, the ranks of a node share the full maps (read-only)
+    # with full_maps "node", the ranks of a node share the full maps (read-only)
     hit_map = gls._freeze(gls._healpix(gls.full(gls.hits)[None], nside, 0, masked=False))[0]
     full = gls._healpix(m, nside, hp.UNSEEN)
     _subpixel_result(full, npol, params.subpixel_order, nside, nthreads, gls._writer)

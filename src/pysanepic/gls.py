@@ -1263,13 +1263,15 @@ class GLS:
         fastest), "node" (one copy shared by the ranks of a node, in MPI-3
         shared memory, see node.py and _NodeSum: the ranks add P^T in rounds
         over slabs of pixels, synchronized by the node; the full maps handed
-        out by solve, full and binned are shared too, read-only when the
-        node has several ranks), or "auto" (default): "node" if the full
-        maps of the ranks of some node would take more than 10% of its
-        memory (at setup, ~8 nobs (ncov + ncomp (ncomp + 1) / 2) bytes per
-        rank: 5 GB at nside 2048 with I/Q/U), else "rank". The choice and
-        its reason are in `full_maps_info`. Without MPI, or with one rank
-        per node, "rank".
+        out by solve, full and binned are shared too, and read-only), or
+        "auto" (default): "node" if the full maps of the ranks of some node
+        would take more than 10% of its memory (at setup, ~8 nobs (ncov +
+        ncomp (ncomp + 1) / 2) bytes per rank: 5 GB at nside 2048 with
+        I/Q/U; where the node memory is unknown, more than 1 GB per rank),
+        else "rank". The choice and its
+        reason are in `full_maps_info`. Without MPI, or with one rank per
+        node, "rank". With MPI the map read by P is shared by the ranks of
+        a node in every mode.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -2044,8 +2046,8 @@ class GLS:
     def full(self, x):
         """Gather a per-pixel array of this rank, (k, nloc) or (nloc,), into the
         full (k, nobs) or (nobs,) array on every rank. Collective with MPI. With
-        several ranks on a node, a read-only array shared by the ranks of the
-        node (one copy per node)."""
+        full_maps "node", a read-only array shared by the ranks of the node
+        (one copy per node)."""
         x = np.asarray(x)
         if self._node_maps:
             one = x.ndim == 1
