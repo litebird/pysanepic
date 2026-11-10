@@ -457,22 +457,17 @@ def _slab_order(ip, nobs, nslab):
     pixels p with p nslab // nobs = s, i.e. [ceil(s nobs / nslab), ceil((s + 1)
     nobs / nslab)); then the flagged samples (p >= nobs). Returns (order,
     starts): the samples of slab s are order[starts[s]:starts[s + 1]], in time
-    order; the samples with p < 0 are left out. order is int32 (int64 for
-    chunks of 2^31 samples or more): GLS keeps it per chunk, as it depends only
-    on the pointing. A counting sort in parallel: each thread counts the slabs
-    of a block of consecutive samples, then writes them after those of the
-    previous blocks, so the order stays the time order."""
+    order; the samples with p < 0 are left out. A counting sort in parallel
+    (it runs before every P^T of a chunk with a map per node): each thread
+    counts the slabs of a block of consecutive samples, then writes them
+    after those of the previous blocks, so the order stays the time order."""
     nb = max(1, min(numba.get_num_threads(), ip.size // 65536))  # blocks of samples, one per thread
-    pos, starts = _slab_counts(ip, nobs, nslab, nb)
-    order = np.empty(starts[-1], np.int32 if ip.size < 2**31 else np.int64)
-    _slab_fill(ip, nobs, nslab, pos, order)
-    return order, starts
+    return _slab_order_blocks(ip, nobs, nslab, nb)
 
 
 @numba.njit(parallel=True, cache=True)
-def _slab_counts(ip, nobs, nslab, nb):
-    """_slab_order with nb blocks of samples: where block b writes its first
-    sample of slab s (pos[b, s]), and the starts of the slabs."""
+def _slab_order_blocks(ip, nobs, nslab, nb):
+    """_slab_order with nb blocks of samples."""
     ns = ip.size
     counts = np.zeros((nb, nslab + 1), np.int64)
     for b in numba.prange(nb):
@@ -481,20 +476,14 @@ def _slab_counts(ip, nobs, nslab, nb):
             if p >= 0:
                 counts[b, nslab if p >= nobs else np.int64(p) * nslab // nobs] += 1
     starts = np.zeros(nslab + 2, np.int64)
-    pos = np.empty((nb, nslab + 1), np.int64)
+    pos = np.empty((nb, nslab + 1), np.int64)  # where block b writes its first sample of slab s
     for s in range(nslab + 1):
         n = starts[s]
         for b in range(nb):
             pos[b, s] = n
             n += counts[b, s]
         starts[s + 1] = n
-    return pos, starts
-
-
-@numba.njit(parallel=True, cache=True)
-def _slab_fill(ip, nobs, nslab, pos, order):
-    """The samples of each block of _slab_counts into order."""
-    ns, nb = ip.size, pos.shape[0]
+    order = np.empty(starts[-1], np.int64)
     for b in numba.prange(nb):
         mine = pos[b].copy()
         for i in range(b * ns // nb, (b + 1) * ns // nb):
@@ -503,6 +492,7 @@ def _slab_fill(ip, nobs, nslab, pos, order):
                 s = nslab if p >= nobs else np.int64(p) * nslab // nobs
                 order[mine[s]] = i
                 mine[s] += 1
+    return order, starts
 
 
 @numba.njit(parallel=True, cache=True)
@@ -1162,12 +1152,13 @@ class _NodeSum:
                 self.node.barrier()
         self.done += 1
 
-    def backproject(self, items, orders, locbuf):
-        """P^T t of a group of chunks, items (ip, t, c2, s2, pol, gx, gy, grad)
-        with their slab orders (see GLS._slab_order), in one set of rounds (one
-        barrier per round for the whole group: the ranks wait for each other
-        once per group, not once per chunk); their flagged samples into locbuf
-        (of this rank)."""
+    def backproject(self, items, locbuf):
+        """P^T t of a group of chunks, items (ip, t, c2, s2, pol, gx, gy, grad),
+        in one set of rounds (one barrier per round for the whole group: the
+        ranks wait for each other once per group, not once per chunk); their
+        flagged samples into locbuf (of this rank)."""
+        with self.gls._tm.phase("of which slab order"):
+            orders = [_slab_order(it[0], self.gls.nobs, self.n) for it in items]
 
         def fn(s, first):
             for (ip, t, c2, s2, pol, gx, gy, grad), (order, starts) in zip(items, orders):
@@ -1179,9 +1170,9 @@ class _NodeSum:
 
         self.add(fn)
 
-    def coverage(self, ip, c2, s2, pol, gx, gy, grad, scale, slab_order):
-        """The coverage of a chunk (see _coverage), with its slab order."""
-        order, starts = slab_order
+    def coverage(self, ip, c2, s2, pol, gx, gy, grad, scale):
+        """The coverage of a chunk (see _coverage)."""
+        order, starts = _slab_order(ip, self.gls.nobs, self.n)
         self.add(lambda s, first: _coverage_sel(ip, c2, s2, pol, gx, gy, grad, order[starts[s] : starts[s + 1]],
                                                 self.edges[s], self.map, scale))
 
@@ -1551,7 +1542,6 @@ class GLS:
         self._layout = None if comm is None else self._node.layout(bounds)
         # several ranks on a node: their sums over pixels in one map per node (full_maps)
         self._node_maps, self.full_maps_info = self._choose_full_maps(full_maps)  # the same on every rank
-        self._slab_orders = [None] * len(self.ip)  # per chunk, see _slab_order
         self.lo, self.hi = int(bounds[rank]), int(bounds[rank + 1])
         self.nloc = self.hi - self.lo
         self._nsky = self.ncomp * self.nloc
@@ -1990,17 +1980,8 @@ class GLS:
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
                 _, c2, s2 = self._pol_arrays(k)
-                acc.coverage(ip, c2, s2, self.pol, *self._grad_arrays(k), 1.0 if scale is None else float(scale[k]),
-                             self._slab_order(k))
+                acc.coverage(ip, c2, s2, self.pol, *self._grad_arrays(k), 1.0 if scale is None else float(scale[k]))
         return acc.local(by_column=True)
-
-    def _slab_order(self, k):
-        """_slab_order of chunk k for the _NodeSum rounds, computed once: it
-        depends only on the pointing (int32, 4 bytes per sample of this rank)."""
-        if self._slab_orders[k] is None:
-            with self._tm.phase("of which slab order"):
-                self._slab_orders[k] = _slab_order(self.ip[k], self.nobs, self._node.node.size)
-        return self._slab_orders[k]
 
     def _pt(self, acc, k, t, c2, s2, pol, locbuf):
         """acc += P^T t for chunk k, its flagged samples into locbuf; acc a full
@@ -2011,8 +1992,7 @@ class GLS:
         """_pt of the chunks items (k, t, c2, s2, pol); with a _NodeSum, in one
         set of rounds."""
         if isinstance(acc, _NodeSum):
-            acc.backproject([(self.ip[k], t, c2, s2, pol, *self._grad_arrays(k)) for k, t, c2, s2, pol in items],
-                            [self._slab_order(k) for k, *_ in items], locbuf)
+            acc.backproject([(self.ip[k], t, c2, s2, pol, *self._grad_arrays(k)) for k, t, c2, s2, pol in items], locbuf)
         else:
             for k, t, c2, s2, pol in items:
                 _backproject(self.ip[k], t, c2, s2, pol, *self._grad_arrays(k), self._edges, acc, locbuf)
