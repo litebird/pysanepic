@@ -846,10 +846,10 @@ class CalibrationParameters:
         GLSParameters.tol, norm(r)^2 / norm(b)^2): None (default):
         GLSParameters.tol throughout; a number: that one; "adaptive":
         max(GLSParameters.tol, tol_factor * dg^2) with dg the largest
-        correction max |dg| of the previous iteration (1e-6 in the first),
+        correction ``max |dg|`` of the previous iteration (1e-6 in the first),
         tighter as the gains converge. Their maps and corrections only feed
         the next iteration, so a looser tolerance (e.g. 1e-6 for 1e-10)
-        saves PCG iterations. It is used until an iteration has max |dg| <
+        saves PCG iterations. It is used until an iteration has ``max |dg|`` <
         gain_tol, and never in the last of the n_iter: the iterations go on
         with GLSParameters.tol and stop (gain_tol) only on one of those,
         since a loose solve resolves dg only down to its tolerance
