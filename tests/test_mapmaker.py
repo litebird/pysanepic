@@ -1795,7 +1795,7 @@ def test_full_maps_choice():
 
     g.comm = Comm()
     for ranks in (48, 1):
-        g._node = types.SimpleNamespace(node=types.SimpleNamespace(size=ranks))
+        g._node = types.SimpleNamespace(comm=types.SimpleNamespace(size=ranks))
         assert g._choose_full_maps("rank") == (False, "rank (rank)" if ranks > 1 else "rank (rank, one rank per node)")
         node, info = g._choose_full_maps("node")
         assert node == (ranks > 1) and info.startswith("node" if ranks > 1 else "rank"), info
