@@ -80,6 +80,40 @@ released, without allocating another full coverage array. At high nside
 this reduces coverage parallelism to limit memory. Different worker counts
 can change the grouping of floating-point sums.
 
+### Full maps per process or per node
+
+The full maps of the products above (the map read by $P$, the sum of $P^T$,
+at setup the coverage and the preconditioner blocks) and the output maps are
+one copy per process with `full_maps="rank"` (the default). With
+`full_maps="node"` the processes of a node share one copy, in MPI-3 shared
+memory, and add $P^T$ in rounds over slabs of pixels, waiting for each other
+at each round. The map read by $P$ is shared per node in both modes.
+
+Which one to use depends on how many processes run on a node more than on
+nside. On one G100 node at nside 2048 with I/Q/U (random pixels over the
+whole sky, 48 × 4 × 2^20 samples in all, 10 PCG iterations, job 23433568,
+`tools/cluster/benchmark_full_maps.slurm`):
+
+| processes × threads | `full_maps` | s per iteration | node memory in the PCG |
+|---|---|---|---|
+| 48 × 1 | `"rank"` | 7.4–8.1 | 158 GB |
+| 48 × 1 | `"node"` | 4.8–4.9 | 44 GB |
+| 8 × 6 | `"rank"` | 3.3 | 39 GB |
+| 8 × 6 | `"node"` | 4.9 | 30 GB |
+
+- With many single-threaded processes per node, `"node"` is faster and uses
+  a quarter of the memory: with `"rank"` the sum of 48 copies of 1.2 GB
+  (the reduce-scatter) dominates the time.
+- With fewer processes and threads, `"rank"` is faster and needs little
+  more memory. The rounds of `"node"` cost ~50% here (and ~25% at nside 512
+  with 8 × 6 in a 1-year e2e run, where it saves no memory: the TOD
+  dominate).
+
+So prefer a few processes per node with threads and `full_maps="rank"`;
+use `"node"` when many single-threaded processes per node are imposed (e.g.
+one per core by the calling code) and the copies of the full maps would not
+fit, ~5 GB per process at nside 2048 with I/Q/U.
+
 ## Sampling alm models
 
 A sky model or sky templates given as alm are interpolated at the pointing
