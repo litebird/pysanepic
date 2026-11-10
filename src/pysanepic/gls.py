@@ -16,6 +16,7 @@ chunk when it is used.
 
 import heapq
 import os
+import time
 import types
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,8 @@ from contextlib import contextmanager
 import ducc0
 import numba
 import numpy as np
+
+from .node import node_of
 
 
 def resolve_nthreads(nthreads=None):
@@ -402,7 +405,9 @@ def _backproject(ip, t, c2, s2, pol, gx, gy, grad, edges, buf, locbuf):
     [edges[th], edges[th + 1]): it reads all the pixel indices of the chunk but
     adds only the samples of its pixels, so the threads share one map without
     races and without private copies. Flagged samples (labels p >= nobs) go to
-    locbuf[p - nobs], written by thread 0."""
+    locbuf[p - nobs], written by thread 0. The body is written out (also in
+    _backproject_sel): a per-sample helper inlined by numba made the serial
+    copy (_backproject_1, the P^T of the chunk workers) 5x slower."""
     nobs = buf.shape[0]
     g = 3 if pol else 1
     for th in numba.prange(edges.size - 1):
@@ -425,6 +430,77 @@ def _backproject(ip, t, c2, s2, pol, gx, gy, grad, edges, buf, locbuf):
                         buf[p, g + 2] += t[i] * (x * x - _Q2)
                         buf[p, g + 3] += t[i] * x * y
                         buf[p, g + 4] += t[i] * (y * y - _Q2)
+
+
+@numba.njit(parallel=True, cache=True)
+def _backproject_sel(ip, t, c2, s2, pol, gx, gy, grad, idx, edges, buf, locbuf):
+    """_backproject on the samples idx only (see _slab_order); flagged samples
+    go to locbuf only if it is not empty."""
+    nobs = buf.shape[0]
+    g = 3 if pol else 1
+    for th in numba.prange(edges.size - 1):
+        lo, hi = edges[th], edges[th + 1]
+        for i in idx:
+            p = ip[i]
+            if p >= nobs:
+                if th == 0 and locbuf.size:
+                    locbuf[p - nobs] += t[i]
+            elif lo <= p < hi:
+                buf[p, 0] += t[i]
+                if pol:
+                    buf[p, 1] += t[i] * c2[i]
+                    buf[p, 2] += t[i] * s2[i]
+                if grad:
+                    x, y = gx[i], gy[i]
+                    buf[p, g] += t[i] * x
+                    buf[p, g + 1] += t[i] * y
+                    if grad > 1:
+                        buf[p, g + 2] += t[i] * (x * x - _Q2)
+                        buf[p, g + 3] += t[i] * x * y
+                        buf[p, g + 4] += t[i] * (y * y - _Q2)
+
+
+def _slab_order(ip, nobs, nslab):
+    """The samples of a chunk grouped by slab of pixels: slab s holds the
+    pixels p with p nslab // nobs = s, i.e. [ceil(s nobs / nslab), ceil((s + 1)
+    nobs / nslab)); then the flagged samples (p >= nobs). Returns (order,
+    starts): the samples of slab s are order[starts[s]:starts[s + 1]], in time
+    order; the samples with p < 0 are left out. A counting sort in parallel
+    (it runs before every P^T of a chunk with a map per node): each thread
+    counts the slabs of a block of consecutive samples, then writes them
+    after those of the previous blocks, so the order stays the time order."""
+    nb = max(1, min(numba.get_num_threads(), ip.size // 65536))  # blocks of samples, one per thread
+    return _slab_order_blocks(ip, nobs, nslab, nb)
+
+
+@numba.njit(parallel=True, cache=True)
+def _slab_order_blocks(ip, nobs, nslab, nb):
+    """_slab_order with nb blocks of samples."""
+    ns = ip.size
+    counts = np.zeros((nb, nslab + 1), np.int64)
+    for b in numba.prange(nb):
+        for i in range(b * ns // nb, (b + 1) * ns // nb):
+            p = ip[i]
+            if p >= 0:
+                counts[b, nslab if p >= nobs else np.int64(p) * nslab // nobs] += 1
+    starts = np.zeros(nslab + 2, np.int64)
+    pos = np.empty((nb, nslab + 1), np.int64)  # where block b writes its first sample of slab s
+    for s in range(nslab + 1):
+        n = starts[s]
+        for b in range(nb):
+            pos[b, s] = n
+            n += counts[b, s]
+        starts[s + 1] = n
+    order = np.empty(starts[-1], np.int64)
+    for b in numba.prange(nb):
+        mine = pos[b].copy()
+        for i in range(b * ns // nb, (b + 1) * ns // nb):
+            p = ip[i]
+            if p >= 0:
+                s = nslab if p >= nobs else np.int64(p) * nslab // nobs
+                order[mine[s]] = i
+                mine[s] += 1
+    return order, starts
 
 
 @numba.njit(parallel=True, cache=True)
@@ -610,6 +686,7 @@ _project_1, _add_template_1, _add_scaled_1, _add_columns_1, _cos_sin_1, _backpro
 # ponytail: fixed budget for the private P^T maps of the chunk workers (nside 512
 # x 48 workers: 3.6 GB); above it, P^T by pixel ranges; make it a parameter if needed
 _PRIVATE_MAPS_BYTES = 4e9
+_ROUND_BYTES = 2**29  # a map per node, one thread: the chunks of a set of rounds of P^T (see GLS._round_groups)
 
 # Coverage accumulators are larger than I/Q/U maps (7 float64 columns).
 # Keep at least one, even when a single full-sky accumulator exceeds the budget.
@@ -697,7 +774,9 @@ def _coverage(ip, c2, s2, pol, gx, gy, grad, out, scale=1.0):
     weights (see _weights): with pol only, c2, s2, c2^2, c2 s2, s2^2 (the
     angle-coverage matrix), each sample counted `scale` times (the weight of
     the chunk in a weighted binned map). Serial: the chunks are summed in
-    parallel into private arrays (GLS._chunk_coverage)."""
+    parallel into private arrays (GLS._chunk_coverage). The body is written
+    out (also in _coverage_sel): a per-sample helper inlined by numba made
+    it 1.7x slower."""
     w = np.empty(8)
     for i in range(ip.size):
         p = ip[i]
@@ -714,22 +793,162 @@ def _coverage(ip, c2, s2, pol, gx, gy, grad, out, scale=1.0):
                 col += 1
 
 
-@numba.njit(cache=True)
+@numba.njit(parallel=True, cache=True)
+def _coverage_sel(ip, c2, s2, pol, gx, gy, grad, idx, edges, out, scale):
+    """_coverage of the samples idx (see _slab_order), thread th on the pixels
+    [edges[th], edges[th + 1])."""
+    for th in numba.prange(edges.size - 1):
+        lo, hi = edges[th], edges[th + 1]
+        w = np.empty(8)
+        for i in idx:
+            p = ip[i]
+            if lo <= p < hi:
+                out[p, 0] += scale
+                n = _weights(i, c2, s2, pol, gx, gy, grad, w)
+                if pol and w[1] * w[1] + w[2] * w[2] > 0.25:
+                    out[p, 1] += scale
+                col = 2
+                for a in range(n):
+                    for b in range(max(a, 1), n):
+                        out[p, col] += scale * w[a] * w[b]
+                        col += 1
+
+
 def _pixel_order(ip, npix):
     """Indices of the samples sorted by pixel, in time order within each pixel:
-    a stable counting sort, O(ns + npix). Negative labels go in a last bucket."""
-    start = np.zeros(npix + 2, np.int64)
-    for i in range(ip.size):
-        p = ip[i] if ip[i] >= 0 else npix
-        start[p + 1] += 1
-    for p in range(npix + 1):
-        start[p + 1] += start[p]
-    order = np.empty(ip.size, np.int64)
-    for i in range(ip.size):
-        p = ip[i] if ip[i] >= 0 else npix
-        order[start[p]] = i
-        start[p] += 1
+    a stable counting sort, O(ns + npix), in parallel (see
+    _pixel_order_blocks). Negative labels go in a last bucket."""
+    nb = max(1, min(numba.get_num_threads(), ip.size // 65536))
+    return _pixel_order_blocks(ip, npix, nb)
+
+
+@numba.njit(parallel=True, cache=True)
+def _pixel_order_blocks(ip, npix, nb):
+    """_pixel_order with nb threads, in two stable passes: the samples by
+    range of labels (nb ranges; each thread counts, then writes, a block of
+    consecutive samples, as _slab_order), then each range by label (one
+    thread per range, with the counts of its labels only: O(npix) memory in
+    all, as serial)."""
+    ns, nl = ip.size, npix + 1  # labels 0 ... npix (npix: the negative ones)
+    counts = np.zeros((nb, nb), np.int64)  # block, range
+    for b in numba.prange(nb):
+        for i in range(b * ns // nb, (b + 1) * ns // nb):
+            q = ip[i] if ip[i] >= 0 else npix
+            counts[b, np.int64(q) * nb // nl] += 1
+    rstart = np.zeros(nb + 1, np.int64)
+    pos = np.empty((nb, nb), np.int64)
+    for r in range(nb):
+        n = rstart[r]
+        for b in range(nb):
+            pos[b, r] = n
+            n += counts[b, r]
+        rstart[r + 1] = n
+    tmp = np.empty(ns, np.int64)
+    for b in numba.prange(nb):
+        mine = pos[b].copy()
+        for i in range(b * ns // nb, (b + 1) * ns // nb):
+            q = ip[i] if ip[i] >= 0 else npix
+            r = np.int64(q) * nb // nl
+            tmp[mine[r]] = i
+            mine[r] += 1
+    order = np.empty(ns, np.int64)
+    for r in numba.prange(nb):
+        lo, hi = (r * nl + nb - 1) // nb, ((r + 1) * nl + nb - 1) // nb  # the labels of range r
+        start = np.zeros(hi - lo + 1, np.int64)
+        for a in range(rstart[r], rstart[r + 1]):
+            i = tmp[a]
+            q = ip[i] if ip[i] >= 0 else npix
+            start[q - lo + 1] += 1
+        start[0] = rstart[r]
+        for j in range(hi - lo):
+            start[j + 1] += start[j]
+        for a in range(rstart[r], rstart[r + 1]):
+            i = tmp[a]
+            q = ip[i] if ip[i] >= 0 else npix
+            order[start[q - lo]] = i
+            start[q - lo] += 1
     return order
+
+
+@numba.njit(parallel=True, cache=True)
+def _sym_rcond(M, out):
+    """out[i] = 1 / cond(M[i]) in the 2-norm (min |eigenvalue| / max, 0 if
+    M[i] = 0) of the small symmetric matrices M (n, k, k), as
+    np.linalg.cond for symmetric matrices, in parallel: cyclic Jacobi
+    rotations (accurate to the rounding of the largest eigenvalue)."""
+    k = M.shape[1]
+    for i in numba.prange(M.shape[0]):
+        A = M[i].copy()
+        for _ in range(100):
+            off = 0.0
+            for p in range(k):
+                for q in range(p + 1, k):
+                    off += A[p, q] * A[p, q]
+            scale = 0.0
+            for p in range(k):
+                scale += A[p, p] * A[p, p]
+            if off <= 1e-34 * scale or off == 0.0:
+                break
+            for p in range(k):
+                for q in range(p + 1, k):
+                    if A[p, q] == 0.0:
+                        continue
+                    theta = (A[q, q] - A[p, p]) / (2.0 * A[p, q])
+                    t = (1.0 if theta >= 0 else -1.0) / (abs(theta) + np.sqrt(theta * theta + 1.0))
+                    c = 1.0 / np.sqrt(t * t + 1.0)
+                    sn = t * c
+                    for r in range(k):  # A <- J^T A J
+                        arp, arq = A[r, p], A[r, q]
+                        A[r, p], A[r, q] = c * arp - sn * arq, sn * arp + c * arq
+                    for r in range(k):
+                        apr, aqr = A[p, r], A[q, r]
+                        A[p, r], A[q, r] = c * apr - sn * aqr, sn * apr + c * aqr
+        lmin, lmax = np.inf, 0.0
+        for p in range(k):
+            a = abs(A[p, p])
+            lmin, lmax = min(lmin, a), max(lmax, a)
+        out[i] = lmin / lmax if lmax > 0 else 0.0
+
+
+@numba.njit(parallel=True, cache=True)
+def _det_inv(M, det, inv):
+    """det[i] and inv[i] (det 0 and inv 0 where singular) of the small
+    matrices M (n, k, k), as np.linalg.det and np.linalg.inv, in parallel:
+    Gauss-Jordan elimination with partial pivoting."""
+    k = M.shape[1]
+    for i in numba.prange(M.shape[0]):
+        A = M[i].copy()
+        B = np.eye(k)
+        d = 1.0
+        for j in range(k):
+            piv = j
+            for r in range(j + 1, k):
+                if abs(A[r, j]) > abs(A[piv, j]):
+                    piv = r
+            if A[piv, j] == 0.0:
+                d = 0.0
+                break
+            if piv != j:
+                d = -d
+                for c in range(k):
+                    A[j, c], A[piv, c] = A[piv, c], A[j, c]
+                    B[j, c], B[piv, c] = B[piv, c], B[j, c]
+            a = A[j, j]
+            d *= a
+            for c in range(k):
+                A[j, c] /= a
+                B[j, c] /= a
+            for r in range(k):
+                if r != j and A[r, j] != 0.0:
+                    f = A[r, j]
+                    for c in range(k):
+                        A[r, c] -= f * A[j, c]
+                        B[r, c] -= f * B[j, c]
+        det[i] = d
+        if d == 0.0:
+            inv[i] = 0.0
+        else:
+            inv[i] = B
 
 
 def _symmetric(tri, n):
@@ -741,7 +960,6 @@ def _symmetric(tri, n):
     return M
 
 
-@numba.njit(parallel=True, cache=True)
 def _block_circulant(ip, c, c2, s2, pol, gx, gy, grad, out, nlabels, locout):
     """Exact per-pixel blocks of P^T C P, C circulant per chunk.
 
@@ -758,84 +976,241 @@ def _block_circulant(ip, c, c2, s2, pol, gx, gy, grad, out, nlabels, locout):
     all the unknowns of the rank (`nlabels`; 200 million in a year of data
     with a Galactic mask).
     """
+    for k in range(ip.shape[0]):
+        _block_add(*_block_sort(ip[k], out.shape[0], nlabels), c[k], c2[k], s2[k], pol, gx[k], gy[k], grad, out, locout,
+                   0, out.shape[0], True)
+
+
+def _block_sort(ip, nobs, nlabels):
+    """The samples of a chunk sorted by label for _block_add: (order, sorted
+    labels, bounds of the runs of equal labels, shift of the unknowns)."""
+    nb = max(1, min(numba.get_num_threads(), ip.size // 65536))
+    return _block_sort_blocks(ip, nobs, nlabels, nb)
+
+
+@numba.njit(parallel=True, cache=True)
+def _block_sort_blocks(ip, nobs, nlabels, nb):
+    """_block_sort with nb threads."""
+    ns = ip.size
+    los, his = np.full(nb, nlabels, np.int64), np.full(nb, nobs - 1, np.int64)
+    for b in numba.prange(nb):  # labels of the unknowns of this chunk: [lo, hi]
+        for i in range(b * ns // nb, (b + 1) * ns // nb):
+            if ip[i] >= nobs:
+                los[b] = min(los[b], ip[i])
+                his[b] = max(his[b], ip[i])
+    lo, hi = los.min(), his.max()
+    off = lo - nobs if hi >= nobs else 0  # unknown j of the chunk is sorted as nobs + j - lo
+    lab = np.empty(ns, np.int64)
+    for i in numba.prange(ns):
+        lab[i] = ip[i] - off if ip[i] >= nobs else ip[i]
+    order = _pixel_order_blocks(lab, hi - off + 1 if hi >= nobs else nobs, nb)
+    sorted_ip = np.empty(ns, np.int64)
+    for i in numba.prange(ns):
+        sorted_ip[i] = lab[order[i]]
+    starts = np.flatnonzero(np.diff(sorted_ip)) + 1
+    bounds = np.empty(starts.size + 2, np.int64)
+    bounds[0] = 0
+    bounds[1:-1] = starts
+    bounds[-1] = ns
+    return order, sorted_ip, bounds, off
+
+
+@numba.njit(parallel=True, cache=True)
+def _block_add(order, sorted_ip, bounds, off, c, c2, s2, pol, gx, gy, grad, out, locout, plo, phi, local_too):
+    """The blocks of one chunk (sorted by _block_sort; c, c2, s2, gx, gy of the
+    chunk) for the pixels [plo, phi) only, and for its unknowns if
+    `local_too` (see _block_circulant)."""
     # ponytail: O(hits^2) per pixel per chunk; switch to a lag cutoff or the
     # SANEPIC N_[0] shortcut if deep pixels with long chunks become a bottleneck
-    nchunk, ns = ip.shape
-    nc = c.shape[1]  # FFT length >= ns: c is the first row of an nc x nc circulant
+    nc = c.size  # FFT length >= ns: c is the first row of an nc x nc circulant
     nobs = out.shape[0]
-    for k in range(nchunk):
-        lo, hi = nlabels, nobs - 1  # labels of the unknowns of this chunk: [lo, hi]
-        for i in range(ns):
-            if ip[k, i] >= nobs:
-                lo = min(lo, ip[k, i])
-                hi = max(hi, ip[k, i])
-        off = lo - nobs if hi >= nobs else 0  # unknown j of the chunk is sorted as nobs + j - lo
-        lab = np.empty(ns, np.int64)
-        for i in range(ns):
-            lab[i] = ip[k, i] - off if ip[k, i] >= nobs else ip[k, i]
-        order = _pixel_order(lab, hi - off + 1 if hi >= nobs else nobs)
-        sorted_ip = lab[order]
-        starts = np.flatnonzero(np.diff(sorted_ip)) + 1
-        bounds = np.empty(starts.size + 2, np.int64)
-        bounds[0] = 0
-        bounds[1:-1] = starts
-        bounds[-1] = ns
-        for r in numba.prange(bounds.size - 1):
-            start, stop = bounds[r], bounds[r + 1]
-            p = sorted_ip[start]
-            if p < 0:  # excluded samples have neither map nor local parameters
-                continue
-            n = stop - start
-            local = p >= nobs  # an unknown of flagged samples: no Q/U
-            # Contiguous run of samples with no polarization nor offsets (e.g. the
-            # padding of a chunk): sum over lags in O(n) instead of O(n^2); II
-            # only (with grad = 2 the quadratic weights are -1/12 there, but such
-            # pixels have no gradient, hence no Hessian: their blocks are unused)
-            unpol = True
-            if (pol or grad) and not local:
-                for a in range(start, stop):
-                    t = order[a]
-                    if (pol and (c2[k, t] != 0.0 or s2[k, t] != 0.0)) or (grad and (gx[k, t] != 0.0 or gy[k, t] != 0.0)):
-                        unpol = False
-                        break
-            if unpol and order[stop - 1] - order[start] == n - 1:
-                acc = 0.0
-                for lag in range(-(n - 1), n):
-                    acc += (n - abs(lag)) * c[k, lag % nc]
-                if local:
-                    locout[p - nobs + off] += acc
-                else:
-                    out[p, 0] += acc
-                continue
+    for r in numba.prange(bounds.size - 1):
+        start, stop = bounds[r], bounds[r + 1]
+        p = sorted_ip[start]
+        if p < 0:  # excluded samples have neither map nor local parameters
+            continue
+        local = p >= nobs  # an unknown of flagged samples: no Q/U
+        if (local and not local_too) or (not local and (p < plo or p >= phi)):
+            continue
+        n = stop - start
+        # Contiguous run of samples with no polarization nor offsets (e.g. the
+        # padding of a chunk): sum over lags in O(n) instead of O(n^2); II
+        # only (with grad = 2 the quadratic weights are -1/12 there, but such
+        # pixels have no gradient, hence no Hessian: their blocks are unused)
+        unpol = True
+        if (pol or grad) and not local:
+            for a in range(start, stop):
+                t = order[a]
+                if (pol and (c2[t] != 0.0 or s2[t] != 0.0)) or (grad and (gx[t] != 0.0 or gy[t] != 0.0)):
+                    unpol = False
+                    break
+        if unpol and order[stop - 1] - order[start] == n - 1:
+            acc = 0.0
+            for lag in range(-(n - 1), n):
+                acc += (n - abs(lag)) * c[lag % nc]
             if local:
-                acc = 0.0
-                for a in range(start, stop):
-                    for b in range(start, stop):
-                        acc += c[k, (order[a] - order[b]) % nc]
                 locout[p - nobs + off] += acc
-                continue
-            # B_jl = sum_a w_j(a) S_l(a), S_l(a) = sum_b c[a - b] w_l(b):
-            # O(hits^2 ncomp) instead of O(hits^2 ncomp^2)
-            W = np.empty((n, 8))
-            nw = 1
-            for a in range(n):
-                nw = _weights(order[start + a], c2[k], s2[k], pol, gx[k], gy[k], grad, W[a])
-            S = np.empty(8)
-            blk = np.zeros(out.shape[1])
-            for a in range(n):
-                ta = order[start + a]
-                S[:] = 0.0
-                for b in range(n):
-                    cab = c[k, (ta - order[start + b]) % nc]
-                    for l in range(nw):
-                        S[l] += cab * W[b, l]
-                col = 0
-                for j in range(nw):
-                    for l in range(j, nw):
-                        blk[col] += W[a, j] * S[l]
-                        col += 1
-            for col in range(blk.size):
-                out[p, col] += blk[col]
+            else:
+                out[p, 0] += acc
+            continue
+        if local:
+            acc = 0.0
+            for a in range(start, stop):
+                for b in range(start, stop):
+                    acc += c[(order[a] - order[b]) % nc]
+            locout[p - nobs + off] += acc
+            continue
+        # B_jl = sum_a w_j(a) S_l(a), S_l(a) = sum_b c[a - b] w_l(b):
+        # O(hits^2 ncomp) instead of O(hits^2 ncomp^2)
+        W = np.empty((n, 8))
+        nw = 1
+        for a in range(n):
+            nw = _weights(order[start + a], c2, s2, pol, gx, gy, grad, W[a])
+        S = np.empty(8)
+        blk = np.zeros(out.shape[1])
+        for a in range(n):
+            ta = order[start + a]
+            S[:] = 0.0
+            for b in range(n):
+                cab = c[(ta - order[start + b]) % nc]
+                for l in range(nw):
+                    S[l] += cab * W[b, l]
+            col = 0
+            for j in range(nw):
+                for l in range(j, nw):
+                    blk[col] += W[a, j] * S[l]
+                    col += 1
+        for col in range(blk.size):
+            out[p, col] += blk[col]
+
+
+class _Timings(dict):
+    """Seconds of the phases of a step, by name (of this rank, waits at the
+    collectives included), for verbose logs: `mark(name)` adds the time
+    since the previous mark, `phase(name)` the time of a block (also inside
+    marked ones: names "of which ..." are parts of others)."""
+
+    def __init__(self):
+        super().__init__()
+        self._last = time.perf_counter()
+
+    def mark(self, name):
+        t = time.perf_counter()
+        self[name] = self.get(name, 0.0) + t - self._last
+        self._last = t
+
+    @contextmanager
+    def phase(self, name):
+        t = time.perf_counter()
+        try:
+            yield
+        finally:
+            self[name] = self.get(name, 0.0) + time.perf_counter() - t
+
+    def __str__(self):
+        return ", ".join(f"{k} {v:.1f} s" for k, v in self.items())
+
+
+def _timing_table(steps):
+    """The lines of a verbose table of timings: steps [(name, seconds,
+    _Timings or None)], each step then its phases indented, and last the
+    parts "of which ..." (inside one or more of those phases), seconds
+    aligned."""
+    rows = []
+    for name, seconds, phases in steps:
+        rows.append((1, name, seconds))
+        items = list((phases or {}).items())
+        rows += [(2, k, v) for k, v in items if "of which" not in k] + [(2, k, v) for k, v in items if "of which" in k]
+    width = max(2 * level + len(name) for level, name, _ in rows)
+    return [f"{'  ' * level}{name:<{width - 2 * level}} {seconds:8.1f} s" for level, name, seconds in rows]
+
+
+class _NodeSum:
+    """Sums over the ranks of per-pixel contributions of their chunks (P^T, the
+    coverage, the blocks of the preconditioner) in one full map per node,
+    shared by its n ranks (see node.py), instead of one per rank.
+
+    The ranks add each chunk in n rounds: in round t, rank r adds the samples
+    of the chunk in the slab (r + t) mod n of the pixels, so two ranks never
+    write the same pixels at the same time (the threads of a rank split the
+    slab, as in _backproject); a barrier of the node closes each round. Every
+    rank does the rounds of the rank of its node with the most chunks
+    (`nunits`, the number of chunks this rank adds), its own chunks first.
+    Then the node leaders sum the nodes and each rank takes its pixels
+    (`local`). The order of the sums is fixed: the result does not depend on
+    the timing of the ranks. Collective; the creation zeroes the map."""
+
+    def __init__(self, gls, ncols, nunits):
+        from mpi4py import MPI
+
+        node = gls._node
+        self.gls, self.node, self.n, self.r = gls, node, node.node.size, node.node.rank
+        self.rounds, self.done = node.node.allreduce(nunits, op=MPI.MAX), 0
+        nobs = gls.nobs
+        self.slabs = (np.arange(self.n + 1, dtype=np.int64) * nobs + self.n - 1) // self.n  # see _slab_order
+        node.barrier()  # nobody reads the previous sums any more
+        self.map = node.work("sum", nobs * ncols).reshape(nobs, ncols)
+        self.map[self.slabs[self.r] : self.slabs[self.r + 1]] = 0.0
+        node.barrier()
+        nt = max(1, min(gls.nthreads, numba.config.NUMBA_NUM_THREADS))
+        self.edges = [a + (b - a) * np.arange(nt + 1, dtype=np.int64) // nt for a, b in zip(self.slabs[:-1], self.slabs[1:])]
+
+    def add(self, fn):
+        """The rounds of one chunk: fn(s, first) adds its samples in slab s (and
+        its local unknowns if `first`)."""
+        tm = self.gls._tm
+        for t in range(self.n):
+            s = (self.r + t) % self.n
+            fn(s, t == 0)
+            with tm.phase("of which node rounds: barriers"):
+                self.node.barrier()
+        self.done += 1
+
+    def backproject(self, items, locbuf):
+        """P^T t of a group of chunks, items (ip, t, c2, s2, pol, gx, gy, grad),
+        in one set of rounds (one barrier per round for the whole group: the
+        ranks wait for each other once per group, not once per chunk); their
+        flagged samples into locbuf (of this rank)."""
+        with self.gls._tm.phase("of which slab order"):
+            orders = [_slab_order(it[0], self.gls.nobs, self.n) for it in items]
+
+        def fn(s, first):
+            for (ip, t, c2, s2, pol, gx, gy, grad), (order, starts) in zip(items, orders):
+                _backproject_sel(ip, t, c2, s2, pol, gx, gy, grad, order[starts[s] : starts[s + 1]], self.edges[s],
+                                 self.map, locbuf[:0])
+                if first and starts[self.n] < order.size:  # the flagged samples
+                    _backproject_sel(ip, t, c2, s2, pol, gx, gy, grad, order[starts[self.n] :], self.edges[s],
+                                     self.map, locbuf)
+
+        self.add(fn)
+
+    def coverage(self, ip, c2, s2, pol, gx, gy, grad, scale):
+        """The coverage of a chunk (see _coverage)."""
+        order, starts = _slab_order(ip, self.gls.nobs, self.n)
+        self.add(lambda s, first: _coverage_sel(ip, c2, s2, pol, gx, gy, grad, order[starts[s] : starts[s + 1]],
+                                                self.edges[s], self.map, scale))
+
+    def blocks(self, ip, c, c2, s2, pol, gx, gy, grad, nlabels, locout):
+        """The blocks of a chunk (see _block_circulant); its unknowns into locout."""
+        srt = _block_sort(ip, self.gls.nobs, nlabels)
+        self.add(lambda s, first: _block_add(*srt, c, c2, s2, pol, gx, gy, grad, self.map, locout,
+                                             self.slabs[s], self.slabs[s + 1], first))
+
+    def finish(self):
+        """The rounds of the other ranks of the node, once this rank has added
+        all its chunks: before any other collective, which would deadlock with
+        the barriers of the rounds."""
+        for _ in range((self.rounds - self.done) * self.n):
+            self.node.barrier()
+        self.done = self.rounds
+
+    def local(self, by_column=False):
+        """This rank's pixels (nloc, ncols) of the sums over all the ranks."""
+        self.finish()
+        g = self.gls
+        self.node.reduce(self.map, g._layout, by_column)
+        a = g.lo - g._layout.lo
+        return self.map[a : a + g.nloc].copy()
 
 
 class GLS:
@@ -881,7 +1256,23 @@ class GLS:
         is summed over ranks with a reduce-scatter that delivers to each rank
         its pixels, and the search direction is rebuilt on every rank for P
         with an allgather (together, the same traffic as one Allreduce). Only
-        the map used by P and the map accumulating P^T are full size.
+        the map used by P and the map accumulating P^T (and, at setup, the
+        coverage and the blocks of the preconditioner) are full size, one
+        copy per rank or per node (full_maps). The pixels are split node by
+        node and only the node leaders exchange maps between nodes.
+    full_maps : where the full maps are with MPI: "rank" (default: one copy
+        per rank, each worker thread adding P^T to a private one when they
+        fit: fastest), "node" (one copy shared by the ranks of a node, in MPI-3
+        shared memory, see node.py and _NodeSum: the ranks add P^T in rounds
+        over slabs of pixels, synchronized by the node; the full maps handed
+        out by solve, full and binned are shared too, and read-only). "node"
+        saves memory when the full maps of the ranks of a node are a large
+        part of its memory (at setup ~8 nobs (ncov + ncomp (ncomp + 1) / 2)
+        bytes per rank: 5 GB at nside 2048 with I/Q/U, e.g. 48 ranks per
+        node); with small maps it is slower and saves nothing. The choice
+        is in `full_maps_info`. Without MPI, or with one rank per node,
+        "rank". With MPI the map read by P is shared by the ranks of a node
+        in every mode.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -1026,8 +1417,13 @@ class GLS:
         counts use identity. No dense basis is stored in either case.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank"):
         self.comm = comm
+        if full_maps not in ("node", "rank"):
+            raise ValueError(f"GLS.full_maps must be 'node' or 'rank', not {full_maps!r}")
+        self.timings = tm = _Timings()  # seconds of the phases of the setup (see _Timings)
+        self.pcg_timings = _Timings()  # of the last solve
+        self._tm = tm  # where the phases go now (_NodeSum: the setup or the solve)
         if flag_method not in ("marginalize", "act", "fill"):
             raise ValueError("GLS.flag_method must be 'marginalize', 'act' or 'fill' (offsets use repeated negative pixel labels)")
         self._filled_flags = flag_method == "fill"
@@ -1148,26 +1544,38 @@ class GLS:
         if self.grad:
             self.gx, self.gy = ([np.asarray(a, dtype=angle_dtype) for a in _chunks(x)] for x in offsets)
 
-        # pixels [lo, hi) of this rank
-        size, rank = (1, 0) if comm is None else (comm.size, comm.rank)
+        # pixels [lo, hi) of this rank, node by node: the ranks of a node share
+        # the full map of P (see node.py)
+        self._node = None if comm is None else node_of(comm)
+        self._pcomm = None if comm is None else self._node.pixels
+        size, rank = (1, 0) if comm is None else (comm.size, self._pcomm.rank)
         self._nsky = 0  # set below; PCG vectors: [this rank's pixels (ncomp, nloc), flagged samples]
         if size > 1:
             _check_mpi_count(self.nobs * self._ncov)  # the largest array exchanged: the coverage
         bounds = np.arange(size + 1, dtype=np.int64) * self.nobs // size
         self._counts = np.diff(bounds)
+        self._layout = None if comm is None else self._node.layout(bounds)
+        # several ranks on a node: their sums over pixels in one map per node (full_maps)
+        self._node_maps, self.full_maps_info = self._choose_full_maps(full_maps)  # the same on every rank
         self.lo, self.hi = int(bounds[rank]), int(bounds[rank + 1])
         self.nloc = self.hi - self.lo
         self._nsky = self.ncomp * self.nloc
 
-        cov = self._chunk_coverage()
         # P^T: each thread owns a range of pixels holding ~1/nthreads of this
-        # rank's samples
+        # rank's samples (with a map per node: equal ranges of each slab, see _NodeSum)
         nt = min(self.nthreads, numba.config.NUMBA_NUM_THREADS)
-        cum = np.cumsum(cov[:, 0])
-        target = (cum[-1] if cum.size else 0.0) * np.arange(nt + 1) / nt
-        self._edges = np.searchsorted(cum, target).astype(np.int64)
-        self._edges[[0, -1]] = 0, self.nobs
-        cov = self._scatter_sum(cov, by_column=True)
+        tm.mark("layout")
+        if self._node_maps:
+            self._edges = np.arange(nt + 1, dtype=np.int64) * self.nobs // nt
+            cov = self._coverage_local()
+        else:
+            cov = self._chunk_coverage()
+            cum = np.cumsum(cov[:, 0])
+            target = (cum[-1] if cum.size else 0.0) * np.arange(nt + 1) / nt
+            self._edges = np.searchsorted(cum, target).astype(np.int64)
+            self._edges[[0, -1]] = 0, self.nobs
+            cov = self._scatter_sum(cov, by_column=True)
+        tm.mark("coverage")
         self.hits = cov[:, 0].astype(np.int64)  # this rank's pixels, like mask and precond
         self.mask = np.repeat((self.hits > 0)[None], self.ncomp, axis=0)
         if self.pol:
@@ -1184,8 +1592,10 @@ class GLS:
                 if min_hess_rcond > 0:
                     self.mask[g + 2 :] &= self._rcond(cov, [0, *range(g, g + 5)], self.mask[g + 2], scaled=True) >= min_hess_rcond
         self._cov = cov  # this rank's pixels, kept for binned
+        tm.mark("mask")
 
-        blocks = np.zeros((self.nobs, self.ncomp * (self.ncomp + 1) // 2))
+        nb = self.ncomp * (self.ncomp + 1) // 2
+        blocks = _NodeSum(self, nb, len(self.ip)) if self._node_maps else np.zeros((self.nobs, nb))
         last_w = c = None  # consecutive chunks often share their weights array
         with numba_threads(self.nthreads):
             for k, (ip, w) in enumerate(zip(self.ip, self.weights)):
@@ -1195,23 +1605,37 @@ class GLS:
                     last_w = w
                 _, c2, s2 = self._pol_arrays(k)
                 gx, gy, _ = self._grad_arrays(k)
-                _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, gx[None], gy[None], self.grad, blocks,
-                                 self.nobs + self.nflag, self._locprec)
+                if self._node_maps:
+                    blocks.blocks(ip, c, c2, s2, self.pol, gx, gy, self.grad, self.nobs + self.nflag, self._locprec)
+                else:
+                    _block_circulant(ip[None], c[None], c2[None], s2[None], self.pol, gx[None], gy[None], self.grad,
+                                     blocks, self.nobs + self.nflag, self._locprec)
                 if self._cuts[k].size:
                     _cut_diagonal(self._cuts[k], c, self._locprec, self.nthreads, w[0])
+        blocks = self._pixel_sums(blocks, by_column=True)
         self._flagprec = self._inverse(self._locprec)
         self._solved = None  # the full Q/U mask, for the templates
-        self.set_templates(templates, shared_templates, prior, shared_prior)
-        blocks = self._scatter_sum(blocks, by_column=True)
+        tm.mark("blocks")
+        self.set_templates(templates, shared_templates, prior, shared_prior)  # its phases in tm
         bad = int(np.any(blocks[self.mask[0], 0] <= 0))
         if (bad if comm is None else comm.allreduce(bad)) > 0:
             raise ValueError("Preconditioner has non-positive elements: check noise weights")
         self._set_preconditioner(blocks, preconditioner)
         self._full = self._buf = self._locbuf = None  # work maps, allocated by _apply
         self._einv = None
+        tm.mark("preconditioner")
         if coarse is not None:
             self._set_coarse(coarse, blocks[:, 0])
+            tm.mark("coarse")
         del blocks
+
+    def _choose_full_maps(self, full_maps):
+        """(maps per node, description) for GLS.full_maps (collective with MPI)."""
+        if self.comm is None:
+            return False, "rank (no MPI)"
+        several = max(self.comm.allgather(self._node.node.size)) > 1  # else nothing to share
+        node = several and full_maps == "node"
+        return node, f"{'node' if node else 'rank'} ({full_maps}{'' if several else ', one rank per node'})"
 
     def set_templates(self, templates=None, shared_templates=None, prior=None, shared_prior=None):
         """Set (or replace) `templates`, `shared_templates` and their priors
@@ -1233,7 +1657,7 @@ class GLS:
         self._shv = np.zeros(self.nshared)  # the shared amplitudes for P, set by _apply
         if self.pol and (self.namp if comm is None else comm.allreduce(self.namp)) + self.nshared:  # collective
             if self._solved is None:
-                self._solved = self.full(self.mask[1].astype(np.uint8)).astype(bool)
+                self._solved = self.full(self.mask[1].astype(np.uint8)).view(bool)
             for k, ip in enumerate(self.ip):
                 valid = (ip >= 0) & (ip < self.nobs)
                 bad = np.zeros(ip.size, bool)
@@ -1242,9 +1666,12 @@ class GLS:
                     for tmpl in (self._tmpl[k], self._shared[k]):
                         tmpl[:] = [(np.where(bad.reshape(-1, *[1] * (v.ndim - 1)), 0, v).astype(v.dtype, copy=False)
                                     if np.any(v[bad] != 0) else v, lab) for v, lab in tmpl]
+        self.timings.mark("templates: Q/U mask")
         diag = self._template_diag(self._shared, self.nshared)
+        self.timings.mark("templates: shared diagonal")
         diag = (diag if comm is None else comm.allreduce(diag)) + self._shprior[0]
         local = self._template_diag(self._tmpl, self.namp) + self._prior[0]
+        self.timings.mark("templates: local diagonal")
         self._locprec = np.concatenate([self._flagprec, self._inverse(local), self._inverse(diag)[: self._nsh_loc]])
 
     @staticmethod
@@ -1491,8 +1918,10 @@ class GLS:
             d = np.sqrt(np.einsum("nii->ni", M))
             with np.errstate(divide="ignore", invalid="ignore"):
                 M = np.nan_to_num(M / d[:, :, None] / d[:, None, :])
-        with np.errstate(divide="ignore"):
-            rcond[seen] = 1.0 / np.linalg.cond(M)
+        out = np.empty(len(M))
+        with numba_threads(self.nthreads):
+            _sym_rcond(np.ascontiguousarray(M), out)
+        rcond[seen] = out
         return rcond
 
     def _set_preconditioner(self, blocks, kind):
@@ -1511,9 +1940,11 @@ class GLS:
         M[off[:, :, None] | off[:, None, :]] = 0.0
         d = np.where(off, 1.0, np.abs(diag.T))
         M[:, np.arange(self.ncomp), np.arange(self.ncomp)] = d
-        good = self.mask[0] & (np.linalg.det(M) > 1e-12 * d.prod(axis=1))
-        self.precond = np.zeros_like(M)
-        self.precond[good] = np.linalg.inv(M[good])
+        det, inv = np.empty(len(M)), np.empty_like(M)
+        with numba_threads(self.nthreads):
+            _det_inv(M, det, inv)
+        good = self.mask[0] & (det > 1e-12 * d.prod(axis=1))
+        self.precond = np.where(good[:, None, None], inv, 0.0)
         bad = self.mask[0] & ~good
         self.precond[bad] = np.eye(self.ncomp) / d[bad][:, None, :]
         self.precond *= self.mask.T[:, :, None] & self.mask.T[:, None, :]
@@ -1532,13 +1963,66 @@ class GLS:
             return full
         out = np.empty((self.nloc, full.shape[1]), full.dtype)
         if not by_column:
-            self.comm.Reduce_scatter(np.ascontiguousarray(full), out, recvcounts=self._counts * full.shape[1])
+            self._pcomm.Reduce_scatter(np.ascontiguousarray(full), out, recvcounts=self._counts * full.shape[1])
             return out
         col = np.empty(self.nloc, full.dtype)
         for j in range(full.shape[1]):
-            self.comm.Reduce_scatter(np.ascontiguousarray(full[:, j]), col, recvcounts=self._counts)
+            self._pcomm.Reduce_scatter(np.ascontiguousarray(full[:, j]), col, recvcounts=self._counts)
             out[:, j] = col
         return out
+
+    def _pixel_sums(self, acc, by_column=False):
+        """This rank's pixels (nloc, k) of sums over the ranks: of a full map
+        of this rank (see _scatter_sum) or of a _NodeSum."""
+        return acc.local(by_column) if isinstance(acc, _NodeSum) else self._scatter_sum(acc, by_column)
+
+    def _coverage_local(self, scale=None):
+        """The coverage of this rank's pixels (nloc, _ncov), summed over the
+        ranks (see _chunk_coverage)."""
+        if not self._node_maps:
+            return self._scatter_sum(self._chunk_coverage(scale), by_column=True)
+        acc = _NodeSum(self, self._ncov, len(self.ip))
+        with numba_threads(self.nthreads):
+            for k, ip in enumerate(self.ip):
+                _, c2, s2 = self._pol_arrays(k)
+                acc.coverage(ip, c2, s2, self.pol, *self._grad_arrays(k), 1.0 if scale is None else float(scale[k]))
+        return acc.local(by_column=True)
+
+    def _pt(self, acc, k, t, c2, s2, pol, locbuf):
+        """acc += P^T t for chunk k, its flagged samples into locbuf; acc a full
+        map of this rank or a _NodeSum."""
+        self._pt_group(acc, [(k, t, c2, s2, pol)], locbuf)
+
+    def _pt_group(self, acc, items, locbuf):
+        """_pt of the chunks items (k, t, c2, s2, pol); with a _NodeSum, in one
+        set of rounds."""
+        if isinstance(acc, _NodeSum):
+            acc.backproject([(self.ip[k], t, c2, s2, pol, *self._grad_arrays(k)) for k, t, c2, s2, pol in items], locbuf)
+        else:
+            for k, t, c2, s2, pol in items:
+                _backproject(self.ip[k], t, c2, s2, pol, *self._grad_arrays(k), self._edges, acc, locbuf)
+
+    def _round_groups(self, free):
+        """The chunks `free` in the groups whose P^T _apply adds in one set of
+        rounds of a _NodeSum: with worker threads, the batches of
+        _apply_chunks (one chunk per worker, in their buffers); else
+        consecutive chunks whose filtered TOD and angles (copies, ~16 bytes
+        per sample) fit in _ROUND_BYTES. One chunk per group without a map
+        per node."""
+        if not self._node_maps:
+            return [[k] for k in free]
+        nw = min(self.nthreads, len(free))
+        if nw > 1:
+            return [free[i : i + nw] for i in range(0, len(free), nw)]
+        groups, size = [], np.inf
+        for k in free:
+            n = 16 * self.ip[k].size
+            if size + n > _ROUND_BYTES:
+                groups.append([])
+                size = 0
+            groups[-1].append(k)
+            size += n
+        return groups
 
     def _gather(self, loc, out=None):
         """Full (nobs, k) array from the (nloc, k) pieces of all ranks (allgather)."""
@@ -1547,20 +2031,78 @@ class GLS:
         if self.comm is None:
             out[:] = loc
         else:
-            self.comm.Allgatherv(np.ascontiguousarray(loc), [out, self._counts * loc.shape[1]])
+            self._pcomm.Allgatherv(np.ascontiguousarray(loc), [out, self._counts * loc.shape[1]])
         return out
 
     def full(self, x):
         """Gather a per-pixel array of this rank, (k, nloc) or (nloc,), into the
-        full (k, nobs) or (nobs,) array on every rank."""
+        full (k, nobs) or (nobs,) array on every rank. Collective with MPI. With
+        full_maps "node", a read-only array shared by the ranks of the node
+        (one copy per node)."""
         x = np.asarray(x)
+        if self._node_maps:
+            one = x.ndim == 1
+            x = x[None] if one else x
+            out = self._node.output((x.shape[0], self.nobs), x.dtype)
+            out[:, self.lo : self.hi] = x
+            self._node.gather_rows(out, self._layout)
+            self._node.freeze(out)
+            return out[0] if one else out
         if x.ndim == 1:
             return self._gather(x[:, None])[:, 0]
         return np.ascontiguousarray(self._gather(x.T).T)
 
+    def _full_mask_of(self):
+        """The full mask (ncomp, nobs), gathered once (collective the first time)."""
+        if getattr(self, "_full_mask", None) is None:
+            self._full_mask = self.full(self.mask.astype(np.uint8)).view(bool)
+        return self._full_mask
+
+    def _freeze(self, out):
+        """Hand out an array of _healpix (or written like it): read-only and
+        visible to the ranks of the node if shared, as it is otherwise."""
+        return self._node.freeze(out) if self._node_maps else out
+
+    @property
+    def _writer(self):
+        """Whether this rank writes the maps shared by its node (all ranks without them)."""
+        return not self._node_maps or self._node.leader
+
+    def _healpix(self, m, nside, fill, masked=True):
+        """to_healpix into a new array, with several ranks on a node shared by
+        them (collective; each one fills a part): writable, to be finished by
+        the _writer ranks and handed out with _freeze. Without `masked`, the
+        unseen pixels are not filled."""
+        npix = 12 * nside * nside
+        if not self._node_maps:
+            out, (a, b) = np.empty((m.shape[0], npix), np.asarray(fill).dtype), (0, npix)
+        else:
+            out = self._node.output((m.shape[0], npix), np.asarray(fill).dtype)
+            a, b = self._node.part(npix)
+        seen = self._full_mask_of() if masked else None
+        out[:, a:b] = fill
+        c = min(b, self.nobs)  # labels beyond the map (virtual pixels) dropped
+        if a < c:
+            out[:, a:c] = m[:, a:c]
+            if masked:
+                out[:, a:c][~seen[:, a:c]] = fill
+        if self._node_maps:
+            self._node.barrier()
+        return out
+
+    def _sum(self, a, b):
+        """a + b for full maps (ncomp, nobs), shared by the ranks of a node as a and b."""
+        if not self._node_maps:
+            return a + b
+        out = self._node.output(a.shape, np.result_type(a, b))
+        lo, hi = self._node.part(a.shape[1])
+        np.add(a[:, lo:hi], b[:, lo:hi], out=out[:, lo:hi])
+        return self._node.freeze(out)
+
     def _dot(self, a, b):
-        d = float(_block_dots(a, b, _DOT_BLOCKS).sum())
-        return d if self.comm is None else self.comm.allreduce(d)
+        with self._tm.phase("dot products (allreduce)"):
+            d = float(_block_dots(a, b, _DOT_BLOCKS).sum())
+            return d if self.comm is None else self.comm.allreduce(d)
 
     def _pol_arrays(self, k, slot=None):
         """(pol, gamma cos 2a, gamma sin 2a) of chunk k, computed into buffers
@@ -1618,41 +2160,70 @@ class GLS:
         unknowns of its flagged samples. FFTs in float32 only for P^T N^-1 P v
         with fft_dtype=np.float32 and not `exact`."""
         single = self._single and v is not None and not exact
-        if self._buf is None:
-            # the search direction for P, and the map for P^T
-            self._full = np.empty((self.nobs, self.ncomp))
-            self._buf = np.empty((self.nobs, self.ncomp))
+        if self._locbuf is None:
+            # the map for P^T (one per node: below; the search direction for P: _set_full)
+            self._buf = None if self._node_maps else np.empty((self.nobs, self.ncomp))
             self._locbuf = np.empty(self.nflag + self.namp)
         loc = self._locbuf[:0]
+        tm = self._tm
         if v is not None:
-            self._gather(v[: self._nsky].reshape(self.ncomp, self.nloc).T, out=self._full)  # the whole map, for P
+            with tm.phase("map for P (allgather)"):
+                self._set_full(v[: self._nsky].reshape(self.ncomp, self.nloc).T)  # the whole map, for P
             loc = v[self._nsky :]
             if self.nshared:
                 sh = self._project_shared(v[len(v) - self._nsh_loc :].copy()) if self._root else None
                 self._shv = sh if self.comm is None else self.comm.bcast(sh)
-        buf = self._buf
-        buf[:] = 0.0
+        free = [k for k in range(len(self.ip)) if not self._grouped[k]]
+        groups = self._round_groups(free)
+        if self._node_maps:  # one set of rounds per group, and per chunk with common modes
+            buf = _NodeSum(self, self.ncomp, len(groups) + sum(len(c) for c, _, _ in self._groups))
+        else:
+            buf = self._buf
+            buf[:] = 0.0
         self._locbuf[:] = 0.0
         self._shbuf = np.zeros(self.nshared)
-        with numba_threads(self.nthreads):
-            free = [k for k in range(len(self.ip)) if not self._grouped[k]]
+        with numba_threads(self.nthreads), tm.phase("chunks (P, N^-1, templates, P^T)"):
             if min(self.nthreads, len(free)) > 1:
                 self._apply_chunks(free, v, tod, loc, single, buf)
             else:
-                for k in free:
-                    pol, c2, s2 = self._pol_arrays(k)
-                    t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
-                    f = self._filter(t, k, single)
-                    _backproject(self.ip[k], f, c2, s2, pol, *self._grad_arrays(k), self._edges, buf, self._locbuf)
-                    self._template_back(k, f)
+                for group in groups:
+                    items = []
+                    for k in group:
+                        pol, c2, s2 = self._pol_arrays(k)
+                        t = self._chunk_tod(k, v, tod, loc, c2, s2, pol)
+                        f = self._filter(t, k, single)
+                        self._template_back(k, f)
+                        if len(group) > 1:  # the buffers are reused by the next chunk
+                            f, c2, s2 = (None if x is None else x.copy() for x in (f, c2, s2))
+                        items.append((k, f, c2, s2, pol))
+                    self._pt_group(buf, items, self._locbuf)
             for chunks, U, M in self._groups:
                 self._apply_group(chunks, U, M, v, tod, loc, buf)
-        sh = self._shbuf if self.comm is None or not self.nshared else self.comm.allreduce(self._shbuf)
+        with tm.phase("sums over the ranks (reduce-scatter)"):
+            if isinstance(buf, _NodeSum):
+                buf.finish()
+            sh = self._shbuf if self.comm is None or not self.nshared else self.comm.allreduce(self._shbuf)
+            sums = self._pixel_sums(buf)
         if v is not None and prior:  # precision * v
             self._locbuf[self.nflag :] += self._prior[0] * loc[self.nflag : self.nflag + self.namp]
             sh = sh + self._shprior[0] * self._shv
-        return np.concatenate([(self._scatter_sum(buf).T * self.mask).ravel(), self._locbuf,
-                               self._project_shared(sh)[: self._nsh_loc]])
+        return np.concatenate([(sums.T * self.mask).ravel(), self._locbuf, self._project_shared(sh)[: self._nsh_loc]])
+
+    def _set_full(self, loc):
+        """The search direction (nobs, ncomp) for P in self._full, from the pixels
+        `loc` (nloc, ncomp) of every rank: with MPI one copy per node, shared by
+        its ranks, fetched again at each product (an other GLS of the same
+        communicator may have enlarged it)."""
+        if self._node is None:
+            if self._full is None:
+                self._full = np.empty((self.nobs, self.ncomp))
+            self._full[:] = loc
+            return
+        node = self._node
+        node.barrier()  # the ranks of the node no longer read the previous direction
+        self._full = node.work("full", self.nobs * self.ncomp).reshape(self.nobs, self.ncomp)
+        self._full[self.lo : self.hi] = loc
+        node.allgather(self._full, self._layout)
 
     def _apply_chunks(self, ks, v, tod, loc, single, buf):
         """P^T N^-1 P v (or P^T N^-1 tod) on the chunks `ks`, in parallel: one
@@ -1672,7 +2243,7 @@ class GLS:
         with float64 FFTs (both precisions are kept with float32 FFTs)."""
         nw = min(self.nthreads, len(ks))
         pool = self._workers(nw)
-        private = nw * buf.nbytes <= _PRIVATE_MAPS_BYTES
+        private = not isinstance(buf, _NodeSum) and nw * buf.nbytes <= _PRIVATE_MAPS_BYTES
         if private:
             # Preserve deterministic largest-first assignment and input order.
             batches = [[] for _ in range(nw)]
@@ -1727,10 +2298,10 @@ class GLS:
             list(pool.map(work_batch, range(nw)))
             _reduce_maps(self._maps[:nw], buf)
         else:
-            for i in range(0, len(ks), nw):
+            for i in range(0, len(ks), nw):  # the groups of _round_groups: one set of rounds each
                 batch = ks[i : i + nw]
-                for k, (pol, c2, s2, f) in zip(batch, pool.map(work, zip(batch, slots))):
-                    _backproject(self.ip[k], f, c2, s2, pol, *self._grad_arrays(k), self._edges, buf, self._locbuf)
+                done = list(pool.map(work, zip(batch, slots)))
+                self._pt_group(buf, [(k, f, c2, s2, pol) for k, (pol, c2, s2, f) in zip(batch, done)], self._locbuf)
         for slot in slots:
             self._locbuf[self.nflag :] += slot["loc"]
             self._shbuf += slot["sh"]
@@ -1784,10 +2355,14 @@ class GLS:
             f -= U[j] @ y
             f *= self.weights[k]
             t = ducc0.fft.c2r(f, lastsize=m, forward=False, inorm=2, nthreads=self.nthreads)[:n]
-            _backproject(self.ip[k], t, c2, s2, pol, *self._grad_arrays(k), self._edges, buf, self._locbuf)
+            self._pt(buf, k, t, c2, s2, pol, self._locbuf)
             self._template_back(k, t)
 
     def _precond_flat(self, r):
+        with self._tm.phase("preconditioner"):
+            return self._precond_flat_(r)
+
+    def _precond_flat_(self, r):
         sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
         z = np.empty_like(r)
         z[: self._nsky] = sky.ravel()
@@ -1825,6 +2400,7 @@ class GLS:
         template amplitudes of this rank, by label; empty without templates)
         and "shared_amplitudes" (on every rank).
         """
+        self.pcg_timings = self._tm = _Timings()
         b = self._apply(tod=_chunks(tod))
         # the deviations from the means of the priors, x = xp + x': A x' = b + precision * mean - A xp
         a0 = self._nsky + self.nflag
@@ -1850,8 +2426,9 @@ class GLS:
                 "shared_amplitudes": shared if self.comm is None else self.comm.bcast(shared)}
         self._free()
         # full mask now, while all ranks are here, so that to_healpix is not collective
-        self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
-        return self._gather(x[: self._nsky].reshape(self.ncomp, self.nloc).T).T, info
+        self._full_mask = None
+        self._full_mask_of()
+        return self.full(x[: self._nsky].reshape(self.ncomp, self.nloc)), info
 
     def shared_covariance(self, tol=1e-10, maxiter=2000, recompute_every=10, verbose=False):
         """Covariance of the shared template amplitudes, marginalized over the
@@ -1862,6 +2439,7 @@ class GLS:
         current templates. (nshared, nshared) on every rank; collective. Warns
         if some of the solves do not converge within `maxiter`."""
         n = self._nsky + self.nflag + self.namp + self._nsh_loc
+        self.pcg_timings = self._tm = _Timings()
         cov = np.zeros((self.nshared, self.nshared))
         failed = []
         for j in range(self.nshared):
@@ -1906,6 +2484,7 @@ class GLS:
         true_residual = True  # r was computed as b - A x in float64
 
         it = 0
+        t = time.perf_counter()
         while it < maxiter and history[-1] > tol:
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
@@ -1930,7 +2509,9 @@ class GLS:
                 d = z.copy()
                 delta = self._dot(r, z)
             if verbose and (self.comm is None or self.comm.rank == 0):
-                print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}")
+                now = time.perf_counter()
+                print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}  ({now - t:.1f} s)", flush=True)
+                t = now
         return x, it, history
 
     def white_weights(self):
@@ -1961,8 +2542,8 @@ class GLS:
             if scale.shape != (len(self.ip),) or not np.all(np.isfinite(scale) & (scale > 0)):
                 raise ValueError(f"binned: weights must be one finite weight > 0 per chunk ({len(self.ip)} on this rank)")
         # the same samples as the setup: its coverage if not weighted
-        cov = self._cov if scale is None else self._scatter_sum(self._chunk_coverage(scale), by_column=True)
-        rhs = np.zeros((self.nobs, self.ncomp))
+        cov = self._cov if scale is None else self._coverage_local(scale)
+        rhs = _NodeSum(self, self.ncomp, len(self.ip)) if self._node_maps else np.zeros((self.nobs, self.ncomp))
         flag = np.zeros(self.nflag)  # not used
         with numba_threads(self.nthreads):
             for k, ip in enumerate(self.ip):
@@ -1970,8 +2551,8 @@ class GLS:
                 t = np.asarray(tod[k], dtype=float)
                 if scale is not None:
                     t = t * scale[k]
-                _backproject(ip, t, c2, s2, pol, *self._grad_arrays(k), self._edges, rhs, flag)
-        rhs = self._scatter_sum(rhs)
+                self._pt(rhs, k, t, c2, s2, pol, flag)
+        rhs = self._pixel_sums(rhs)
         out = np.zeros((self.ncomp, self.nloc))
         i_only = self.mask[0] & ~self.mask[1:].any(axis=0)
         out[0, i_only] = rhs[i_only, 0] / cov[i_only, 0]
@@ -1985,12 +2566,11 @@ class GLS:
         return self.full(out)
 
     def to_healpix(self, m, nside, fill=np.nan):
-        """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2); labels
+        """Expand a full map (ncomp, nobs) to RING maps (ncomp, 12 nside^2) of this
+        rank (not shared by the node, unlike the maps of make_maps); labels
         beyond the map (virtual pixels) are dropped. Collective with MPI only if
         called before solve()."""
-        if getattr(self, "_full_mask", None) is None:
-            self._full_mask = self.full(self.mask.astype(np.uint8)).astype(bool)
-        unseen = ~self._full_mask
+        unseen = ~self._full_mask_of()
         full = np.full((m.shape[0], 12 * nside * nside), fill)
         n = min(full.shape[1], self.nobs)
         full[:, :n] = m[:, :n]

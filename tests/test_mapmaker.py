@@ -8,6 +8,7 @@ Run with: pytest tests/  (or: python tests/test_mapmaker.py)
 """
 
 import dataclasses
+import types
 import warnings
 
 import ducc0
@@ -457,9 +458,25 @@ def test_calibration_noiseless():
                   calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=10, gain_tol=1e-12))
     assert r.calibration_iterations < 10
     assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
+    # a looser PCG in the calibration iterations (with and without a mask): the
+    # same gains, and the final maps solved to GLSParameters.tol
+    for mask, tol in ((None, 1e-16), (~band, 1e-16), (None, "adaptive")):
+        kw = dict(gain_period_s=per / fs, n_iter=10, gain_tol=1e-12, mask=mask)
+        ref = make_maps(data, nside, coordinates="E", params=params, calibration=CalibrationParameters(**kw))
+        r = make_maps(data, nside, coordinates="E", params=params, calibration=CalibrationParameters(tol=tol, **kw))
+        assert r.residuals[-1] <= params.tol and r.converged
+        assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-10
+        seen = ref.maps != hp.UNSEEN
+        assert np.array_equal(r.maps != hp.UNSEEN, seen)
+        assert np.abs(r.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
     assert make_maps(data[:1], nside, coordinates="E", params=params).gains is None
     with pytest.raises(ValueError, match="gain_tol"):
         CalibrationParameters(gain_tol=0.0)
+    for bad in (0.0, "fast", np.inf):
+        with pytest.raises(ValueError, match="CalibrationParameters.tol"):
+            CalibrationParameters(tol=bad)
+    with pytest.raises(ValueError, match="tol_factor"):
+        CalibrationParameters(tol="adaptive", tol_factor=0.0)
     with pytest.raises(ValueError, match="dipole"):
         make_maps([dataclasses.replace(data[0], dipole=None)], nside, calibration=CalibrationParameters())
     with pytest.raises(ValueError, match="mask"):
@@ -1726,13 +1743,79 @@ def _signal(d, sky, nside):
 
 
 def test_pixel_order():
-    """Counting sort == stable argsort, also with empty and unhit pixels."""
-    from pysanepic.gls import _pixel_order
+    """Counting sort == stable argsort, also with empty and unhit pixels and
+    negative labels (last), in one block or in parallel (more than 65536
+    samples); _block_sort the same with unknowns of flagged samples."""
+    from pysanepic.gls import _block_sort, _pixel_order, numba_threads
 
     rng = np.random.default_rng(3)
-    for npix, ns in [(1, 5), (50, 0), (50, 1000), (100_000, 20_000)]:
-        ip = rng.integers(0, npix, ns).astype(np.int32)
-        assert np.array_equal(_pixel_order(ip, npix), np.argsort(ip, kind="stable"))
+    with numba_threads(4):
+        for npix, ns in [(1, 5), (50, 0), (50, 1000), (100_000, 20_000), (3, 200_000), (1000, 300_000), (100_000, 500_000)]:
+            ip = rng.integers(-2, npix, ns).astype(np.int32)
+            assert np.array_equal(_pixel_order(ip, npix), np.argsort(np.where(ip < 0, npix, ip), kind="stable"))
+        nobs, ns = 5000, 300_000
+        ip = rng.integers(-1, nobs, ns).astype(np.int32)
+        ip[1000:2000] = nobs + 70 + np.arange(1000) // 10  # unknowns of the chunk, labels from nobs + 70
+        order, sorted_ip, bounds, off = _block_sort(ip, nobs, nobs + 10**6)
+        lab = np.where(ip >= nobs, ip - 70, ip)
+        assert off == 70 and np.array_equal(order, np.argsort(np.where(lab < 0, 10**9, lab), kind="stable"))
+        assert np.array_equal(sorted_ip, lab[order]) and np.array_equal(bounds, np.r_[0, np.flatnonzero(np.diff(sorted_ip)) + 1, ns])
+
+
+def test_timing_table():
+    """Verbose timings: one line per step and phase, seconds aligned, the
+    parts "of which ..." after the phases of their step."""
+    from pysanepic.gls import _timing_table
+
+    lines = _timing_table([("PCG (2 iterations)", 10.0, {"of which slab order": 1.0, "chunks": 8.0}), ("maps", 0.5, None)])
+    assert [ln.split()[0] for ln in lines] == ["PCG", "chunks", "of", "maps"]
+    assert lines[1].startswith("    chunks") and lines[2].startswith("    of which slab order")
+    assert len({len(ln) for ln in lines}) == 1 and all(ln.endswith(" s") for ln in lines)
+
+
+def test_full_maps_choice():
+    """GLS full_maps: checked, "rank" by default; without MPI, or with one
+    rank per node, always one copy per rank (fake communicator and node)."""
+    from pysanepic import GLS
+
+    assert GLSParameters().full_maps == "rank"
+    for bad in ("shared", "auto"):
+        with pytest.raises(ValueError, match="full_maps"):
+            GLSParameters(full_maps=bad)
+    pix = np.zeros((1, 10), np.int32)
+    w = [one_over_f_weights(10, 1.0, 1.0, 0.0, 1.0)]
+    with pytest.raises(ValueError, match="full_maps"):
+        GLS(pix, None, w, full_maps=True)
+    g = GLS(pix, None, w, full_maps="node")
+    assert not g._node_maps and g.full_maps_info == "rank (no MPI)"
+
+    class Comm:  # every rank alike
+        def allgather(self, x):
+            return [x, x]
+
+    g.comm = Comm()
+    for ranks in (48, 1):
+        g._node = types.SimpleNamespace(node=types.SimpleNamespace(size=ranks))
+        assert g._choose_full_maps("rank") == (False, "rank (rank)" if ranks > 1 else "rank (rank, one rank per node)")
+        node, info = g._choose_full_maps("node")
+        assert node == (ranks > 1) and info.startswith("node" if ranks > 1 else "rank"), info
+
+
+def test_slab_order():
+    """The parallel counting sort by slab == a stable argsort of the slabs, the
+    flagged samples (p >= nobs) last and p < 0 left out, with one block or
+    several (more than 65536 samples), empty slabs and more slabs than pixels."""
+    from pysanepic.gls import _slab_order, numba_threads
+
+    rng = np.random.default_rng(4)
+    with numba_threads(4):
+        for nobs, ns, nslab in [(10, 0, 3), (7, 50, 12), (1000, 300_000, 5), (100_000, 500_000, 48)]:
+            ip = rng.integers(-3, nobs + 20, ns).astype(np.int32)
+            order, starts = _slab_order(ip, nobs, nslab)
+            slab = np.where(ip >= nobs, nslab, ip.astype(np.int64) * nslab // nobs)
+            keep = np.flatnonzero(ip >= 0)
+            assert np.array_equal(order, keep[np.argsort(slab[keep], kind="stable")])
+            assert np.array_equal(starts, np.r_[0, np.cumsum(np.bincount(slab[keep], minlength=nslab + 1))])
 
 
 def test_cos_sin_table():

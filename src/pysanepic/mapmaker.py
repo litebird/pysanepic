@@ -23,7 +23,7 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
-from .gls import _GapFilledTOD, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
+from .gls import _GapFilledTOD, _Timings, _timing_table, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
 from .gapfill import conditional_gap_fill, _validate_gap_solve, _validate_gap_preconditioner
 
 
@@ -319,6 +319,10 @@ class DetectorGroup:
 @dataclass
 class MapResult:
     """Output of :func:`make_maps`.
+
+    With MPI, maps, hit_map, gradient and hessian are on every rank: a copy
+    per rank with full_maps "rank", or shared by the ranks of a node with
+    "node" (one copy per node, read-only: copy them to change them).
 
     Attributes
     ----------
@@ -640,6 +644,10 @@ class GLSParameters:
         in angle_dtype) and ~1.3-1.5x the PCG time with 1, ~1.15-1.3x more
         with 2 (no memory per sample); the white noise of I grows by <~1%.
         Polarization has no sub-pixel terms.
+    full_maps : with MPI, where the full maps are: "rank" (default: a copy
+        per rank, fastest) or "node" (one copy shared by the ranks of a
+        node: less memory with many ranks per node at large nside, slower,
+        and the output maps are read-only). See GLS `full_maps`.
     binned_weights : weights of the binned map of the sky model put back in
         the maps (make_maps' `sky_model`; unused without it): "noise"
         (default) weights each detector by its white-noise level 1 /
@@ -669,8 +677,11 @@ class GLSParameters:
     sample_batch: int = 1
     subpixel_order: int = 0
     binned_weights: str | dict = "noise"
+    full_maps: str = "rank"
 
     def __post_init__(self):
+        if self.full_maps not in ("node", "rank"):
+            raise ValueError(f"GLSParameters.full_maps must be 'node' or 'rank', not {self.full_maps!r}")
         if self.subpixel_order not in (0, 1, 2):
             raise ValueError(f"GLSParameters.subpixel_order must be 0, 1 or 2, not {self.subpixel_order!r}")
         if not (isinstance(self.sample_batch, (int, np.integer)) and self.sample_batch >= 1):
@@ -698,6 +709,7 @@ class GLSParameters:
             "template_dtype": self.template_dtype,
             "coarse": None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
             "subpixel_order": self.subpixel_order,
+            "full_maps": self.full_maps,
         }
 
 
@@ -829,6 +841,23 @@ class CalibrationParameters:
         the errors were 0.05-0.13% smaller, with 35% fewer iterations.
         False (default): marginalized.
     prior : :class:`Prior` on the gains g (mean None: 1), or None (default).
+    tol : tolerance of the PCG in the first calibration iterations (as
+        GLSParameters.tol, norm(r)^2 / norm(b)^2): None (default):
+        GLSParameters.tol throughout; a number: that one; "adaptive":
+        max(GLSParameters.tol, tol_factor * dg^2) with dg the largest
+        correction ``max |dg|`` of the previous iteration (1e-6 in the first),
+        tighter as the gains converge. Their maps and corrections only feed
+        the next iteration, so a looser tolerance (e.g. 1e-6 for 1e-10)
+        saves PCG iterations. It is used until an iteration has ``max |dg|`` <
+        gain_tol, and never in the last of the n_iter: the iterations go on
+        with GLSParameters.tol and stop (gain_tol) only on one of those,
+        since a loose solve resolves dg only down to its tolerance
+        (warm-started, it can stop at once with dg = 0). The final maps and
+        gains are therefore those of a solve at GLSParameters.tol. It pays
+        when the calibration needs many iterations; in a 30-day e2e test
+        (noise, tol 1e-10, 3 iterations) it was slower (+6% adaptive, +24%
+        with 1e-6): the less accurate early gains cost more iterations.
+    tol_factor : with tol="adaptive", the factor of dg^2 (default 1e-3).
     """
 
     gain_period_s: float = 3600.0
@@ -838,10 +867,19 @@ class CalibrationParameters:
     cache_model: bool = False
     covariance_fixed_gains: bool = False
     prior: Prior | None = None
+    tol: float | str | None = None
+    tol_factor: float = 1e-3
 
     def __post_init__(self):
         if self.gain_tol is not None and not self.gain_tol > 0:
             raise ValueError("CalibrationParameters.gain_tol must be None or > 0")
+        if isinstance(self.tol, str):
+            if self.tol != "adaptive":
+                raise ValueError(f"CalibrationParameters.tol must be None, a number > 0 or 'adaptive', not {self.tol!r}")
+        elif self.tol is not None and not (np.isfinite(self.tol) and self.tol > 0):
+            raise ValueError("CalibrationParameters.tol must be None, a number > 0 or 'adaptive'")
+        if not (np.isfinite(self.tol_factor) and self.tol_factor > 0):
+            raise ValueError("CalibrationParameters.tol_factor must be > 0")
         if self.prior is not None and not isinstance(self.prior, Prior):
             raise TypeError("CalibrationParameters.prior must be a pysanepic.Prior")
         if isinstance(self.mask, dict):
@@ -1028,16 +1066,21 @@ def _pixel_mean_shift(nside, gradient, hessian, nthreads):
     return shift
 
 
-def _subpixel_result(maps, npol, order, nside, nthreads):
-    """GLS form -> MapResult form: (maps (npol, npix) with I the pixel mean,
-    gradient or None, hessian or None) of the GLS maps `maps` (npol + 0, 2 or
-    5 components, UNSEEN where not solved) for subpixel_order `order`."""
+def _subpixel_result(maps, npol, order, nside, nthreads, write=True):
+    """GLS form -> MapResult form, in place: (maps (npol, npix) with I the
+    pixel mean, gradient or None, hessian or None), views of the GLS maps
+    `maps` (npol + 0, 2 or 5 components, UNSEEN where not solved) for
+    subpixel_order `order`. Only the ranks with `write` change `maps` (one
+    per node when the ranks of a node share it)."""
     sub, maps = maps[npol:], maps[:npol]
     if not order:
         return maps, None, None
     gradient = sub[:2]
-    hessian = np.where(sub[2:] == hp.UNSEEN, hp.UNSEEN, sub[2:] * _HESSIAN[:, None]) if order > 1 else None
-    maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
+    hessian = sub[2:] if order > 1 else None
+    if write:
+        if hessian is not None:
+            np.multiply(hessian, _HESSIAN[:, None], out=hessian, where=hessian != hp.UNSEEN)
+        maps[0] += _pixel_mean_shift(nside, gradient, hessian, nthreads)
     return maps, gradient, hessian
 
 
@@ -1291,15 +1334,30 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
                mask_gain=mask_gain, masks=masks,
                cache={} if calibration is not None and calibration.cache_model else None)
     n_cal = 0
-    for _ in range(1 if calibration is None else calibration.n_iter):
+    n_iter = 1 if calibration is None else calibration.n_iter
+    loose = calibration is not None and calibration.tol is not None
+    final_tol = (GLSParameters() if params is None else params).tol
+    dg = None  # max |dg| of the previous iteration
+    for _ in range(n_iter):
+        # CalibrationParameters.tol until the corrections are small, and never in the last iteration:
+        # a loose solve can stop with dg ~ 0 (a warm start within its tolerance), not a converged calibration
+        fit.tol = None
+        if loose and n_cal < n_iter - 1:
+            tol = calibration.tol
+            if tol == "adaptive":
+                tol = 1e-6 if dg is None else calibration.tol_factor * dg**2
+            fit.tol = tol if tol > final_tol else None
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
         n_cal += 1
         if calibration is not None:
             dg = amplitudes.dg_max if comm is None else max(comm.allgather(amplitudes.dg_max))
             if verbose and (comm is None or comm.rank == 0):
-                print(f"calibration iteration {n_cal}: max |dg| = {dg:.3e}")
+                tol = "" if fit.tol is None else f" (PCG tol {fit.tol:g})"
+                print(f"calibration iteration {n_cal}{tol}: max |dg| = {dg:.3e}")
             if calibration.gain_tol is not None and dg < calibration.gain_tol:
-                break
+                if fit.tol is None:
+                    break
+                loose = False  # converged at the loose tolerance: the next iterations at GLSParameters.tol
             if n_cal == 1 and calibration.n_iter > 1:
                 _mask_unsolved_pol(fit, res, verbose and (comm is None or comm.rank == 0))
     cov = None
@@ -1531,6 +1589,7 @@ class _Fit:
     cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, sky template TODs)
     no_gains: tuple | None = None  # the templates and priors of the GLS but the gain templates (covariance_fixed_gains)
     fit: bool = True  # False: final maps with gains and amplitudes fixed
+    tol: float | None = None  # PCG tolerance of the next fit iteration (CalibrationParameters.tol), None: GLSParameters.tol
 
     @property
     def alm(self):
@@ -1724,6 +1783,7 @@ class _ChunkBuilder:
         self.weights = {}  # chunks with the same length and noise share one array
         self.n_virtual = 0  # padding margins on this rank; labels are unique across ranks
         self.presampled = {}  # j -> (pix, angle, {None: sky model TOD, key: sky template TOD}, loc)
+        self.timings = _Timings()  # seconds of the phases, for verbose
 
     def items(self, data):
         """(j, item) of `data` (a DetectorData or a DetectorGroup, j of its
@@ -1743,8 +1803,9 @@ class _ChunkBuilder:
                 return
             if batching:
                 fields = {None: fit.sky, **fit.skies}
-                for i, r in enumerate(_sample_batch(fields, dets, self.nside, self.coordinates, self.nthreads)):
-                    self.presampled[j + i] = r
+                with self.timings.phase("pointing + sky sampling (batches)"):
+                    for i, r in enumerate(_sample_batch(fields, dets, self.nside, self.coordinates, self.nthreads)):
+                        self.presampled[j + i] = r
             for d in items:
                 yield j, d
                 j += len(d.detectors) if isinstance(d, DetectorGroup) else 1
@@ -1776,22 +1837,26 @@ class _ChunkBuilder:
         else:
             # the (theta, phi) only for alm models or offsets, not to keep them otherwise
             sampled = None
-            pix, angle, loc = _pixels_and_angles(d, self.nside, self.coordinates, self.nthreads,
-                                                 loc=(sample and fit.alm) or params.subpixel_order > 0)
+            with self.timings.phase("pointing"):
+                pix, angle, loc = _pixels_and_angles(d, self.nside, self.coordinates, self.nthreads,
+                                                     loc=(sample and fit.alm) or params.subpixel_order > 0)
         offsets = None
         if params.subpixel_order:
             if loc is None:
                 raise ValueError("GLSParameters.subpixel_order needs a Pointing with angles (theta, phi), not pixels")
-            offsets = _pixel_offsets(pix, loc, self.nside, self.dtype, self.nthreads)
-        det = (_DetectorTOD(d.tod, d.flags, None) if fit is None
-               else self._detector_tod(d, j, pix, angle, loc, offsets, sample, sampled))
+            with self.timings.phase("pointing"):
+                offsets = _pixel_offsets(pix, loc, self.nside, self.dtype, self.nthreads)
+        with self.timings.phase("TOD model"):
+            det = (_DetectorTOD(d.tod, d.flags, None) if fit is None
+                   else self._detector_tod(d, j, pix, angle, loc, offsets, sample, sampled))
         gap = params.split_gap_s * d.sampling_rate_hz if split else np.inf
         chunks = _chunk_bounds(len(d.tod), max(1, int(round(params.chunk_s * d.sampling_rate_hz))))
         pieces = [piece for c in chunks for piece in _split_at_gaps(*c, det.flags, gap)]
         first = len(self.tod)
-        self._add_tod(d, det, pieces)
-        if not self.reuse:  # the GLS has pixels, angles and weights already
-            self._add_layout(d, det.flags, pix, angle, offsets, pieces)
+        with self.timings.phase("chunks"):
+            self._add_tod(d, det, pieces)
+            if not self.reuse:  # the GLS has pixels, angles and weights already
+                self._add_layout(d, det.flags, pix, angle, offsets, pieces)
         return list(range(first, len(self.tod)))
 
     def _detector_tod(self, d, j, pix, angle, loc, offsets, sample, sampled):
@@ -1807,7 +1872,8 @@ class _ChunkBuilder:
                 sky_tod = sampled.pop(None)
                 ttod = sampled
             else:
-                sky_tod, ttod = model.sample(d, pix, angle, loc)
+                with self.timings.phase("TOD model: of which sky sampling"):
+                    sky_tod, ttod = model.sample(d, pix, angle, loc)
             if fit.cache is not None:
                 fit.cache[j] = sky_tod, {k: t.copy() for k, t in ttod.items()}
         ttod = model.tods(d, ttod)
@@ -1947,6 +2013,7 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
         fit.no_gains = ([t for t in templates if id(t) not in gain_ids], shared, prior, shared_prior)
     if reuse:
         gls = fit.gls
+        gls.timings = _Timings()
         gls.set_templates(templates, shared, prior, shared_prior)
     else:
         gls = GLS(
@@ -1979,28 +2046,34 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     # warm start from the previous calibration iteration (if the pixels are the same)
     x0 = None if fit is None or fit.x0 is None or fit.x0.shape != (gls.ncomp, gls.nobs) else fit.x0
     t2 = time.perf_counter()
-    m, info = gls.solve(tod_c, x0=x0, tol=params.tol, maxiter=params.maxiter, verbose=verbose)
+    # a looser tolerance in the first calibration iterations (CalibrationParameters.tol), not in the final maps
+    tol = fit.tol if fit is not None and fit.fit and fit.tol is not None else params.tol
+    m, info = gls.solve(tod_c, x0=x0, tol=tol, maxiter=params.maxiter, verbose=verbose)
     t3 = time.perf_counter()
     if fit is not None:
         fit.x0 = m
         if fit.fit:
-            fit.residual = gls.to_healpix(m, nside, fill=hp.UNSEEN)
+            fit.residual = gls._freeze(gls._healpix(m, nside, hp.UNSEEN))
         fit.amplitudes.update(info if fit.fit else None)  # g (1 + dg), a + da, A + dA
         if fit.sky is not None:  # put back the sky model, as binned from its TOD: the maps of the whole sky
             bw = params.binned_weights
             if isinstance(bw, dict):  # every name checked in make_maps
                 bw = np.array([bw[n] for n in chunks.names], dtype=float)
-            m = m + gls.binned(model_c, weights=bw)
+            m = gls._sum(m, gls.binned(model_c, weights=bw))
 
-    hit_map = np.zeros(npix, dtype=np.int64)
-    n = min(npix, gls.nobs)
-    hit_map[:n] = gls.full(gls.hits)[:n]
-    maps, gradient, hessian = _subpixel_result(gls.to_healpix(m, nside, fill=hp.UNSEEN), npol, params.subpixel_order,
-                                               nside, nthreads)
+    # with full_maps "node", the ranks of a node share the full maps (read-only)
+    hit_map = gls._freeze(gls._healpix(gls.full(gls.hits)[None], nside, 0, masked=False))[0]
+    full = gls._healpix(m, nside, hp.UNSEEN)
+    _subpixel_result(full, npol, params.subpixel_order, nside, nthreads, gls._writer)
+    gls._freeze(full)  # before the views: they inherit read-only
+    maps, gradient, hessian = _subpixel_result(full, npol, params.subpixel_order, nside, nthreads, write=False)
     if verbose and chunks.rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
-        print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
-              f"({info['iterations']} iterations), maps {time.perf_counter() - t3:.1f} s", flush=True)
+        steps = [("TOD and templates", t1 - t0, chunks.timings), (setup, t2 - t1, gls.timings),
+                 (f"PCG ({info['iterations']} iterations)", t3 - t2, gls.pcg_timings),
+                 ("maps", time.perf_counter() - t3, None)]
+        lines = [f"timings (phases of rank 0; full maps per {gls.full_maps_info}):", *_timing_table(steps)]
+        print("\n".join(lines), flush=True)
     return MapResult(
         maps=maps,
         hit_map=hit_map,

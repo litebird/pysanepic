@@ -3,6 +3,7 @@
 Run with: mpirun -n 4 python tests/test_mpi.py  (under pytest it runs on 1 rank)
 """
 
+import dataclasses
 import tempfile
 
 import numpy as np
@@ -60,6 +61,37 @@ def test_make_maps_mpi_padding():
         seen = ref.maps != hp.UNSEEN
         assert np.array_equal(res.maps != hp.UNSEEN, seen)
         assert np.abs(res.maps[seen] - ref.maps[seen]).max() < 1e-8 * np.abs(ref.maps[seen]).max()
+
+
+def test_make_maps_mpi_subpixel_sky_model():
+    """make_maps with the Hessian (the pixel means written once per node) and a
+    sky model (its binned map added back): the serial result; with several
+    ranks on a node its maps are shared and read-only."""
+    import healpy as hp
+
+    from pysanepic import GLSParameters, make_maps
+    from builders import four_detectors
+
+    comm = MPI.COMM_WORLD
+    nside, n, fs = 16, 60_000, 10.0
+    rng = np.random.default_rng(2)
+    sky = random_sky(rng, nside)
+    data = four_detectors(n, fs, rng, sky, nside)
+    params = GLSParameters(chunk_s=1200.0, tol=1e-20, angle_dtype=np.float64, subpixel_order=2)
+    ref = make_maps(data, nside, coordinates="E", sky_model=0.9 * sky, params=params) if comm.rank == 0 else None
+    several = comm.Split_type(MPI.COMM_TYPE_SHARED).size > 1
+    for full_maps in ("node", "rank"):
+        kw = dict(coordinates="E", sky_model=0.9 * sky, params=dataclasses.replace(params, full_maps=full_maps))
+        res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
+        shared = several and full_maps == "node"
+        assert all(x.flags.writeable != shared for x in (res.maps, res.hit_map, res.gradient, res.hessian))
+        if comm.rank == 0:
+            assert np.array_equal(res.hit_map, ref.hit_map)
+            for a, b in ((res.maps, ref.maps), (res.gradient, ref.gradient), (res.hessian, ref.hessian)):
+                seen = b != hp.UNSEEN
+                assert np.array_equal(a != hp.UNSEEN, seen)
+                # ~850 iterations, ill-conditioned: MPI and serial differ by ~3e-6 (as on 0.6.5)
+                assert np.abs(a[seen] - b[seen]).max() < 1e-5 * np.abs(b[seen]).max()
 
 
 def test_calibration_mpi():
@@ -396,9 +428,79 @@ def test_estimate_noise_calibrated_mpi():
             assert np.allclose(est[k].psd, ref[k].psd, rtol=1e-6)
 
 
+def test_node_shared_map():
+    """Ranks on fake nodes: placed cyclically on two nodes (rank r on node
+    r % 2, nodes of different sizes with an odd number of ranks), or one node
+    per rank. Each node owns a contiguous pixel range, its ranks share one map
+    (the same memory), and with a different number of chunks per rank (some
+    with none: empty rounds) and flagged samples the solution is the serial one."""
+    from pysanepic import node as nodemod
+
+    world = MPI.COMM_WORLD
+    rng = np.random.default_rng(1)
+    ns, nchunk = 512, max(world.size * (world.size - 1) // 2, 1)
+    pix = rng.integers(0, 200, (nchunk, ns))
+    pix[::3, 100:110] = -1  # flagged samples: unknowns local to the rank
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.0, 1.0), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    first = world.rank * (world.rank - 1) // 2
+    mine = slice(first, first + max(world.rank, world.size == 1))  # rank r has r chunks: rank 0 none
+    ms = GLS(pix, psi, w, min_pol_rcond=0.0).solve(tod, tol=1e-20)[0] if world.rank == 0 else None
+    for fake in (lambda r: r % 2, lambda r: r):
+        comm = world.Dup()  # a new communicator: not the cached Node of COMM_WORLD
+        nodemod._TEST_NODE = fake
+        try:
+            g = GLS(pix[mine], psi[mine], w[mine], comm=comm, min_pol_rcond=0.0, full_maps="node")
+            m, _ = g.solve(tod[mine], tol=1e-20)
+            nd = g._node
+            # the node's ranks own consecutive slots of pixels
+            assert nd.node.allgather(nd.pixels.rank) == list(range(nd.first, nd.first + nd.node.size))
+            # one map per node: what its rank 0 writes, the others read
+            work = nd.work("test", 1)
+            nd.barrier()
+            if nd.node.rank == 0:
+                work[0] = 1000.0 + nd.first
+            nd.barrier()
+            assert work[0] == 1000.0 + nd.first
+            if g._node_maps:
+                # the solution is one read-only map per node, freed by a later
+                # output once no rank of the node references it
+                wins = [win for win, ref in nd._outs if ref() is m]
+                assert len(wins) == 1 and not m.flags.writeable
+                if world.rank == 0:
+                    assert np.allclose(m, ms, rtol=1e-10, atol=0)
+                del m
+                hits = g.full(g.hits)
+                assert wins[0] not in [win for win, _ in nd._outs]
+                assert np.array_equal(hits[g.lo : g.hi], g.hits) and not hits.flags.writeable
+            elif world.rank == 0:
+                assert np.allclose(m, ms, rtol=1e-10, atol=0)
+        finally:
+            nodemod._TEST_NODE = None
+    # P^T in one set of rounds per group of chunks: one thread per rank (all the
+    # chunks of a rank in one group, or groups of 2: a different number of sets
+    # of rounds per rank), or the batches of the worker threads
+    from pysanepic import gls as glsmod
+
+    budget = glsmod._ROUND_BYTES
+    nodemod._TEST_NODE = lambda r: r % 2
+    try:
+        for nthreads, rb in ((1, budget), (1, 16 * ns * 2), (2, budget)):
+            glsmod._ROUND_BYTES = rb
+            g = GLS(pix[mine], psi[mine], w[mine], comm=world.Dup(), min_pol_rcond=0.0, nthreads=nthreads, full_maps="node")
+            m, _ = g.solve(tod[mine], tol=1e-20)
+            if world.rank == 0:
+                assert np.allclose(m, ms, rtol=1e-10, atol=0)
+    finally:
+        nodemod._TEST_NODE = None
+        glsmod._ROUND_BYTES = budget
+
+
 if __name__ == "__main__":
     test_mpi_matches_serial()
     test_make_maps_mpi_padding()
+    test_make_maps_mpi_subpixel_sky_model()
     test_more_ranks_than_pixels()
     test_mpi_count_check()
     test_flags_mpi()
@@ -411,5 +513,6 @@ if __name__ == "__main__":
     test_tod_templates_mpi()
     test_priors_mpi()
     test_estimate_noise_calibrated_mpi()
+    test_node_shared_map()
     if MPI.COMM_WORLD.rank == 0:
         print("ok")
