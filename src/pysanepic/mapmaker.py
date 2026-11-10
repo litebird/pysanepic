@@ -24,7 +24,7 @@ import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 from .gls import _GapFilledTOD, _Timings, _timing_table, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
-from .node import abort_on_error
+from .node import abort_on_error, node_of
 from .gapfill import conditional_gap_fill, _validate_gap_solve, _validate_gap_preconditioner
 
 
@@ -1085,15 +1085,33 @@ def _subpixel_result(maps, npol, order, nside, nthreads, write=True):
     return maps, gradient, hessian
 
 
-def _subpixel_gls(maps, gradient, hessian, nside, nthreads):
+def _subpixel_gls(maps, gradient, hessian, nside, nthreads, comm=None):
     """MapResult form -> GLS form: (maps with I as in the TOD model of GLS
     (a copy), the GLS sub-pixel components) of MapResult.maps, .gradient (not
-    None) and .hessian; the inverse of _subpixel_result."""
-    maps = maps.copy()
-    maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
-    if hessian is None:
+    None) and .hessian; the inverse of _subpixel_result. With an MPI `comm`
+    of several ranks, read-only arrays shared by the ranks of each node,
+    computed by its first rank (with the pixel moments: ~5 GB at nside 2048
+    once per node, not per rank). Collective then."""
+    nsub = len(gradient) + (0 if hessian is None else len(hessian))
+    node = None if comm is None or comm.Get_size() < 2 else node_of(comm)
+    if node is None and hessian is None:
+        maps = maps.copy()
+        maps[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
         return maps, gradient
-    return maps, np.concatenate([gradient, np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian / _HESSIAN[:, None])])
+    if node is None:
+        out, sub = maps.copy(), np.empty((nsub, maps.shape[1]))
+    else:
+        out, sub = node.output(maps.shape, maps.dtype), node.output((nsub, maps.shape[1]), np.float64)
+    if node is None or node.leader:
+        out[:] = maps
+        out[0] -= _pixel_mean_shift(nside, gradient, hessian, nthreads)
+        sub[: len(gradient)] = gradient
+        if hessian is not None:
+            sub[len(gradient) :] = np.where(hessian == hp.UNSEEN, hp.UNSEEN, hessian / _HESSIAN[:, None])
+    if node is not None:
+        node.freeze(out)
+        node.freeze(sub)
+    return out, sub
 
 
 def _pixels_and_angles(d, nside, coordinates, nthreads, loc=False):
@@ -2132,13 +2150,14 @@ class _TODModel:
         return cls(fit.templates, fit.skies, fit.sky, fit.amplitudes, nthreads)
 
     @classmethod
-    def from_result(cls, result, nthreads):
+    def from_result(cls, result, nthreads, comm=None):
         templates = dict(result.template_definitions or {})
         skies = {k: _model(t.sky, result.nside, f"templates[{k!r}].sky") for k, t in templates.items() if t.sky is not None}
         model = cls(templates, skies, None, _Amplitudes.from_result(result), nthreads)
         model.result, model.maps = result, result.maps
         if result.gradient is not None:  # back to the GLS form of the sub-pixel terms, once
-            model.maps, model.sub = _subpixel_gls(result.maps, result.gradient, result.hessian, result.nside, nthreads)
+            model.maps, model.sub = _subpixel_gls(result.maps, result.gradient, result.hessian, result.nside, nthreads,
+                                                  comm)
         return model
 
     @property
@@ -2383,7 +2402,7 @@ def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None,
     the scan), so iterating make_maps / estimate_noise once is usually enough.
     """
     nthreads = resolve_nthreads(nthreads)
-    model = _TODModel.from_result(result, nthreads)
+    model = _TODModel.from_result(result, nthreads, comm)
     acc = {}  # name -> [fs, sum of P per bin, count per bin, sum of log f per bin]
     gacc = {}  # names of a group -> [fs, sum of the cross-spectra per bin, count, sum of log f]
     j = 0  # DetectorData so far, groups expanded: the index of their gains and amplitudes per period
