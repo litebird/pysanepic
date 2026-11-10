@@ -2,12 +2,12 @@
 
 ## Unreleased
 
-- `GLSParameters.full_maps` (and GLS `full_maps`): `"rank"`, `"node"` or
-  `"auto"` (default), where the full maps are with MPI (below). "auto"
-  shares them per node only when the copies of the ranks of a node would
-  take more than 10% of its memory (`8 nobs (ncov + nb)` bytes per rank,
-  ~5 GB at nside 2048 with I/Q/U). The maps per node cost time when they
-  are small: in a 1-year e2e run at nside 512 with 8 ranks x 6 threads per
+- `GLSParameters.full_maps` (and GLS `full_maps`): `"rank"` (default, as
+  before) or `"node"`, where the full maps are with MPI (below). Choose
+  "node" when the copies of the ranks of a node would take a large part
+  of its memory (`8 nobs (ncov + nb)` bytes per rank at setup, ~5 GB at
+  nside 2048 with I/Q/U). The maps per node cost time when they are
+  small: in a 1-year e2e run at nside 512 with 8 ranks x 6 threads per
   node, a PCG iteration takes ~37 s with "rank" (as before) and ~47 s with
   "node", which saves no memory there (the TOD dominate). The ranks of a
   node wait for each other at each set of rounds of P^T, now one per group

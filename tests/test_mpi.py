@@ -80,7 +80,7 @@ def test_make_maps_mpi_subpixel_sky_model():
     params = GLSParameters(chunk_s=1200.0, tol=1e-20, angle_dtype=np.float64, subpixel_order=2)
     ref = make_maps(data, nside, coordinates="E", sky_model=0.9 * sky, params=params) if comm.rank == 0 else None
     several = comm.Split_type(MPI.COMM_TYPE_SHARED).size > 1
-    for full_maps in ("node", "rank"):  # "auto" is "rank" here (small maps)
+    for full_maps in ("node", "rank"):
         kw = dict(coordinates="E", sky_model=0.9 * sky, params=dataclasses.replace(params, full_maps=full_maps))
         res = make_maps(data[comm.rank :: comm.size], nside, comm=comm, **kw)
         shared = several and full_maps == "node"

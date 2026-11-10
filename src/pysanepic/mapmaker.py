@@ -644,11 +644,10 @@ class GLSParameters:
         in angle_dtype) and ~1.3-1.5x the PCG time with 1, ~1.15-1.3x more
         with 2 (no memory per sample); the white noise of I grows by <~1%.
         Polarization has no sub-pixel terms.
-    full_maps : with MPI, where the full maps are: "rank" (a copy per rank,
-        fastest), "node" (one copy shared by the ranks of a node: less
-        memory with many ranks per node at large nside, slower) or "auto"
-        (default): "node" when the copies of the ranks of a node would take
-        more than 10% of its memory. See GLS `full_maps`.
+    full_maps : with MPI, where the full maps are: "rank" (default: a copy
+        per rank, fastest) or "node" (one copy shared by the ranks of a
+        node: less memory with many ranks per node at large nside, slower,
+        and the output maps are read-only). See GLS `full_maps`.
     binned_weights : weights of the binned map of the sky model put back in
         the maps (make_maps' `sky_model`; unused without it): "noise"
         (default) weights each detector by its white-noise level 1 /
@@ -678,11 +677,11 @@ class GLSParameters:
     sample_batch: int = 1
     subpixel_order: int = 0
     binned_weights: str | dict = "noise"
-    full_maps: str = "auto"
+    full_maps: str = "rank"
 
     def __post_init__(self):
-        if self.full_maps not in ("auto", "node", "rank"):
-            raise ValueError(f"GLSParameters.full_maps must be 'auto', 'node' or 'rank', not {self.full_maps!r}")
+        if self.full_maps not in ("node", "rank"):
+            raise ValueError(f"GLSParameters.full_maps must be 'node' or 'rank', not {self.full_maps!r}")
         if self.subpixel_order not in (0, 1, 2):
             raise ValueError(f"GLSParameters.subpixel_order must be 0, 1 or 2, not {self.subpixel_order!r}")
         if not (isinstance(self.sample_batch, (int, np.integer)) and self.sample_batch >= 1):

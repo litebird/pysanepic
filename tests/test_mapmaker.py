@@ -1762,15 +1762,15 @@ def test_pixel_order():
         assert np.array_equal(sorted_ip, lab[order]) and np.array_equal(bounds, np.r_[0, np.flatnonzero(np.diff(sorted_ip)) + 1, ns])
 
 
-def test_full_maps_choice(monkeypatch):
-    """GLS full_maps: checked; without MPI always one copy per rank; "auto"
-    picks a map per node when the copies of the ranks of a node would take
-    more than 10% of its memory (fake communicator and node)."""
+def test_full_maps_choice():
+    """GLS full_maps: checked, "rank" by default; without MPI, or with one
+    rank per node, always one copy per rank (fake communicator and node)."""
     from pysanepic import GLS
-    from pysanepic import gls as glsmod
 
-    with pytest.raises(ValueError, match="full_maps"):
-        GLSParameters(full_maps="shared")
+    assert GLSParameters().full_maps == "rank"
+    for bad in ("shared", "auto"):
+        with pytest.raises(ValueError, match="full_maps"):
+            GLSParameters(full_maps=bad)
     pix = np.zeros((1, 10), np.int32)
     w = [one_over_f_weights(10, 1.0, 1.0, 0.0, 1.0)]
     with pytest.raises(ValueError, match="full_maps"):
@@ -1783,18 +1783,11 @@ def test_full_maps_choice(monkeypatch):
             return [x, x]
 
     g.comm = Comm()
-    g.nobs, g._ncov, g.ncomp = 50_331_648, 7, 3  # nside 2048, I/Q/U: 5.2 GB per rank
-    for ranks, mem, choice in ((48, 385e9, True), (8, 3e12, False), (1, 385e9, False)):
+    for ranks in (48, 1):
         g._node = types.SimpleNamespace(node=types.SimpleNamespace(size=ranks))
-        monkeypatch.setattr(glsmod, "_node_memory", lambda: mem)
-        node, info = g._choose_full_maps("auto")
-        assert node == choice and info.startswith("node" if choice else "rank"), info
-        assert g._choose_full_maps("rank")[0] is False and g._choose_full_maps("node")[0] == (ranks > 1)
-    monkeypatch.setattr(glsmod, "_node_memory", lambda: None)  # unknown: more than 1 GB per rank
-    g._node = types.SimpleNamespace(node=types.SimpleNamespace(size=2))
-    assert g._choose_full_maps("auto")[0]
-    g.nobs = 12 * 512**2
-    assert not g._choose_full_maps("auto")[0]
+        assert g._choose_full_maps("rank") == (False, "rank (rank)" if ranks > 1 else "rank (rank, one rank per node)")
+        node, info = g._choose_full_maps("node")
+        assert node == (ranks > 1) and info.startswith("node" if ranks > 1 else "rank"), info
 
 
 def test_slab_order():

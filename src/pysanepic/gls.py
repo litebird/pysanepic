@@ -686,18 +686,6 @@ _project_1, _add_template_1, _add_scaled_1, _add_columns_1, _cos_sin_1, _backpro
 # ponytail: fixed budget for the private P^T maps of the chunk workers (nside 512
 # x 48 workers: 3.6 GB); above it, P^T by pixel ranges; make it a parameter if needed
 _PRIVATE_MAPS_BYTES = 4e9
-# GLS full_maps="auto": maps per node when those of the ranks of a node would take more than this
-# fraction of its memory (or, where it is unknown, more than _FULL_MAPS_BYTES per rank)
-_FULL_MAPS_FRACTION = 0.1
-_FULL_MAPS_BYTES = 1e9
-
-
-def _node_memory():
-    """The physical memory of this node in bytes, or None if unknown."""
-    try:
-        return float(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
-    except (ValueError, OSError, AttributeError):
-        return None
 _ROUND_BYTES = 2**29  # a map per node, one thread: the chunks of a set of rounds of P^T (see GLS._round_groups)
 
 # Coverage accumulators are larger than I/Q/U maps (7 float64 columns).
@@ -1258,20 +1246,19 @@ class GLS:
         coverage and the blocks of the preconditioner) are full size, one
         copy per rank or per node (full_maps). The pixels are split node by
         node and only the node leaders exchange maps between nodes.
-    full_maps : where the full maps are with MPI: "rank" (one copy per rank,
-        each worker thread adding P^T to a private one when they fit:
-        fastest), "node" (one copy shared by the ranks of a node, in MPI-3
+    full_maps : where the full maps are with MPI: "rank" (default: one copy
+        per rank, each worker thread adding P^T to a private one when they
+        fit: fastest), "node" (one copy shared by the ranks of a node, in MPI-3
         shared memory, see node.py and _NodeSum: the ranks add P^T in rounds
         over slabs of pixels, synchronized by the node; the full maps handed
-        out by solve, full and binned are shared too, and read-only), or
-        "auto" (default): "node" if the full maps of the ranks of some node
-        would take more than 10% of its memory (at setup, ~8 nobs (ncov +
-        ncomp (ncomp + 1) / 2) bytes per rank: 5 GB at nside 2048 with
-        I/Q/U; where the node memory is unknown, more than 1 GB per rank),
-        else "rank". The choice and its
-        reason are in `full_maps_info`. Without MPI, or with one rank per
-        node, "rank". With MPI the map read by P is shared by the ranks of
-        a node in every mode.
+        out by solve, full and binned are shared too, and read-only). "node"
+        saves memory when the full maps of the ranks of a node are a large
+        part of its memory (at setup ~8 nobs (ncov + ncomp (ncomp + 1) / 2)
+        bytes per rank: 5 GB at nside 2048 with I/Q/U, e.g. 48 ranks per
+        node); with small maps it is slower and saves nothing. The choice
+        is in `full_maps_info`. Without MPI, or with one rank per node,
+        "rank". With MPI the map read by P is shared by the ranks of a node
+        in every mode.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -1416,10 +1403,10 @@ class GLS:
         counts use identity. No dense basis is stored in either case.
     """
 
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="auto"):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank"):
         self.comm = comm
-        if full_maps not in ("auto", "node", "rank"):
-            raise ValueError(f"GLS.full_maps must be 'auto', 'node' or 'rank', not {full_maps!r}")
+        if full_maps not in ("node", "rank"):
+            raise ValueError(f"GLS.full_maps must be 'node' or 'rank', not {full_maps!r}")
         self.timings = tm = _Timings()  # seconds of the phases of the setup (see _Timings)
         self.pcg_timings = _Timings()  # of the last solve
         self._tm = tm  # where the phases go now (_NodeSum: the setup or the solve)
@@ -1632,19 +1619,9 @@ class GLS:
         """(maps per node, description) for GLS.full_maps (collective with MPI)."""
         if self.comm is None:
             return False, "rank (no MPI)"
-        size = self._node.node.size
-        several = max(self.comm.allgather(size)) > 1  # else nothing to share
-        if full_maps != "auto" or not several:
-            node = several and full_maps == "node"
-            return node, f"{'node' if node else 'rank'} ({full_maps}{'' if several else ', one rank per node'})"
-        # the largest full maps of a rank: coverage and blocks at setup
-        est = 8.0 * self.nobs * (self._ncov + self.ncomp * (self.ncomp + 1) // 2)
-        mem = _node_memory()
-        want = size * est > _FULL_MAPS_FRACTION * mem if mem else est > _FULL_MAPS_BYTES
-        node = max(self.comm.allgather(int(want))) > 0
-        why = (f"{size} ranks x {est / 1e9:.2f} GB of full maps = {size * est / mem:.1%} of the node memory" if mem
-               else f"{est / 1e9:.2f} GB of full maps per rank")
-        return node, f"{'node' if node else 'rank'} (auto: {why}, on this node)"
+        several = max(self.comm.allgather(self._node.node.size)) > 1  # else nothing to share
+        node = several and full_maps == "node"
+        return node, f"{'node' if node else 'rank'} ({full_maps}{'' if several else ', one rank per node'})"
 
     def set_templates(self, templates=None, shared_templates=None, prior=None, shared_prior=None):
         """Set (or replace) `templates`, `shared_templates` and their priors
