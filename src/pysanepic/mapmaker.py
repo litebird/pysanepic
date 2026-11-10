@@ -23,7 +23,7 @@ import numba
 import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
-from .gls import _GapFilledTOD, _Timings, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
+from .gls import _GapFilledTOD, _Timings, _timing_table, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
 from .gapfill import conditional_gap_fill, _validate_gap_solve, _validate_gap_preconditioner
 
 
@@ -2069,11 +2069,11 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     maps, gradient, hessian = _subpixel_result(full, npol, params.subpixel_order, nside, nthreads, write=False)
     if verbose and chunks.rank == 0:
         setup = f"GLS setup + conditional fill ({gap_iterations} CG iterations at most)" if conditional else "GLS setup"
-        print(f"TOD and templates {t1 - t0:.1f} s, {setup} {t2 - t1:.1f} s, PCG {t3 - t2:.1f} s "
-              f"({info['iterations']} iterations), maps {time.perf_counter() - t3:.1f} s", flush=True)
-        print(f"  TOD and templates (rank 0): {chunks.timings}", flush=True)
-        print(f"  GLS setup (rank 0): {gls.timings}; full maps per {gls.full_maps_info}", flush=True)
-        print(f"  PCG (rank 0): {gls.pcg_timings}", flush=True)
+        steps = [("TOD and templates", t1 - t0, chunks.timings), (setup, t2 - t1, gls.timings),
+                 (f"PCG ({info['iterations']} iterations)", t3 - t2, gls.pcg_timings),
+                 ("maps", time.perf_counter() - t3, None)]
+        lines = [f"timings (phases of rank 0; full maps per {gls.full_maps_info}):", *_timing_table(steps)]
+        print("\n".join(lines), flush=True)
     return MapResult(
         maps=maps,
         hit_map=hit_map,

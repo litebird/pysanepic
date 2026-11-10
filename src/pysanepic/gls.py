@@ -1111,6 +1111,20 @@ class _Timings(dict):
         return ", ".join(f"{k} {v:.1f} s" for k, v in self.items())
 
 
+def _timing_table(steps):
+    """The lines of a verbose table of timings: steps [(name, seconds,
+    _Timings or None)], each step then its phases indented, and last the
+    parts "of which ..." (inside one or more of those phases), seconds
+    aligned."""
+    rows = []
+    for name, seconds, phases in steps:
+        rows.append((1, name, seconds))
+        items = list((phases or {}).items())
+        rows += [(2, k, v) for k, v in items if "of which" not in k] + [(2, k, v) for k, v in items if "of which" in k]
+    width = max(2 * level + len(name) for level, name, _ in rows)
+    return [f"{'  ' * level}{name:<{width - 2 * level}} {seconds:8.1f} s" for level, name, seconds in rows]
+
+
 class _NodeSum:
     """Sums over the ranks of per-pixel contributions of their chunks (P^T, the
     coverage, the blocks of the preconditioner) in one full map per node,

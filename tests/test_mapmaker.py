@@ -1762,6 +1762,17 @@ def test_pixel_order():
         assert np.array_equal(sorted_ip, lab[order]) and np.array_equal(bounds, np.r_[0, np.flatnonzero(np.diff(sorted_ip)) + 1, ns])
 
 
+def test_timing_table():
+    """Verbose timings: one line per step and phase, seconds aligned, the
+    parts "of which ..." after the phases of their step."""
+    from pysanepic.gls import _timing_table
+
+    lines = _timing_table([("PCG (2 iterations)", 10.0, {"of which slab order": 1.0, "chunks": 8.0}), ("maps", 0.5, None)])
+    assert [ln.split()[0] for ln in lines] == ["PCG", "chunks", "of", "maps"]
+    assert lines[1].startswith("    chunks") and lines[2].startswith("    of which slab order")
+    assert len({len(ln) for ln in lines}) == 1 and all(ln.endswith(" s") for ln in lines)
+
+
 def test_full_maps_choice():
     """GLS full_maps: checked, "rank" by default; without MPI, or with one
     rank per node, always one copy per rank (fake communicator and node)."""

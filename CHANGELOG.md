@@ -38,8 +38,8 @@
   maps per rank (~5 GB per rank at nside 2048 with I/Q/U).
 - With `verbose`, each PCG iteration line ends with its wall time, in
   seconds (rank 0).
-- `make_maps(verbose=True)` prints the time of the phases of each GLS
-  solve (rank 0): of the TOD and templates (pointing, sky sampling, TOD
+- `make_maps(verbose=True)` prints a table of the time of the phases of
+  each GLS solve (rank 0, one line per phase, seconds aligned): of the TOD and templates (pointing, sky sampling, TOD
   model, chunks) and of the GLS setup (coverage, mask, preconditioner
   blocks, template diagonals, preconditioner, coarse level); also in
   `GLS.timings`. In a 30-day e2e test the preconditioner blocks were about
