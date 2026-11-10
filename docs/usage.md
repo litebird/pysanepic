@@ -56,7 +56,11 @@ i_map, q_map, u_map = result.maps  # healpy.UNSEEN where not solved
 ```
 
 With MPI, every process calls `make_maps` with its own data and the same
-`comm`; see [MPI and threads](performance.md#mpi-and-threads).
+`comm`; see [MPI and threads](performance.md#mpi-and-threads). Run the script
+with `python -m mpi4py script.py` (e.g. `srun python -m mpi4py script.py`):
+then an uncaught exception on one process aborts all of them. Otherwise the
+others wait for it forever in the next collective call, and a batch job
+hangs until its time limit.
 
 ## Pointing
 
