@@ -3,15 +3,18 @@
 ## Unreleased
 
 - `GLSParameters.full_maps` (and GLS `full_maps`): `"rank"`, `"node"` or
-  `"auto"` (default), where the full maps are with MPI (below). The maps per
-  node cost time: in a 1-year e2e run at nside 512 with 8 ranks x 6 threads
-  per node (job 23410051, one set of rounds per chunk) the PCG was 55%
-  slower and saved only a few GB per node; "auto" shares them only when
-  the copies of the ranks of a node would take more than 10% of its memory.
-  The rounds of P^T are now one per group of chunks (the batch of the
-  worker threads, or 512 MB of chunks with one thread). Part of that
-  slowdown, with "rank" too (28% in the PCG), came from a P^T kernel 5x
-  slower than in 0.6.5, now fixed: those numbers are being measured again.
+  `"auto"` (default), where the full maps are with MPI (below). "auto"
+  shares them per node only when the copies of the ranks of a node would
+  take more than 10% of its memory (`8 nobs (ncov + nb)` bytes per rank,
+  ~5 GB at nside 2048 with I/Q/U). The maps per node cost time when they
+  are small: in a 1-year e2e run at nside 512 with 8 ranks x 6 threads per
+  node, a PCG iteration takes ~37 s with "rank" (as before) and ~47 s with
+  "node", which saves no memory there (the TOD dominate). The ranks of a
+  node wait for each other at each set of rounds of P^T, now one per group
+  of chunks (the batch of the worker threads, or 512 MB of chunks with one
+  thread) instead of one per chunk. With many ranks per node and large
+  maps "node" is faster than one copy per rank (nside 2048, 1 node x 48
+  ranks: 4.7 instead of 12.5 s per iteration in a benchmark).
 - With MPI, the ranks of a node can share one copy of the full maps
   (`full_maps="node"`), in MPI-3 shared-memory windows, instead of one copy
   per rank: the map read by P (the PCG search direction), the map summing
