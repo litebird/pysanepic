@@ -354,6 +354,34 @@ def test_estimate_noise_mpi():
             assert np.allclose(mine[k].psd, ref[k].psd, rtol=1e-12) and np.allclose(mine[k].freqs_hz, ref[k].freqs_hz)
 
 
+def test_estimate_noise_subpixel_mpi():
+    """With the gradient and the Hessian in the result, the TOD model of
+    estimate_noise is computed once per node, in read-only arrays shared by
+    its ranks, and the spectra are the serial ones."""
+    from pysanepic import estimate_noise
+    from pysanepic.mapmaker import MapResult, _TODModel
+    from builders import noise_data
+
+    comm = MPI.COMM_WORLD
+    nside, fs, chunk = 8, 10.0, 2000
+    rng = np.random.default_rng(17)
+    sky = random_sky(rng, nside)
+    npix = 12 * nside**2
+    gradient, hessian = 0.1 * rng.normal(size=(2, npix)), 0.01 * rng.normal(size=(3, npix))
+    data = noise_data(rng, nside, sky, fs, chunk, 8, lambda f: 1 + (0.1 / f) ** 1.5, 1e-4)
+    truth = MapResult(maps=sky, hit_map=None, nside=nside, coordinates="E", iterations=0, converged=True,
+                      residuals=None, gradient=gradient, hessian=hessian)
+    serial = _TODModel.from_result(truth, 1)
+    model = _TODModel.from_result(truth, 1, comm)
+    assert np.array_equal(model.maps, serial.maps) and np.array_equal(model.sub, serial.sub)
+    assert model.maps.flags.writeable == model.sub.flags.writeable == (comm.size == 1)
+    mine = estimate_noise(data[comm.rank :: comm.size], truth, chunk_s=chunk / fs, comm=comm)
+    if comm.rank == 0:
+        ref = estimate_noise(data, truth, chunk_s=chunk / fs)
+        assert sorted(mine) == sorted(ref)
+        for k in ref:
+            assert np.allclose(mine[k].psd, ref[k].psd, rtol=1e-12)
+
 
 def test_detector_groups_mpi():
     """DetectorGroups on different ranks (each group on one rank) = serial."""
@@ -506,6 +534,7 @@ if __name__ == "__main__":
     test_flags_mpi()
     test_conditional_fill_mpi()
     test_estimate_noise_mpi()
+    test_estimate_noise_subpixel_mpi()
     test_detector_groups_mpi()
     test_estimate_common_modes_mpi()
     test_calibration_mpi()

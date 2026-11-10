@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- With MPI and the sub-pixel terms (a result with `gradient`),
+  `estimate_noise` builds the TOD model of the maps (the maps and the
+  sub-pixel components in the form of the GLS, and the pixel moments) once
+  per node, in read-only arrays shared by its ranks, instead of on every
+  rank: at nside 2048 with 48 ranks on a G100 node the peak memory of
+  `estimate_noise` went from 322 to 32 GB per node, in the same time and
+  with the same spectra (#86).
+
 - With MPI, an exception on one process inside `make_maps`,
   `estimate_noise` or a collective method of `GLS` (`__init__`, `solve`,
   `full`, `binned`, `rhs`, `apply_A`, `set_templates`,
