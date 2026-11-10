@@ -26,7 +26,7 @@ import ducc0
 import numba
 import numpy as np
 
-from .node import node_of
+from .node import abort_on_error, node_of
 
 
 def resolve_nthreads(nthreads=None):
@@ -1417,6 +1417,7 @@ class GLS:
         counts use identity. No dense basis is stored in either case.
     """
 
+    @abort_on_error
     def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank"):
         self.comm = comm
         if full_maps not in ("node", "rank"):
@@ -1637,6 +1638,7 @@ class GLS:
         node = several and full_maps == "node"
         return node, f"{'node' if node else 'rank'} ({full_maps}{'' if several else ', one rank per node'})"
 
+    @abort_on_error
     def set_templates(self, templates=None, shared_templates=None, prior=None, shared_prior=None):
         """Set (or replace) `templates`, `shared_templates` and their priors
         (see the class), keeping the rest of the setup: pixels,
@@ -2034,6 +2036,7 @@ class GLS:
             self._pcomm.Allgatherv(np.ascontiguousarray(loc), [out, self._counts * loc.shape[1]])
         return out
 
+    @abort_on_error
     def full(self, x):
         """Gather a per-pixel array of this rank, (k, nloc) or (nloc,), into the
         full (k, nobs) or (nobs,) array on every rank. Collective with MPI. With
@@ -2377,6 +2380,7 @@ class GLS:
         if self.nflag or self.namp or self.nshared:
             raise ValueError("apply_A and rhs work on the pixels only: with flagged samples or templates use solve()")
 
+    @abort_on_error
     def apply_A(self, m):
         """P^T N^-1 P m for this rank's pixels of a map, (ncomp, nloc) (without
         MPI, the whole map); returns the same pixels. Collective with MPI. Not
@@ -2384,12 +2388,14 @@ class GLS:
         self._no_flags()
         return self._apply(np.ravel(m)).reshape(self.ncomp, self.nloc)
 
+    @abort_on_error
     def rhs(self, tod):
         """P^T N^-1 d on this rank's pixels (ncomp, nloc), for timelines laid out
         like `pix`. Collective with MPI. Not available with marginalized flags."""
         self._no_flags()
         return self._apply(tod=_chunks(tod)).reshape(self.ncomp, self.nloc)
 
+    @abort_on_error
     def solve(self, tod, x0=None, tol=1e-15, maxiter=2000, recompute_every=10, verbose=False):
         """Run PCG on `tod` (same chunk layout as `pix`).
 
@@ -2430,6 +2436,7 @@ class GLS:
         self._full_mask_of()
         return self.full(x[: self._nsky].reshape(self.ncomp, self.nloc)), info
 
+    @abort_on_error
     def shared_covariance(self, tol=1e-10, maxiter=2000, recompute_every=10, verbose=False):
         """Covariance of the shared template amplitudes, marginalized over the
         maps, the flagged samples and the local amplitudes: the shared block of
@@ -2522,6 +2529,7 @@ class GLS:
         common modes are not included."""
         return np.array([float(np.median(np.asarray(w, dtype=float)[len(w) // 2 :])) for w in self.weights])
 
+    @abort_on_error
     def binned(self, tod, weights="equal"):
         """Binned map (P^T W P)^-1 P^T W tod, (ncomp, nobs) on every rank, for
         timelines laid out like `pix`, with W one weight per chunk: "equal"

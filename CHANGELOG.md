@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- With MPI, an exception on one process inside `make_maps`,
+  `estimate_noise` or a collective method of `GLS` (`__init__`, `solve`,
+  `full`, `binned`, `rhs`, `apply_A`, `set_templates`,
+  `shared_covariance`) prints its traceback and aborts all the processes,
+  instead of leaving the others waiting forever in a collective call (a
+  batch job hung until its time limit). `PYSANEPIC_MPI_ABORT=0` raises it
+  as before (#83).
+
 - `GLSParameters.full_maps` (and GLS `full_maps`): `"rank"` (default, as
   before) or `"node"`, where the full maps are with MPI (below). Choose
   "node" when the copies of the ranks of a node would take a large part

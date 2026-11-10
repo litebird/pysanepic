@@ -13,12 +13,55 @@ nodes: an allgather of the node ranges for P, a reduce-scatter for the sums.
 """
 
 import atexit
+import functools
+import inspect
+import os
+import sys
+import traceback
 import weakref
 
 import numpy as np
 
 _NODES = {}  # communicator handle -> Node
 _TEST_NODE = None  # tests: rank -> fake node within the real node, e.g. two "nodes" on one machine
+
+
+ABORT_ENV = "PYSANEPIC_MPI_ABORT"  # "0": raise as usual instead of aborting (see abort_on_error)
+
+
+def abort_on_error(fn):
+    """Decorate a collective function or method (its `comm` argument, or
+    `self.comm`): an exception on one rank of a communicator with several
+    ranks prints its traceback and aborts all of them (MPI_Abort), instead
+    of leaving the others waiting forever in the next collective call (a
+    batch job would hang until its time limit). MPI cannot interrupt them
+    otherwise. With the environment variable PYSANEPIC_MPI_ABORT=0 the
+    exception is raised as usual."""
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            try:
+                a = sig.bind_partial(*args, **kwargs).arguments
+            except TypeError:  # called with wrong arguments: on every rank alike, raise it
+                a = {}
+            comm = a.get("comm")
+            if comm is None:
+                comm = getattr(a.get("self"), "comm", None)
+            if comm is None or comm.Get_size() < 2 or os.environ.get(ABORT_ENV, "1") == "0":
+                raise
+            print(f"pysanepic: rank {comm.Get_rank()} of {comm.Get_size()} failed in {fn.__qualname__}, aborting "
+                  f"all ranks ({ABORT_ENV}=0 to raise instead):", file=sys.stderr)
+            traceback.print_exc()
+            sys.stderr.flush()
+            sys.stdout.flush()
+            comm.Abort(1)
+            raise  # Abort may return before the processes are killed
+
+    return wrapper
 
 
 def node_of(comm):

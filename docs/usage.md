@@ -56,11 +56,14 @@ i_map, q_map, u_map = result.maps  # healpy.UNSEEN where not solved
 ```
 
 With MPI, every process calls `make_maps` with its own data and the same
-`comm`; see [MPI and threads](performance.md#mpi-and-threads). Run the script
-with `python -m mpi4py script.py` (e.g. `srun python -m mpi4py script.py`):
-then an uncaught exception on one process aborts all of them. Otherwise the
-others wait for it forever in the next collective call, and a batch job
-hangs until its time limit.
+`comm`; see [MPI and threads](performance.md#mpi-and-threads). An exception on
+one process inside `make_maps`, `estimate_noise` or a collective method of
+`GLS` prints its traceback and aborts all the processes (`MPI_Abort`):
+otherwise the others would wait for it forever in the next collective call,
+and a batch job would hang until its time limit. Set the environment variable
+`PYSANEPIC_MPI_ABORT=0` to get the exception instead. For errors in your own
+code, run the script with `python -m mpi4py script.py` (e.g.
+`srun python -m mpi4py script.py`), which aborts on any uncaught exception.
 
 ## Pointing
 

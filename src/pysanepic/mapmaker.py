@@ -24,6 +24,7 @@ import numpy as np
 
 from .gls import GLS, fast_fft_length, numba_threads, one_over_f_weights, psd_weights, resolve_nthreads, two_angle
 from .gls import _GapFilledTOD, _Timings, _timing_table, _Q2, _TRIG_COS, _TRIG_SIN, _add_pol, _axpy, _calibrated, _fill_columns, _project_iqu, _validate_act_ncoeff
+from .node import abort_on_error
 from .gapfill import conditional_gap_fill, _validate_gap_solve, _validate_gap_preconditioner
 
 
@@ -1226,6 +1227,7 @@ def _coarse_pixels(nside, coarse_nside):
     return coarse
 
 
+@abort_on_error
 def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=None, verbose=False, calibration=None,
               sky_model=None, templates=None, template_covariance=False):
     """GLS maps with 1/f noise from a list of :class:`DetectorData`.
@@ -2347,6 +2349,7 @@ def _fit_common_modes(R, w, r, maxiter=2000, tol=1e-10):
     return A / s, P * s**2, N
 
 
+@abort_on_error
 def estimate_noise(data, result, chunk_s=86400.0, nbins=60, fit=None, comm=None, nthreads=None, n_modes=1):
     """Noise spectrum of each detector from the residual of a map.
 
