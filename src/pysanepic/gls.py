@@ -2298,6 +2298,7 @@ class GLS:
             self._maps = np.zeros((nw, *buf.map.shape))  # zeroed again by _reduce_maps
         flag = self._locbuf[: self.nflag]  # disjoint labels for each chunk
         for j, slot in enumerate(slots):
+            slot["times"] = {}
             slot["nthreads"] = max(1, self.nthreads // nw)
             slot["loc"], slot["sh"] = np.zeros(self.namp), np.zeros(self.nshared)
             if private:
@@ -2306,13 +2307,23 @@ class GLS:
 
         def work(task):
             k, slot = task
+            times = slot["times"]  # seconds of each step, summed over the chunks of this worker
+            t0 = time.perf_counter()
             pol, c2, s2 = self._pol_arrays(k, slot)
+            t1 = time.perf_counter()
             t = self._chunk_tod(k, v, tod, loc, c2, s2, pol, slot)
+            t2 = time.perf_counter()
             f = self._filter(t, k, single, slot)
+            t3 = time.perf_counter()
             self._template_back(k, f, slot["loc"], slot["sh"], serial=True)
+            t4 = time.perf_counter()
+            for name, dt in (("angles", t1 - t0), ("P and templates", t2 - t1), ("N^-1 (FFTs)", t3 - t2),
+                             ("templates T^T", t4 - t3)):
+                times[name] = times.get(name, 0.0) + dt
             if not private:
                 return pol, c2, s2, f
             _backproject_1(self.ip[k], f, c2, s2, pol, *self._grad_arrays(k), whole, slot["map"], flag)
+            times["P^T"] = times.get("P^T", 0.0) + time.perf_counter() - t4
 
         if private:
             # A dynamic slot queue changes the grouping of floating-point
@@ -2334,6 +2345,9 @@ class GLS:
         for slot in slots:
             self._locbuf[self.nflag :] += slot["loc"]
             self._shbuf += slot["sh"]
+            # CPU time of the workers (summed over them: more than the wall time)
+            for name, dt in slot["times"].items():
+                self._tm[f"of which workers (thread-s): {name}"] = self._tm.get(f"of which workers (thread-s): {name}", 0.0) + dt
 
     def _chunk_tod(self, k, v, tod, loc, c2, s2, pol, slot=None):
         """P v, or chunk TOD (marginalized flags set to 0, gap fills kept);
@@ -2351,10 +2365,15 @@ class GLS:
         if self._cuts[k].size:
             _cut_project(self._cuts[k], loc, t)
         serial = slot is not None
+        if serial:
+            t0 = time.perf_counter()
         for values, labels in self._tmpl[k]:
             _template_add(t, values, labels, loc[self.nflag : self.nflag + self.namp], serial)
         for values, labels in self._shared[k]:
             _template_add(t, values, labels, self._shv, serial)
+        if serial:
+            times = slot["times"]
+            times["templates T a (inside P and templates)"] = times.get("templates T a (inside P and templates)", 0.0) + time.perf_counter() - t0
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
