@@ -582,6 +582,23 @@ def _template_add(t, values, labels, amp, serial=False):
         (_add_template_1 if serial else _add_template)(t, values, labels, amp)
 
 
+def _tmpl_kind(values, labels):
+    """The kind of a template entry, for the timers."""
+    if np.ndim(values) == 2:
+        return f"columns x{values.shape[1]}"
+    return "one amplitude" if np.ndim(labels) == 0 else "labels per sample"
+
+
+def _tick(times, step, where, values, labels, t0):
+    """Add the seconds since t0 of one template entry to a chunk worker's
+    `times` (None: not timed), by step, local or shared amplitudes and kind:
+    2D columns, one amplitude in the chunk, or labels per sample."""
+    if times is None:
+        return
+    key = f"templates {step}, {where}, {_tmpl_kind(values, labels)} ({values.dtype}, {np.asarray(labels).dtype if np.ndim(labels) else 'int'})"
+    times[key] = times.get(key, 0.0) + time.perf_counter() - t0
+
+
 def _template_transpose(values, labels, f, out):
     """out[labels] += values * f, labels an array or one int, or values
     (n, ncol) and labels (ncol,)."""
@@ -1886,9 +1903,10 @@ class GLS:
             a[g] -= a[g].mean()
         return a
 
-    def _template_back(self, k, f, loc=None, sh=None, serial=False):
+    def _template_back(self, k, f, loc=None, sh=None, serial=False, times=None):
         """Add T^T f of chunk k (f = N^-1 t) to the amplitudes in _locbuf and
-        _shbuf (or in `loc` and `sh`, those of a chunk worker)."""
+        _shbuf (or in `loc` and `sh`, those of a chunk worker); `times`: a
+        chunk worker's timers."""
         loc = self._locbuf[self.nflag :] if loc is None else loc
         sh = self._shbuf if sh is None else sh
         if self._cuts[k].size:
@@ -1898,9 +1916,13 @@ class GLS:
             # shared by chunks, so workers sum them in private `loc` buffers.
             _cut_transpose(self._cuts[k], f, self._locbuf)
         for values, labels in self._tmpl[k]:
+            t0 = time.perf_counter()
             _template_transpose(values, labels, f, loc)
+            _tick(times, "T^T", "local", values, labels, t0)
         for values, labels in self._shared[k]:
+            t0 = time.perf_counter()
             _template_transpose(values, labels, f, sh)
+            _tick(times, "T^T", "shared", values, labels, t0)
 
     def _set_coarse(self, coarse, diag_i):
         """E^-1 = (Z^T A Z)^-1 of the two-level preconditioner (see `coarse`);
@@ -2315,7 +2337,7 @@ class GLS:
             t2 = time.perf_counter()
             f = self._filter(t, k, single, slot)
             t3 = time.perf_counter()
-            self._template_back(k, f, slot["loc"], slot["sh"], serial=True)
+            self._template_back(k, f, slot["loc"], slot["sh"], serial=True, times=slot["times"])
             t4 = time.perf_counter()
             for name, dt in (("angles", t1 - t0), ("P and templates", t2 - t1), ("N^-1 (FFTs)", t3 - t2),
                              ("templates T^T", t4 - t3)):
@@ -2365,15 +2387,15 @@ class GLS:
         if self._cuts[k].size:
             _cut_project(self._cuts[k], loc, t)
         serial = slot is not None
-        if serial:
-            t0 = time.perf_counter()
+        times = slot["times"] if serial else None
         for values, labels in self._tmpl[k]:
+            t0 = time.perf_counter()
             _template_add(t, values, labels, loc[self.nflag : self.nflag + self.namp], serial)
+            _tick(times, "T a", "local", values, labels, t0)
         for values, labels in self._shared[k]:
+            t0 = time.perf_counter()
             _template_add(t, values, labels, self._shv, serial)
-        if serial:
-            times = slot["times"]
-            times["templates T a (inside P and templates)"] = times.get("templates T a (inside P and templates)", 0.0) + time.perf_counter() - t0
+            _tick(times, "T a", "shared", values, labels, t0)
         return t
 
     def _apply_group(self, chunks, U, M, v, tod, loc, buf):
@@ -2449,6 +2471,17 @@ class GLS:
         and "shared_amplitudes" (on every rank).
         """
         self.pcg_timings = self._tm = _Timings()
+        if verbose and (self.comm is None or self.comm.rank == 0):  # the template entries timed by the chunk workers
+            entries = {}
+            for where, tm in (("local", self._tmpl), ("shared", self._shared)):
+                for chunk in tm:
+                    for values, labels in chunk:
+                        kind = f"{where}, {_tmpl_kind(values, labels)}"
+                        e, n = entries.get(kind, (0, 0))
+                        entries[kind] = (e + 1, n + values.shape[0])
+            print("template entries of rank 0 (entries, samples): "
+                  + ("; ".join(f"{k}: {e}, {n}" for k, (e, n) in entries.items()) or "none")
+                  + f"; {len(self.ip)} chunks, {sum(ip.size for ip in self.ip)} samples", flush=True)
         b = self._apply(tod=_chunks(tod))
         # the deviations from the means of the priors, x = xp + x': A x' = b + precision * mean - A xp
         a0 = self._nsky + self.nflag
