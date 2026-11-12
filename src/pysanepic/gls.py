@@ -582,6 +582,21 @@ def _template_add(t, values, labels, amp, serial=False):
         (_add_template_1 if serial else _add_template)(t, values, labels, amp)
 
 
+def _ritz_summary(alphas, betas):
+    """Diagnostics: the extreme eigenvalues of M^-1 A estimated from the CG
+    coefficients (the Lanczos tridiagonal matrix), as a string."""
+    k = len(alphas)
+    if k < 2:
+        return "too few iterations"
+    a, b = np.array(alphas), np.array(betas[: k - 1])
+    diag = 1.0 / a
+    diag[1:] += b / a[:-1]
+    off = np.sqrt(np.abs(b)) / a[:-1]
+    ev = np.linalg.eigvalsh(np.diag(diag) + np.diag(off, 1) + np.diag(off, -1))
+    return (f"{k} steps, min {ev[0]:.3e}, max {ev[-1]:.3e}, cond {ev[-1] / ev[0]:.3e}; smallest "
+            + " ".join(f"{e:.3e}" for e in ev[:6]))
+
+
 def _tmpl_kind(values, labels):
     """The kind of a template entry, for the timers."""
     if np.ndim(values) == 2:
@@ -2564,12 +2579,19 @@ class GLS:
         delta = self._dot(r, z)
         history = [self._dot(r, r) / bb]
         true_residual = True  # r was computed as b - A x in float64
+        talk = verbose and (self.comm is None or self.comm.rank == 0)
+        alphas, betas = [], []  # diagnostics (verbose): Lanczos estimates of the eigenvalues of M^-1 A
+        if verbose:
+            blocks = self._block_shares(r, z)
+            if talk:
+                print(f"iter    0  |r|^2/|b|^2 = {history[-1]:.3e}  blocks {blocks}", flush=True)
 
         it = 0
         t = time.perf_counter()
         while it < maxiter and history[-1] > tol:
             q = self._apply(d)
             alpha = delta / self._dot(d, q)
+            alphas.append(alpha)
             _axpy(x, alpha, d)
             true_residual = (it + 1) % recompute_every == 0  # after every recompute_every-th step
             if true_residual:
@@ -2578,6 +2600,7 @@ class GLS:
                 _axpy(r, -alpha, q)
             z = self._precond_flat(r)
             delta_new = self._dot(r, z)
+            betas.append(delta_new / delta)
             _xpby(d, z, delta_new / delta)
             delta = delta_new
             history.append(self._dot(r, r) / bb)
@@ -2590,11 +2613,29 @@ class GLS:
                 z = self._precond_flat(r)
                 d = z.copy()
                 delta = self._dot(r, z)
-            if verbose and (self.comm is None or self.comm.rank == 0):
-                now = time.perf_counter()
-                print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}  ({now - t:.1f} s)", flush=True)
-                t = now
+                if talk:
+                    print(f"restart at iteration {it}: {_ritz_summary(alphas, betas)}", flush=True)
+                alphas, betas = [], []
+            if verbose:
+                blocks = self._block_shares(r, z)
+                if talk:
+                    now = time.perf_counter()
+                    print(f"iter {it:4d}  |r|^2/|b|^2 = {history[-1]:.3e}  ({now - t:.1f} s)  blocks {blocks}", flush=True)
+                    t = now
+        if talk:
+            print(f"PCG eigenvalues of M^-1 A (Lanczos, since the last restart): {_ritz_summary(alphas, betas)}", flush=True)
         return x, it, history
+
+    def _block_shares(self, r, z):
+        """Diagnostics: the shares of r^T M^-1 r (z = M^-1 r; the same units
+        in every block) in the maps, the flagged samples, the local and the
+        shared amplitudes, as a string (collective)."""
+        a, b, c = self._nsky, self._nsky + self.nflag, self._nsky + self.nflag + self.namp
+        parts = np.array([np.dot(r[:a], z[:a]), np.dot(r[a:b], z[a:b]), np.dot(r[b:c], z[b:c]), np.dot(r[c:], z[c:])])
+        if self.comm is not None:
+            parts = self.comm.allreduce(parts)
+        tot = parts.sum()
+        return "map/flags/local/shared " + " ".join(f"{p / tot:.2e}" if tot > 0 else "0" for p in parts)
 
     def white_weights(self):
         """The white-noise weight of each chunk of this rank, 1 / sigma^2 for
