@@ -512,6 +512,42 @@ def test_calibration_act_flags(ncoeff):
     assert r.hit_map.sum() == sum((~d.flags).sum() for d in flagged)
 
 
+def test_calibration_masked_flags_sine_and_warm_start(monkeypatch):
+    """Samples out of the gain mask are flag unknowns: with
+    flag_preconditioner="sine" the gains and maps are those of the diagonal
+    one, and the calibration iterations after the first start from the flag
+    unknowns of the previous one (the reused GLS)."""
+    from pysanepic import GLS, CalibrationParameters
+
+    nside, n, fs, per = 16, 120_000, 10.0, 12_000
+    data, true, sky = calibration_data(nside, n, fs, per)
+    th, _ = hp.pix2ang(nside, np.arange(12 * nside**2))
+    mask = (np.abs(90 - np.degrees(th)) > 20).astype(float)
+    starts = []
+    solve = GLS.solve
+
+    def spy(self, *a, flags0=None, **k):
+        starts.append((self.nflag, None if flags0 is None else flags0.size))
+        return solve(self, *a, flags0=flags0, **k)
+
+    monkeypatch.setattr(GLS, "solve", spy)
+    res = {}
+    for prec in ("diagonal", "sine"):
+        starts.clear()
+        params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64,
+                               flag_preconditioner=prec)
+        res[prec] = make_maps(data, nside, coordinates="E", params=params, nthreads=2,
+                              calibration=CalibrationParameters(gain_period_s=per / fs, n_iter=3, mask=mask))
+        assert res[prec].converged
+        nflag = starts[0][0]
+        assert nflag > 0 and starts[:3] == [(nflag, None), (nflag, nflag), (nflag, nflag)]
+        assert starts[3][1] is None  # the final maps: a new GLS
+    for r in res.values():
+        assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-9
+    seen = res["diagonal"].maps[1] != hp.UNSEEN
+    assert np.abs(res["sine"].maps[:, seen] - res["diagonal"].maps[:, seen]).max() < 1e-9 * np.abs(sky).max()
+
+
 def test_flag_methods_noiseless_response():
     """Signal response with no noise, i.e. the bias of each flag treatment:
     marginalize, act and conditional_mean with the true sky_model are exact;
@@ -1923,6 +1959,62 @@ def test_flags_exact_gls():
     assert np.abs(m - ref).max() < 1e-11 * np.abs(ref).max()
     with pytest.raises(ValueError, match="flagged"):
         g.rhs(tod)
+
+
+def _flagged_gls_case(flag_preconditioner, order):
+    """A chunk with long flagged runs, steep 1/f noise: (GLS, TOD)."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(17)
+    npix, ns, nchunk, fs = 12, 2048, 2, 10.0
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = one_over_f_weights(ns, fs, 1.0, 2.0, 1.5, 0.01)
+    flags = rng.random((nchunk, ns)) < 0.02  # isolated samples: the diagonal
+    flags[0, 100:400] = flags[1, 900:1500] = flags[1, 1600:1650] = True
+    labels = -1 - np.arange(ns) if order == "reversed" else -1 - rng.permutation(ns) if order == "shuffled" else np.arange(-ns, 0)
+    g = GLS(np.where(flags, labels, pix), psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0, angle_dtype=np.float64,
+            flag_preconditioner=flag_preconditioner)
+    return g, np.where(flags, np.nan, tod)
+
+
+@pytest.mark.parametrize("order", ["forward", "reversed", "shuffled"])
+def test_flag_sine_preconditioner(order):
+    """flag_preconditioner="sine": the same solution as the diagonal one, in
+    fewer iterations on long runs of 1/f noise; runs whose unknowns are not
+    consecutive keep the diagonal."""
+    res = {}
+    for prec in ("diagonal", "sine"):
+        g, tod = _flagged_gls_case(prec, order)
+        res[prec] = g.solve(tod, tol=1e-24, maxiter=2000)
+        assert res[prec][1]["converged"]
+        if prec == "sine":
+            assert (g._sine is None) == (order == "shuffled")
+            if g._sine is not None:
+                assert sorted(g._sine[1].tolist()) == [50, 300, 600]
+    (m0, i0), (m1, i1) = res["diagonal"], res["sine"]
+    assert np.abs(m1 - m0).max() < 1e-9 * np.abs(m0).max()
+    assert np.abs(i1["flags"] - i0["flags"]).max() < 1e-8 * np.abs(i0["flags"]).max()
+    if order == "shuffled":
+        assert i1["iterations"] == i0["iterations"]
+    else:
+        assert i1["iterations"] < 0.7 * i0["iterations"]
+    with pytest.raises(ValueError, match="flag_preconditioner"):
+        _flagged_gls_case("dst", "forward")
+
+
+def test_flags_warm_start():
+    """solve(flags0=...): from the flags and the map of a converged solve, the
+    PCG starts converged; a wrong size is refused."""
+    g, tod = _flagged_gls_case("diagonal", "forward")
+    m, info = g.solve(tod, tol=1e-20, maxiter=2000)
+    m2, info2 = g.solve(tod, x0=m, flags0=info["flags"], tol=1e-16, maxiter=2000)
+    _, info3 = g.solve(tod, x0=m, tol=1e-16, maxiter=2000)
+    assert info2["iterations"] == 0 < info3["iterations"]
+    assert np.abs(m2 - m).max() < 1e-12 * np.abs(m).max()
+    with pytest.raises(ValueError, match="flags0"):
+        g.solve(tod, flags0=np.zeros(g.nflag + 1))
 
 
 def test_flags_in_make_maps():

@@ -1282,6 +1282,21 @@ class _RankSum:
         return self.gls._scatter_sum(self.map, by_column)
 
 
+def _unknown_runs(flagged, unknown, min_length=33):
+    """(first unknown, length) of the runs of consecutive flagged samples
+    (positions `flagged`) of at least `min_length` samples whose unknowns
+    `unknown` are consecutive (in either order): one unknown per sample."""
+    brk = np.flatnonzero(np.diff(flagged) != 1) + 1
+    out = []
+    for s, e in zip(np.r_[0, brk], np.r_[brk, flagged.size]):
+        if e - s < min_length:
+            continue
+        d = np.diff(unknown[s:e])
+        if abs(int(d[0])) == 1 and np.all(d == d[0]):
+            out.append((int(unknown[s:e].min()), int(e - s)))
+    return out
+
+
 class GLS:
     """Map-maker for a fixed set of pointings and noise weights.
 
@@ -1342,6 +1357,13 @@ class GLS:
         is in `full_maps_info`. Without MPI, or with one rank per node,
         "rank". With MPI the map read by P is shared by the ranks of a node
         in every mode.
+    flag_preconditioner : "diagonal" (default) or "sine"
+        Preconditioner of the unknowns of the flagged samples (flag_method
+        "marginalize"): the inverse diagonal of N^-1, or, for each run of
+        more than 32 samples with one unknown each, the inverse of its block
+        of N^-1 approximated with the DST-I (the "sine" preconditioner of
+        gapfill). It pays when the runs are long against the 1/f knee
+        period, where the diagonal misses their low frequencies.
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -1487,8 +1509,10 @@ class GLS:
     """
 
     @abort_on_error
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank"):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank", flag_preconditioner="diagonal"):
         self.comm = comm
+        if flag_preconditioner not in ("diagonal", "sine"):
+            raise ValueError(f"GLS.flag_preconditioner must be 'diagonal' or 'sine', not {flag_preconditioner!r}")
         if full_maps not in ("node", "rank"):
             raise ValueError(f"GLS.full_maps must be 'node' or 'rank', not {full_maps!r}")
         self.timings = tm = _Timings()  # seconds of the phases of the setup (see _Timings)
@@ -1550,6 +1574,7 @@ class GLS:
         self.nobs = nobs if comm is None else max(comm.allgather(nobs))
         # flagged samples: labels nobs, nobs + 1, ... of unknowns local to this rank
         self.nflag = 0
+        sine_runs = []  # (chunk, first unknown, length) of the long runs, flag_preconditioner="sine"
         self._cuts = [np.empty((0, 4), np.int64) for _ in self.ip]
         for k, p in enumerate(self.ip):
             if self._filled_flags:
@@ -1578,6 +1603,8 @@ class GLS:
                     p[flagged] = np.repeat(np.where(poly, -1, self.nobs + first), lengths)
                 else:
                     labels, unknown = np.unique(p[flagged], return_inverse=True)
+                    if flag_preconditioner == "sine":
+                        sine_runs.extend((k, self.nflag + lo, n) for lo, n in _unknown_runs(flagged, unknown))
                     p[flagged] = self.nobs + self.nflag + unknown
                     self.nflag += labels.size
                 self.ip[k] = p
@@ -1586,6 +1613,7 @@ class GLS:
         self._root = comm is None or comm.rank == 0
         self._shgroups = [np.asarray(g, dtype=np.int64) for g in shared_groups or []]
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
+        self._sine = self._sine_preconditioner(sine_runs) if sine_runs else None
         self.pol = psi is not None or pol_angles is not None
         if subpixel_order is None:
             subpixel_order = 0 if offsets is None else 1
@@ -2443,12 +2471,60 @@ class GLS:
             self._pt(buf, k, t, c2, s2, pol, self._locbuf)
             self._template_back(k, t)
 
+    def _sine_preconditioner(self, runs):
+        """flag_preconditioner="sine": for each long run of flagged samples
+        (one unknown per sample, contiguous unknowns), the inverse of its
+        diagonal block of N^-1 approximated as S diag(1 / w(f_j)) S, S the
+        orthonormal DST-I and f_j = j / (2 (length + 1)) (as
+        gapfill._gap_preconditioner). Returns (first unknowns, lengths, groups
+        of runs for the threads, 1 / w(f_j) of each run at its unknowns)."""
+        inv = np.zeros(self.nflag, np.float32)
+        cache = {}
+        first, length = [], []
+        for k, a, n in runs:
+            w, m = self.weights[k], self._nfft[k]
+            key = id(w), m, n
+            if key not in cache:
+                w = np.asarray(w, dtype=float)
+                spectrum = np.interp(np.arange(1, n + 1) * (m / (2.0 * (n + 1))), np.arange(w.size), w)
+                cache[key] = 1.0 / spectrum if np.all(spectrum > 0) else None
+            if cache[key] is None:
+                continue  # the diagonal of _locprec
+            inv[a : a + n] = cache[key]
+            first.append(a)
+            length.append(n)
+        first, length = np.array(first, np.int64), np.array(length, np.int64)
+        if not first.size:
+            return None
+        cut = np.searchsorted(np.cumsum(length), np.arange(1, self.nthreads) * (length.sum() / self.nthreads))
+        groups = [g for g in np.split(np.arange(first.size), cut) if g.size]
+        return first, length, groups, inv
+
+    def _apply_sine(self, r, z):
+        """z of the long flagged runs = S diag(1 / w) S r (see _sine_preconditioner), in threads."""
+        first, length, groups, inv = self._sine
+
+        def work(g):
+            for a, n in zip(first[g], length[g]):
+                sl = slice(a, a + n)
+                t = ducc0.fft.dst(r[sl], type=1, inorm=1, nthreads=1)
+                t *= inv[sl]
+                ducc0.fft.dst(t, type=1, inorm=1, out=z[sl], nthreads=1)
+
+        if len(groups) == 1:
+            work(groups[0])
+        else:
+            with ThreadPoolExecutor(len(groups), thread_name_prefix="pysanepic-sine") as pool:
+                list(pool.map(work, groups))
+
     def _precond_flat(self, r):
         with self._tm.phase("preconditioner"):
             sky = self._apply_precond(r[: self._nsky].reshape(self.ncomp, self.nloc))
             z = np.empty_like(r)
             z[: self._nsky] = sky.ravel()
             _mul(z[self._nsky :], r[self._nsky :], self._locprec)
+            if self._sine is not None:
+                self._apply_sine(r[self._nsky : self._nsky + self.nflag], z[self._nsky : self._nsky + self.nflag])
             if self._nsh_loc:
                 self._project_shared(z[len(z) - self._nsh_loc :])
             if self._einv is not None:
@@ -2475,15 +2551,18 @@ class GLS:
         return self._apply(tod=_chunks(tod)).reshape(self.ncomp, self.nloc)
 
     @abort_on_error
-    def solve(self, tod, x0=None, tol=1e-15, maxiter=2000, recompute_every=10, verbose=False):
+    def solve(self, tod, x0=None, tol=1e-15, maxiter=2000, recompute_every=10, verbose=False, flags0=None):
         """Run PCG on `tod` (same chunk layout as `pix`).
 
         Stops when norm(r)^2 / norm(b)^2 < tol (same criterion as SANEPIC).
         x0: optional starting map (ncomp, nobs). Returns (map (ncomp, nobs) on
         every rank, info dict) with "iterations", "converged", "residuals"
         (norm(r)^2 / norm(b)^2 at each iteration) and "amplitudes" (the
-        template amplitudes of this rank, by label; empty without templates)
-        and "shared_amplitudes" (on every rank).
+        template amplitudes of this rank, by label; empty without templates),
+        "shared_amplitudes" (on every rank) and "flags" (the unknowns of the
+        flagged samples of this rank). flags0: their starting values, e.g.
+        "flags" of a previous solve of this GLS on a similar TOD (the
+        calibration iterations of make_maps); None: 0.
         """
         self.pcg_timings = self._tm = _Timings()
         if verbose and (self.comm is None or self.comm.rank == 0):  # the template entries timed by the chunk workers
@@ -2513,12 +2592,18 @@ class GLS:
         x = np.zeros_like(b)
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
-        x, it, history = self._pcg(b, x, x0 is not None, tol, maxiter, recompute_every, verbose)
+        warm = flags0 is not None and self.nflag > 0
+        if warm:
+            if np.shape(flags0) != (self.nflag,):
+                raise ValueError(f"flags0 must have the {self.nflag} unknowns of the flagged samples of this rank")
+            x[self._nsky : self._nsky + self.nflag] = flags0
+        x, it, history = self._pcg(b, x, x0 is not None or warm, tol, maxiter, recompute_every, verbose)
         x[a0:] += mean
         a0 = self._nsky + self.nflag
         shared = x[len(x) - self._nsh_loc :].copy() if self._root else None
         info = {"iterations": it, "converged": history[-1] <= tol, "residuals": np.array(history),
                 "amplitudes": x[a0 : a0 + self.namp].copy(),
+                "flags": x[self._nsky : a0].copy(),
                 "shared_amplitudes": shared if self.comm is None else self.comm.bcast(shared)}
         self._free()
         # full mask now, while all ranks are here, so that to_healpix is not collective
