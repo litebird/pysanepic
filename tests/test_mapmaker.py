@@ -1993,8 +1993,7 @@ def test_flag_sine_preconditioner(order):
         if prec == "sine":
             assert (g._sine is None) == (order == "shuffled")
             if g._sine is not None:
-                assert sorted(np.concatenate([b[2] for b in g._sine]).tolist()) == [50, 300, 600]
-                assert all(n >= length.max() for n, _, length, _ in g._sine)
+                assert sorted(n for group in g._sine for n, first, _ in group for _ in first) == [50, 300, 600]
     (m0, i0), (m1, i1) = res["diagonal"], res["sine"]
     assert np.abs(m1 - m0).max() < 1e-9 * np.abs(m0).max()
     assert np.abs(i1["flags"] - i0["flags"]).max() < 1e-8 * np.abs(i0["flags"]).max()

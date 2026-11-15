@@ -775,26 +775,6 @@ def _xpby(y, x, b):
 
 
 @numba.njit(parallel=True, cache=True)
-def _gather_runs(buf, r, first, length):
-    """buf[i] = r[first[i] : first[i] + length[i]], zero padded."""
-    for i in numba.prange(first.size):
-        a, n = first[i], length[i]
-        for k in range(n):
-            buf[i, k] = r[a + k]
-        for k in range(n, buf.shape[1]):
-            buf[i, k] = 0.0
-
-
-@numba.njit(parallel=True, cache=True)
-def _scatter_runs(z, buf, first, length):
-    """z[first[i] : first[i] + length[i]] = buf[i, :length[i]]."""
-    for i in numba.prange(first.size):
-        a, n = first[i], length[i]
-        for k in range(n):
-            z[a + k] = buf[i, k]
-
-
-@numba.njit(parallel=True, cache=True)
 def _mul(out, a, b):
     """out = a b."""
     for i in numba.prange(out.size):
@@ -1382,7 +1362,7 @@ class GLS:
         "marginalize"): the inverse diagonal of N^-1, or, for each run of
         more than 32 samples with one unknown each, the inverse of its block
         of N^-1 approximated with the DST-I (the "sine" preconditioner of
-        gapfill, on the run padded to a fast FFT length, by about 1%). It
+        gapfill; runs of the same length transformed together). It
         pays when the runs are long against the 1/f knee period and the
         flagged unknowns limit the convergence, as when solve starts from
         the unknowns of a previous solve (flags0). "warm": "sine" only in
@@ -2500,41 +2480,52 @@ class GLS:
         """flag_preconditioner "sine" or "warm": for each long run of flagged
         samples (one unknown per sample, contiguous unknowns), the inverse of
         its diagonal block of N^-1 approximated as S diag(1 / w(f_j)) S, S the
-        orthonormal DST-I of length N and f_j = j / (2 (N + 1)) (as
-        gapfill._gap_preconditioner), with N >= length the next fast DST-I
-        length: the run block of that SPD operator on the run padded with
-        zeros. Runs of the same N are transformed together. Returns a list of
-        (N, first unknowns, lengths, 1 / w(f_j) of each run (runs, N)
-        float32)."""
+        orthonormal DST-I of length N = length and f_j = j / (2 (N + 1)) (as
+        gapfill._gap_preconditioner). Runs of the same N are transformed
+        together; zero padding them to a fast DST-I length (by ~1%) was 5x
+        faster but saved 2 PCG iterations instead of 14 (jobs 23496699, 23466601).
+        Returns groups (one per thread) of buckets (N, first unknowns,
+        1 / w(f_j) of each run (runs, N) float32)."""
         cache, buckets = {}, {}
         for k, a, n in runs:
             w, m = self.weights[k], self._nfft[k]
-            size = ducc0.fft.good_size(n + 1, True) - 1
+            size = n
             key = id(w), m, size
             if key not in cache:
                 w = np.asarray(w, dtype=float)
                 spectrum = np.interp(np.arange(1, size + 1) * (m / (2.0 * (size + 1))), np.arange(w.size), w)
                 cache[key] = (1.0 / spectrum).astype(np.float32) if np.all(spectrum > 0) else None
             if cache[key] is not None:  # else the diagonal of _locprec
-                buckets.setdefault(size, []).append((a, n, cache[key]))
-        out = []
-        for size, b in sorted(buckets.items()):
-            out.append((size, np.array([a for a, _, _ in b], np.int64), np.array([n for _, n, _ in b], np.int64),
-                        np.stack([inv for _, _, inv in b])))
-        return out or None
+                buckets.setdefault(size, []).append((a, cache[key]))
+        if not buckets:
+            return None
+        out = [(n, np.array([a for a, _ in b], np.int64), np.stack([inv for _, inv in b])) for n, b in sorted(buckets.items())]
+        # buckets of a few runs each: threads over groups of buckets of about the same size
+        order = sorted(range(len(out)), key=lambda i: -out[i][2].size)
+        groups, load = [[] for _ in range(min(self.nthreads, len(out)))], [0] * min(self.nthreads, len(out))
+        for i in order:
+            j = load.index(min(load))
+            groups[j].append(out[i])
+            load[j] += out[i][2].size
+        return groups
 
     def _apply_sine(self, r, z):
-        """z of the long flagged runs = S diag(1 / w) S r (see _sine_preconditioner)."""
-        if getattr(self, "_sine_buf", None) is None:
-            self._sine_buf = np.empty(max(inv.size for _, _, _, inv in self._sine), np.float64)  # float64: a float32 buffer rounds the preconditioner (toy: 24 vs 22 iterations)
-        big = self._sine_buf
-        for size, first, length, inv in self._sine:
-            buf = big[: inv.size].reshape(inv.shape)
-            _gather_runs(buf, r, first, length)
-            ducc0.fft.dst(buf, type=1, axes=(1,), inorm=1, out=buf, nthreads=self.nthreads)
-            buf *= inv
-            ducc0.fft.dst(buf, type=1, axes=(1,), inorm=1, out=buf, nthreads=self.nthreads)
-            _scatter_runs(z, buf, first, length)
+        """z of the long flagged runs = S diag(1 / w) S r (see _sine_preconditioner), in threads."""
+
+        def work(group):
+            for n, first, inv in group:
+                idx = first[:, None] + np.arange(n)
+                buf = r[idx]
+                ducc0.fft.dst(buf, type=1, axes=(1,), inorm=1, out=buf, nthreads=1)
+                buf *= inv
+                ducc0.fft.dst(buf, type=1, axes=(1,), inorm=1, out=buf, nthreads=1)
+                z[idx] = buf
+
+        if len(self._sine) == 1:
+            work(self._sine[0])
+        else:
+            with ThreadPoolExecutor(len(self._sine), thread_name_prefix="pysanepic-sine") as pool:
+                list(pool.map(work, self._sine))
 
     def _precond_flat(self, r):
         with self._tm.phase("preconditioner"):
