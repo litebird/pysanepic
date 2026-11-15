@@ -649,6 +649,13 @@ class GLSParameters:
         per rank, fastest) or "node" (one copy shared by the ranks of a
         node: less memory with many ranks per node at large nside, slower,
         and the output maps are read-only). See GLS `full_maps`.
+    flag_preconditioner : preconditioner of the unknowns of the flagged
+        samples (flag_method "marginalize", and the samples out of the
+        masks of the calibration): "diagonal" (default), "sine" (a DST-I
+        block per long run) or "warm" ("sine" in the calibration iterations
+        that start from the flagged unknowns of the previous one, where they
+        limit the convergence; "diagonal" in the others). See GLS
+        `flag_preconditioner`.
     binned_weights : weights of the binned map of the sky model put back in
         the maps (make_maps' `sky_model`; unused without it): "noise"
         (default) weights each detector by its white-noise level 1 /
@@ -679,8 +686,11 @@ class GLSParameters:
     subpixel_order: int = 0
     binned_weights: str | dict = "noise"
     full_maps: str = "rank"
+    flag_preconditioner: str = "diagonal"
 
     def __post_init__(self):
+        if self.flag_preconditioner not in ("diagonal", "sine", "warm"):
+            raise ValueError(f"GLSParameters.flag_preconditioner must be 'diagonal', 'sine' or 'warm', not {self.flag_preconditioner!r}")
         if self.full_maps not in ("node", "rank"):
             raise ValueError(f"GLSParameters.full_maps must be 'node' or 'rank', not {self.full_maps!r}")
         if self.subpixel_order not in (0, 1, 2):
@@ -711,6 +721,7 @@ class GLSParameters:
             "coarse": None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
             "subpixel_order": self.subpixel_order,
             "full_maps": self.full_maps,
+            "flag_preconditioner": self.flag_preconditioner,
         }
 
 
