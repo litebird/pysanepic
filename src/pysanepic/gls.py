@@ -2526,7 +2526,7 @@ class GLS:
     def _apply_sine(self, r, z):
         """z of the long flagged runs = S diag(1 / w) S r (see _sine_preconditioner)."""
         if getattr(self, "_sine_buf", None) is None:
-            self._sine_buf = np.empty(max(inv.size for _, _, _, inv in self._sine), np.float32)
+            self._sine_buf = np.empty(max(inv.size for _, _, _, inv in self._sine), np.float64)  # float64: a float32 buffer rounds the preconditioner (toy: 24 vs 22 iterations)
         big = self._sine_buf
         for size, first, length, inv in self._sine:
             buf = big[: inv.size].reshape(inv.shape)
