@@ -295,6 +295,29 @@ def test_flags_mpi():
             assert np.allclose(m, ms, rtol=1e-9, atol=1e-12 * np.abs(ms).max())
 
 
+def test_flags0_rank_without_flags_mpi():
+    """flags0 given, x0=None, only rank 0 has flagged samples, verbose only on
+    rank 0: the collective steps of the PCG stay in step (no hang), same maps
+    as serial."""
+    comm = MPI.COMM_WORLD
+    rng = np.random.default_rng(4)
+    ns, nchunk, npix = 512, 2 * comm.size, 40
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    w = np.tile(one_over_f_weights(ns, 10.0, 1.0, 0.5, 1.0, 0.01), (nchunk, 1))
+    tod = rng.normal(size=(nchunk, ns))
+    pix[0, 100:160] = -1 - np.arange(60)  # chunk 0 only: rank 0
+    mine = slice(comm.rank, None, comm.size)
+    kw = {"min_pol_rcond": 0.0, "flag_preconditioner": "sine"}
+    g = GLS(pix[mine], psi[mine], w[mine], comm=comm, **kw)
+    assert (g.nflag > 0) == (comm.rank == 0)
+    m, info = g.solve(tod[mine], tol=1e-24, flags0=np.ones(g.nflag), verbose=comm.rank == 0)
+    assert info["converged"]
+    if comm.rank == 0:
+        ms, _ = GLS(pix, psi, w, **kw).solve(tod, tol=1e-24)
+        assert np.allclose(m, ms, rtol=1e-9, atol=1e-12 * np.abs(ms).max())
+
+
 def test_conditional_fill_mpi():
     """Conditional means, also for groups and padding, are partition invariant."""
     from pysanepic import (CommonMode, DetectorData, DetectorGroup, GapFill, GLSParameters,
@@ -532,6 +555,7 @@ if __name__ == "__main__":
     test_more_ranks_than_pixels()
     test_mpi_count_check()
     test_flags_mpi()
+    test_flags0_rank_without_flags_mpi()
     test_conditional_fill_mpi()
     test_estimate_noise_mpi()
     test_estimate_noise_subpixel_mpi()

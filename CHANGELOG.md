@@ -18,6 +18,15 @@
   second takes 18 instead of 32, 3093 s instead of 3498 s for the two
   (3965 s with neither change).
 
+- `flag_preconditioner="sine"` keeps the diagonal for runs whose unknowns
+  are also used by other samples of the chunk (same labels in two runs,
+  `GLS` only: `make_maps` never makes them), where the sine was not a block
+  of the system and slowed the PCG down. `solve` checks the size of `flags0`
+  first, also on ranks without flagged samples, and makes the first product
+  of the PCG and `verbose` collective: `flags0` with `x0=None` and a rank
+  without flagged samples, or `verbose` on rank 0 only, no longer hang
+  (#93).
+
 ## 0.6.6 (2026-11-10)
 
 - With MPI, the ranks of a node can share one copy of the full maps

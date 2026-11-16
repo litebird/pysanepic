@@ -27,6 +27,19 @@ fs is scalar or one sampling rate per chunk, needed for gap durations.
 Flagged TOD is ignored and set to zero. The basis is evaluated without
 stored template arrays; `nflag` counts the coefficients, not cut samples.
 Use `solve`, as with the other local unknowns.
+The unknowns of the flagged samples (one per sample or per label) have the
+preconditioner `flag_preconditioner`: `"sine"` (default) for the runs of more
+than 32 samples with consecutive unknowns used by no other sample of the
+chunk, the diagonal otherwise; `"diagonal"` for all. `solve` returns them in
+`info["flags"]` (this rank's), and `solve(..., flags0=info["flags"])` starts a
+later solve of the same GLS from them (with `x0` for the map), as the
+calibration iterations of `make_maps` do. `verbose=True` prints, from rank 0,
+the residual and the share of each block of unknowns at each PCG iteration
+and the Lanczos estimates of the eigenvalues of the preconditioned system;
+with MPI the value of rank 0 is used on all ranks. With $N^{-1}$ singular
+(`weights[..., 0] = 0`) the I offset is not constrained by the data, and its
+value (and that of the flag unknowns) depends on the preconditioner and on
+the start.
 `act_ncoeff` is also accepted here: None keeps the ACT rule, an integer fixes
 the count, and a callable `(lengths_samples, fs_hz)` returns a positive integer
 scalar or an array of counts (one per gap, capped at its length). For example

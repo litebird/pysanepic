@@ -2037,6 +2037,60 @@ def test_flags_warm_start():
         g.solve(tod, flags0=np.zeros(g.nflag + 1))
 
 
+def test_flag_sine_preconditioner_shared_unknowns():
+    """Two long runs of a chunk with the same labels share their unknowns:
+    the sine of either run alone is not a block of A, so both keep the
+    diagonal, and the solve converges like the diagonal one."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(5)
+    npix, ns, fs = 12, 2048, 10.0
+    pix = rng.integers(0, npix, (1, ns))
+    psi = rng.uniform(0, np.pi, (1, ns))
+    tod = rng.normal(size=(1, ns))
+    w = one_over_f_weights(ns, fs, 1.0, 2.0, 1.5, 0.01)[None]
+    labels = np.arange(-ns, 0)
+    labels[1000:1300] = labels[100:400]  # the second run reuses the unknowns of the first
+    flags = np.zeros((1, ns), bool)
+    flags[0, 100:400] = flags[0, 1000:1300] = flags[0, 1600:1700] = True
+    res = {}
+    for prec in ("diagonal", "sine"):
+        g = GLS(np.where(flags, labels, pix), psi, w, min_pol_rcond=0.0, angle_dtype=np.float64, flag_preconditioner=prec)
+        res[prec] = g.solve(np.where(flags, np.nan, tod), tol=1e-24, maxiter=3000)
+        assert res[prec][1]["converged"]
+    assert g.nflag == 400
+    assert sorted(n for group in g._sine for n, first, _ in group for _ in first) == [100]  # the exclusive run only
+    (m0, _), (m1, _) = res["diagonal"], res["sine"]
+    assert np.abs(m1 - m0).max() < 1e-9 * np.abs(m0).max()
+
+
+def test_flags0_checked_without_flags():
+    """flags0 of the wrong size is refused also when this rank has no flagged
+    samples, and before any work on the TOD."""
+    g, _ = _flagged_gls_case("diagonal", "forward")
+    with pytest.raises(ValueError, match="flags0"):
+        g.solve(None, flags0=np.zeros(g.nflag + 1))  # no TOD read: checked first
+    from pysanepic import GLS
+
+    g0 = GLS(np.abs(g.ip[0][None] % 12), None, np.ones((1, g.ip[0].size // 2 + 1)))
+    assert g0.nflag == 0
+    with pytest.raises(ValueError, match="flags0"):
+        g0.solve(np.zeros((1, g.ip[0].size)), flags0=np.zeros(3))
+    g0.solve(np.zeros((1, g.ip[0].size)), flags0=np.zeros(0))  # the right size, empty
+
+
+def test_solve_verbose(capsys):
+    """verbose=True: the PCG prints the residual and the shares of the blocks
+    at each iteration and the Lanczos estimates, with the same solution."""
+    g, tod = _flagged_gls_case("sine", "forward")
+    m, info = g.solve(tod, tol=1e-20, maxiter=2000)
+    mv, infov = g.solve(tod, tol=1e-20, maxiter=2000, verbose=True)
+    out = capsys.readouterr().out
+    assert "iter    0" in out and "blocks" in out and "template entries" in out
+    assert infov["iterations"] == info["iterations"]
+    assert np.array_equal(mv, m)
+
+
 def test_flags_in_make_maps():
     """Glitches and a gap, flagged: noiseless maps recover the sky whatever the
     flagged TOD (NaN or huge), flagged samples are not hits; flags are checked."""
