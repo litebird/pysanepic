@@ -1357,16 +1357,18 @@ class GLS:
         is in `full_maps_info`. Without MPI, or with one rank per node,
         "rank". With MPI the map read by P is shared by the ranks of a node
         in every mode.
-    flag_preconditioner : "diagonal" (default), "sine" or "warm"
+    flag_preconditioner : "sine" (default) or "diagonal"
         Preconditioner of the unknowns of the flagged samples (flag_method
-        "marginalize"): the inverse diagonal of N^-1, or, for each run of
-        more than 32 samples with one unknown each, the inverse of its block
-        of N^-1 approximated with the DST-I (the "sine" preconditioner of
-        gapfill; runs of the same length transformed together). It
-        pays when the runs are long against the 1/f knee period and the
-        flagged unknowns limit the convergence, as when solve starts from
-        the unknowns of a previous solve (flags0). "warm": "sine" only in
-        the solves with flags0, "diagonal" otherwise.
+        "marginalize"): for each run of more than 32 samples with one
+        unknown each, the inverse of its block of N^-1 approximated with the
+        DST-I (the "sine" preconditioner of gapfill; runs of the same length
+        transformed together; shorter runs keep the diagonal), or the
+        inverse diagonal of N^-1 for every unknown. The sine pays when the
+        runs are long against the 1/f knee period: in the e2e calibration
+        (16 detectors, one year, gain mask) the same iterations in the first
+        solve at ~2.8 s per iteration more, and 18 iterations instead of 30
+        in the next one started from its flag unknowns (flags0), whose
+        start is better too (job 23501851).
     nthreads : int or None
         Threads per process (FFTs, numba); None: OMP_NUM_THREADS, else 1.
     pol_angles : (angle2, gamma) or None
@@ -1512,11 +1514,10 @@ class GLS:
     """
 
     @abort_on_error
-    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank", flag_preconditioner="diagonal"):
+    def __init__(self, pix, psi, weights, pol_efficiency=None, min_pol_hits=4, min_pol_rcond=1e-2, preconditioner="block", comm=None, nthreads=None, angle_dtype=np.float32, pol_angles=None, overwrite_pix=False, fft_lengths=None, fft_dtype=np.float64, common_modes=None, coarse=None, templates=None, shared_templates=None, shared_groups=None, template_dtype=np.float32, flag_method="marginalize", flag_sampling_rate_hz=None, act_ncoeff=None, prior=None, shared_prior=None, offsets=None, min_grad_hits=8, min_grad_rcond=1e-2, subpixel_order=None, min_hess_hits=20, min_hess_rcond=1e-2, full_maps="rank", flag_preconditioner="sine"):
         self.comm = comm
-        if flag_preconditioner not in ("diagonal", "sine", "warm"):
-            raise ValueError(f"GLS.flag_preconditioner must be 'diagonal', 'sine' or 'warm', not {flag_preconditioner!r}")
-        self._flag_prec = flag_preconditioner
+        if flag_preconditioner not in ("diagonal", "sine"):
+            raise ValueError(f"GLS.flag_preconditioner must be 'sine' or 'diagonal', not {flag_preconditioner!r}")
         if full_maps not in ("node", "rank"):
             raise ValueError(f"GLS.full_maps must be 'node' or 'rank', not {full_maps!r}")
         self.timings = tm = _Timings()  # seconds of the phases of the setup (see _Timings)
@@ -1607,7 +1608,7 @@ class GLS:
                     p[flagged] = np.repeat(np.where(poly, -1, self.nobs + first), lengths)
                 else:
                     labels, unknown = np.unique(p[flagged], return_inverse=True)
-                    if flag_preconditioner != "diagonal":
+                    if flag_preconditioner == "sine":
                         sine_runs.extend((k, self.nflag + lo, n) for lo, n in _unknown_runs(flagged, unknown))
                     p[flagged] = self.nobs + self.nflag + unknown
                     self.nflag += labels.size
@@ -1618,7 +1619,6 @@ class GLS:
         self._shgroups = [np.asarray(g, dtype=np.int64) for g in shared_groups or []]
         self._locprec = np.zeros(self.nflag)  # diagonal of P^T N^-1 P of each unknown, then inverted
         self._sine = self._sine_preconditioner(sine_runs) if sine_runs else None
-        self._sine_on = flag_preconditioner == "sine"  # set by solve with "warm"
         self.pol = psi is not None or pol_angles is not None
         if subpixel_order is None:
             subpixel_order = 0 if offsets is None else 1
@@ -2477,7 +2477,7 @@ class GLS:
             self._template_back(k, t)
 
     def _sine_preconditioner(self, runs):
-        """flag_preconditioner "sine" or "warm": for each long run of flagged
+        """flag_preconditioner "sine": for each long run of flagged
         samples (one unknown per sample, contiguous unknowns), the inverse of
         its diagonal block of N^-1 approximated as S diag(1 / w(f_j)) S, S the
         orthonormal DST-I of length N = length and f_j = j / (2 (N + 1)) (as
@@ -2533,7 +2533,7 @@ class GLS:
             z = np.empty_like(r)
             z[: self._nsky] = sky.ravel()
             _mul(z[self._nsky :], r[self._nsky :], self._locprec)
-            if self._sine is not None and self._sine_on:
+            if self._sine is not None:
                 self._apply_sine(r[self._nsky : self._nsky + self.nflag], z[self._nsky : self._nsky + self.nflag])
             if self._nsh_loc:
                 self._project_shared(z[len(z) - self._nsh_loc :])
@@ -2603,7 +2603,6 @@ class GLS:
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
         warm = flags0 is not None and self.nflag > 0
-        self._sine_on = self._flag_prec == "sine" or (self._flag_prec == "warm" and warm)
         if warm:
             if np.shape(flags0) != (self.nflag,):
                 raise ValueError(f"flags0 must have the {self.nflag} unknowns of the flagged samples of this rank")
@@ -2634,7 +2633,6 @@ class GLS:
         n = self._nsky + self.nflag + self.namp + self._nsh_loc
         self.pcg_timings = self._tm = _Timings()
         cov = np.zeros((self.nshared, self.nshared))
-        self._sine_on = self._flag_prec == "sine"
         failed = []
         for j in range(self.nshared):
             b = np.zeros(n)

@@ -8,6 +8,7 @@ Run with: pytest tests/  (or: python tests/test_mapmaker.py)
 """
 
 import dataclasses
+import inspect
 import types
 import warnings
 
@@ -532,7 +533,7 @@ def test_calibration_masked_flags_sine_and_warm_start(monkeypatch):
 
     monkeypatch.setattr(GLS, "solve", spy)
     res = {}
-    for prec in ("diagonal", "sine", "warm"):
+    for prec in ("diagonal", "sine"):
         starts.clear()
         params = GLSParameters(chunk_s=1200.0, tol=1e-24, min_pol_rcond=0.0, angle_dtype=np.float64,
                                flag_preconditioner=prec)
@@ -545,8 +546,9 @@ def test_calibration_masked_flags_sine_and_warm_start(monkeypatch):
     for r in res.values():
         assert max(np.abs(g - g0).max() for g, g0 in zip(r.gains, true)) < 1e-9
     seen = res["diagonal"].maps[1] != hp.UNSEEN
-    for prec in ("sine", "warm"):
-        assert np.abs(res[prec].maps[:, seen] - res["diagonal"].maps[:, seen]).max() < 1e-9 * np.abs(sky).max()
+    assert np.abs(res["sine"].maps[:, seen] - res["diagonal"].maps[:, seen]).max() < 1e-9 * np.abs(sky).max()
+    with pytest.raises(ValueError, match="flag_preconditioner"):
+        GLSParameters(flag_preconditioner="warm")
 
 
 def test_flag_methods_noiseless_response():
@@ -2005,20 +2007,21 @@ def test_flag_sine_preconditioner(order):
         _flagged_gls_case("dst", "forward")
 
 
-def test_flag_warm_preconditioner():
-    """flag_preconditioner="warm": the diagonal without flags0, the sine with
-    flags0 (and the same solution)."""
+def test_flag_preconditioner_default_and_warm_start():
+    """The sine is the default; it also cuts the iterations of a solve
+    started from the flag unknowns (flags0), with the same solution."""
+    from pysanepic import GLS
+
+    assert inspect.signature(GLS).parameters["flag_preconditioner"].default == "sine"
+    assert GLSParameters().flag_preconditioner == "sine"
     sols = {}
-    for prec in ("diagonal", "sine", "warm"):
+    for prec in ("diagonal", "sine"):
         g, tod = _flagged_gls_case(prec, "forward")
         cold = g.solve(tod, tol=1e-24, maxiter=2000)
-        flags0 = 0.5 * cold[1]["flags"]
-        sols[prec] = cold, g.solve(tod, tol=1e-24, maxiter=2000, flags0=flags0)
-    (_, c0), (_, w0) = sols["diagonal"]
-    _, (_, w1) = sols["sine"]
-    (m2, c2), (m3, w2) = sols["warm"]
-    assert c2["iterations"] == c0["iterations"] and w2["iterations"] == w1["iterations"] < w0["iterations"]
-    assert np.abs(m3 - m2).max() < 1e-9 * np.abs(m2).max()
+        sols[prec] = g.solve(tod, tol=1e-24, maxiter=2000, flags0=0.5 * cold[1]["flags"])
+    (m0, w0), (m1, w1) = sols["diagonal"], sols["sine"]
+    assert w1["iterations"] < w0["iterations"]
+    assert np.abs(m1 - m0).max() < 1e-9 * np.abs(m0).max()
 
 
 def test_flags_warm_start():

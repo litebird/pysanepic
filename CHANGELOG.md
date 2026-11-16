@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Calibration: the iterations after the first start the PCG from the
+  unknowns of the flagged samples of the previous one (`GLS.solve`
+  `flags0`, and its `info["flags"]`), not only from its map. In the e2e
+  calibration (16 detectors, one year) the second solve takes 32 PCG
+  iterations instead of 42.
+
+- The unknowns of the flagged samples (`flag_method="marginalize"`, and the
+  samples out of the gain mask) have a new default preconditioner,
+  `GLSParameters.flag_preconditioner="sine"` (and GLS
+  `flag_preconditioner`): each run of more than 32 flagged samples gets
+  the inverse of its block of N^-1 approximated with the DST-I, as in
+  `GapFill`; `"diagonal"` is the previous one. Same solutions; in the e2e
+  calibration the first solve keeps its 49 iterations (+2.8 s each), the
+  second takes 18 instead of 32, 3093 s instead of 3498 s for the two
+  (3965 s with neither change).
+
 ## 0.6.6 (2026-11-10)
 
 - With MPI, the ranks of a node can share one copy of the full maps
