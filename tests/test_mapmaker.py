@@ -2064,6 +2064,35 @@ def test_flag_sine_preconditioner_shared_unknowns():
     assert np.abs(m1 - m0).max() < 1e-9 * np.abs(m0).max()
 
 
+def test_flag_preconditioner_singular_weights():
+    """N^-1 singular (w[0] = 0): the I offset is not constrained, and its value
+    may depend on the flag preconditioner; Q, U and I minus its mean do not."""
+    from pysanepic import GLS, one_over_f_weights
+
+    rng = np.random.default_rng(17)
+    npix, ns, nchunk, fs = 12, 2048, 2, 10.0
+    pix = rng.integers(0, npix, (nchunk, ns))
+    psi = rng.uniform(0, np.pi, (nchunk, ns))
+    tod = rng.normal(size=(nchunk, ns))
+    w = one_over_f_weights(ns, fs, 1.0, 2.0, 1.5, 0.01)
+    w[0] = 0.0
+    flags = rng.random((nchunk, ns)) < 0.02
+    flags[0, 100:400] = flags[1, 900:1500] = True
+    labels = np.arange(-ns, 0)
+    sols = {}
+    for prec in ("diagonal", "sine"):
+        g = GLS(np.where(flags, labels, pix), psi, np.tile(w, (nchunk, 1)), min_pol_rcond=0.0,
+                angle_dtype=np.float64, flag_preconditioner=prec)
+        m, info = g.solve(np.where(flags, np.nan, tod), tol=1e-24, maxiter=3000)
+        assert info["converged"]
+        sols[prec] = m
+    m0, m1 = sols["diagonal"], sols["sine"]
+    scale = np.abs(m0).max()
+    assert np.abs(m1[1:] - m0[1:]).max() < 1e-9 * scale
+    assert np.abs((m1[0] - m1[0].mean()) - (m0[0] - m0[0].mean())).max() < 1e-9 * scale
+    assert abs(m1[0].mean() - m0[0].mean()) > 1e-6 * scale  # the offset is free: the case is singular
+
+
 def test_flags0_checked_without_flags():
     """flags0 of the wrong size is refused also when this rank has no flagged
     samples, and before any work on the TOD."""
