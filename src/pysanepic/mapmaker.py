@@ -1396,7 +1396,7 @@ def make_maps(data, nside, coordinates="G", params=None, comm=None, nthreads=Non
             fit.gls.set_templates(*fit.no_gains)  # collective
         cov = {"labels": amplitudes.labels, "matrix": fit.gls.shared_covariance(tol=p.covariance_tol, maxiter=p.maxiter, verbose=verbose)}
     if fit.mask_gain is not None or any(m is not None for m in fit.masks.values()):  # samples may have been left out
-        fit.fit, fit.gls = False, None  # other flags: a new GLS
+        fit.fit, fit.gls, fit.flags0 = False, None, None  # other flags: a new GLS
         res = _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit)[0]
     res.templates = amplitudes.result_templates()
     res.template_covariance = cov
@@ -1682,7 +1682,7 @@ def _mask_unsolved_pol(fit, res, verbose):
 
     fit.mask_gain = cut(fit.mask_gain)
     fit.masks = {k: cut(m) for k, m in fit.masks.items()}
-    fit.gls = None
+    fit.gls = fit.flags0 = None
 
 
 def _sample(x, d, pix, angle, loc, nthreads):

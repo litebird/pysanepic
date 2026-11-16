@@ -1285,14 +1285,16 @@ class _RankSum:
 def _unknown_runs(flagged, unknown, min_length=33):
     """(first unknown, length) of the runs of consecutive flagged samples
     (positions `flagged`) of at least `min_length` samples whose unknowns
-    `unknown` are consecutive (in either order): one unknown per sample."""
+    `unknown` are consecutive (in either order) and used by no other sample
+    of the chunk: one unknown per sample."""
     brk = np.flatnonzero(np.diff(flagged) != 1) + 1
+    uses = np.bincount(unknown)
     out = []
     for s, e in zip(np.r_[0, brk], np.r_[brk, flagged.size]):
         if e - s < min_length:
             continue
         d = np.diff(unknown[s:e])
-        if abs(int(d[0])) == 1 and np.all(d == d[0]):
+        if abs(int(d[0])) == 1 and np.all(d == d[0]) and np.all(uses[unknown[s:e]] == 1):
             out.append((int(unknown[s:e].min()), int(e - s)))
     return out
 
@@ -1360,7 +1362,7 @@ class GLS:
     flag_preconditioner : "sine" (default) or "diagonal"
         Preconditioner of the unknowns of the flagged samples (flag_method
         "marginalize"): for each run of more than 32 samples with one
-        unknown each, the inverse of its block of N^-1 approximated with the
+        unknown each, used by no other sample of the chunk, the inverse of its block of N^-1 approximated with the
         DST-I (the "sine" preconditioner of gapfill; runs of the same length
         transformed together; shorter runs keep the diagonal), or the
         inverse diagonal of N^-1 for every unknown. The sine pays when the
@@ -2489,14 +2491,13 @@ class GLS:
         cache, buckets = {}, {}
         for k, a, n in runs:
             w, m = self.weights[k], self._nfft[k]
-            size = n
-            key = id(w), m, size
+            key = id(w), m, n
             if key not in cache:
                 w = np.asarray(w, dtype=float)
-                spectrum = np.interp(np.arange(1, size + 1) * (m / (2.0 * (size + 1))), np.arange(w.size), w)
+                spectrum = np.interp(np.arange(1, n + 1) * (m / (2.0 * (n + 1))), np.arange(w.size), w)
                 cache[key] = (1.0 / spectrum).astype(np.float32) if np.all(spectrum > 0) else None
             if cache[key] is not None:  # else the diagonal of _locprec
-                buckets.setdefault(size, []).append((a, cache[key]))
+                buckets.setdefault(n, []).append((a, cache[key]))
         if not buckets:
             return None
         out = [(n, np.array([a for a, _ in b], np.int64), np.stack([inv for _, inv in b])) for n, b in sorted(buckets.items())]
@@ -2572,8 +2573,17 @@ class GLS:
         "shared_amplitudes" (on every rank) and "flags" (the unknowns of the
         flagged samples of this rank). flags0: their starting values, e.g.
         "flags" of a previous solve of this GLS on a similar TOD (the
-        calibration iterations of make_maps); None: 0.
+        calibration iterations of make_maps); None: 0. verbose is taken from
+        rank 0 (it adds collective steps to the PCG).
+
+        With N^-1 singular (weights[..., 0] = 0), the offset of the
+        intensity map is not constrained by the data: its value (and that
+        of the flag unknowns) depends on the start and on the
+        preconditioner (flag_preconditioner), the rest of the solution does
+        not.
         """
+        if flags0 is not None and np.shape(flags0) != (self.nflag,):
+            raise ValueError(f"flags0 must have the {self.nflag} unknowns of the flagged samples of this rank")
         self.pcg_timings = self._tm = _Timings()
         if verbose and (self.comm is None or self.comm.rank == 0):  # the template entries timed by the chunk workers
             entries = {}
@@ -2602,10 +2612,8 @@ class GLS:
         x = np.zeros_like(b)
         if x0 is not None:
             x[: self._nsky] = (x0[:, self.lo : self.hi] * self.mask).ravel()
-        warm = flags0 is not None and self.nflag > 0
+        warm = flags0 is not None and self.nflag > 0  # local: _pcg makes start collective
         if warm:
-            if np.shape(flags0) != (self.nflag,):
-                raise ValueError(f"flags0 must have the {self.nflag} unknowns of the flagged samples of this rank")
             x[self._nsky : self._nsky + self.nflag] = flags0
         x, it, history = self._pcg(b, x, x0 is not None or warm, tol, maxiter, recompute_every, verbose)
         x[a0:] += mean
@@ -2659,7 +2667,12 @@ class GLS:
 
     def _pcg(self, b, x, start, tol, maxiter, recompute_every, verbose):
         """PCG on A x = b from x (`start`: x is not 0); returns (x, iterations,
-        norm(r)^2 / norm(b)^2 at each iteration)."""
+        norm(r)^2 / norm(b)^2 at each iteration). `start` and `verbose` decide
+        collective steps (the first product, the block shares): taken from
+        all ranks (any start, the verbose of rank 0)."""
+        if self.comm is not None:
+            start = self.comm.allreduce(int(bool(start))) > 0
+            verbose = self.comm.bcast(verbose)
         with numba_threads(self.nthreads):
             return self._pcg_loop(b, x, start, tol, maxiter, recompute_every, verbose)
 
