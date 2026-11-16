@@ -649,6 +649,11 @@ class GLSParameters:
         per rank, fastest) or "node" (one copy shared by the ranks of a
         node: less memory with many ranks per node at large nside, slower,
         and the output maps are read-only). See GLS `full_maps`.
+    flag_preconditioner : preconditioner of the unknowns of the flagged
+        samples (flag_method "marginalize", and the samples out of the
+        masks of the calibration): "sine" (default: a DST-I block per long
+        run, the diagonal for the short ones) or "diagonal". See GLS
+        `flag_preconditioner`.
     binned_weights : weights of the binned map of the sky model put back in
         the maps (make_maps' `sky_model`; unused without it): "noise"
         (default) weights each detector by its white-noise level 1 /
@@ -679,8 +684,11 @@ class GLSParameters:
     subpixel_order: int = 0
     binned_weights: str | dict = "noise"
     full_maps: str = "rank"
+    flag_preconditioner: str = "sine"
 
     def __post_init__(self):
+        if self.flag_preconditioner not in ("diagonal", "sine"):
+            raise ValueError(f"GLSParameters.flag_preconditioner must be 'sine' or 'diagonal', not {self.flag_preconditioner!r}")
         if self.full_maps not in ("node", "rank"):
             raise ValueError(f"GLSParameters.full_maps must be 'node' or 'rank', not {self.full_maps!r}")
         if self.subpixel_order not in (0, 1, 2):
@@ -711,6 +719,7 @@ class GLSParameters:
             "coarse": None if nc is None else _coarse_pixels(nside, nc) if nc else _monopole_pixel(nside),
             "subpixel_order": self.subpixel_order,
             "full_maps": self.full_maps,
+            "flag_preconditioner": self.flag_preconditioner,
         }
 
 
@@ -1605,6 +1614,7 @@ class _Fit:
     masks: dict  # name -> mask of the template, or None
     residual: np.ndarray | None = None  # maps minus sky model of the previous iteration
     x0: np.ndarray | None = None  # the GLS solution of the previous iteration: the start of the next one
+    flags0: np.ndarray | None = None  # its unknowns of the flagged samples (this rank), for the reused GLS
     gls: "GLS | None" = None  # the GLS of the fit iterations, reused (same pixels and flags)
     cache: dict | None = None  # with cache_model: DetectorData index -> (sky model TOD, sky template TODs)
     no_gains: tuple | None = None  # the templates and priors of the GLS but the gain templates (covariance_fixed_gains)
@@ -2068,10 +2078,13 @@ def _make_maps(data, nside, coordinates, params, comm, nthreads, verbose, fit=No
     t2 = time.perf_counter()
     # a looser tolerance in the first calibration iterations (CalibrationParameters.tol), not in the final maps
     tol = fit.tol if fit is not None and fit.fit and fit.tol is not None else params.tol
-    m, info = gls.solve(tod_c, x0=x0, tol=tol, maxiter=params.maxiter, verbose=verbose)
+    # and of the flagged samples, with the same GLS (same flags)
+    flags0 = fit.flags0 if reuse and fit is not None and fit.fit else None
+    m, info = gls.solve(tod_c, x0=x0, tol=tol, maxiter=params.maxiter, verbose=verbose, flags0=flags0)
     t3 = time.perf_counter()
     if fit is not None:
         fit.x0 = m
+        fit.flags0 = info["flags"] if fit.fit and fit.gls is gls else None
         if fit.fit:
             fit.residual = gls._freeze(gls._healpix(m, nside, hp.UNSEEN))
         fit.amplitudes.update(info if fit.fit else None)  # g (1 + dg), a + da, A + dA
